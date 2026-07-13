@@ -41,17 +41,14 @@ pub struct BoxRead<'a> {
 /// when the full box may extend beyond the buffer.
 #[inline]
 pub fn read_box_header(data: &[u8], offset: usize) -> Option<BoxHeader> {
-   if offset + 8 > data.len() {
-      return None;
-   }
-
-   let size32 = read_u32_be(data, offset)?;
+   let standard_header_end = offset.checked_add(8)?;
+   let standard_header = data.get(offset..standard_header_end)?;
+   let size32 = read_u32_be(standard_header, 0)?;
 
    let (header_len, total_size) = if size32 == 1 {
-      if offset + 16 > data.len() {
-         return None;
-      }
-      (16, read_u64_be(data, offset + 8)? as usize)
+      let extended_header_end = offset.checked_add(16)?;
+      let extended_size = read_u64_be(data.get(standard_header_end..extended_header_end)?, 0)?;
+      (16, usize::try_from(extended_size).ok()?)
    } else if size32 == 0 {
       return None;
    } else {
@@ -64,10 +61,10 @@ pub fn read_box_header(data: &[u8], offset: usize) -> Option<BoxHeader> {
 
    Some(BoxHeader {
       fourcc: [
-         data[offset + 4],
-         data[offset + 5],
-         data[offset + 6],
-         data[offset + 7],
+         standard_header[4],
+         standard_header[5],
+         standard_header[6],
+         standard_header[7],
       ],
       header_len,
       total_size,
@@ -110,41 +107,16 @@ pub fn read_box_header(data: &[u8], offset: usize) -> Option<BoxHeader> {
 /// ```
 #[inline]
 pub fn read_box(data: &[u8], offset: usize) -> Option<BoxRead<'_>> {
-   // Need at least 8 bytes for standard header
-   if offset + 8 > data.len() {
-      return None;
-   }
-
-   let size32 = read_u32_be(data, offset)?;
-
-   let (header_len, total_size) = if size32 == 1 {
-      // Extended size: 64-bit size follows fourcc
-      if offset + 16 > data.len() {
-         return None;
-      }
-      (16, read_u64_be(data, offset + 8)? as usize)
-   } else if size32 == 0 {
-      // Size 0 means box extends to EOF - not supported in slice context
-      return None;
-   } else {
-      (8, size32 as usize)
-   };
-
-   // Validate size
-   if total_size < header_len || offset + total_size > data.len() {
-      return None;
-   }
+   let header = read_box_header(data, offset)?;
+   let payload_start = offset.checked_add(header.header_len)?;
+   let box_end = offset.checked_add(header.total_size)?;
+   let payload = data.get(payload_start..box_end)?;
 
    Some(BoxRead {
-      fourcc: [
-         data[offset + 4],
-         data[offset + 5],
-         data[offset + 6],
-         data[offset + 7],
-      ],
-      header_len,
-      total_size,
-      payload: &data[offset + header_len..offset + total_size],
+      fourcc: header.fourcc,
+      header_len: header.header_len,
+      total_size: header.total_size,
+      payload,
    })
 }
 

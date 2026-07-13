@@ -150,7 +150,7 @@ pub fn stts_sample_count(stts: &[u8]) -> Option<u32> {
    let mut offset = 8usize;
    for _ in 0..entry_count {
       total_samples = total_samples.checked_add(read_u32_be(stts, offset)?)?;
-      offset += 8;
+      offset = offset.checked_add(8)?;
    }
    Some(total_samples)
 }

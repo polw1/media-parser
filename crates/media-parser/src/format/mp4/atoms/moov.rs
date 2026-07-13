@@ -48,7 +48,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    let file_size = reader.size().await?;
 
    // Strategy 1: Head - iterate aligned boxes
-   let head_len = HEAD_SIZE.min(file_size as usize);
+   let head_len = HEAD_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
    let mut head_buf = vec![0u8; head_len];
    let _ = reader.read_at(0, &mut head_buf).await?;
 
@@ -57,7 +57,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    }
 
    // Strategy 2: Tail - pattern search for "moov" fourcc
-   let tail_len = TAIL_SIZE.min(file_size as usize);
+   let tail_len = TAIL_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
    let tail_offset = file_size.saturating_sub(tail_len as u64);
    let mut tail_buf = vec![0u8; tail_len];
    let _ = reader.read_at(tail_offset, &mut tail_buf).await?;
@@ -117,9 +117,9 @@ fn find_moov_aligned(buf: &[u8], base_offset: u64) -> Option<(u64, u64)> {
    let mut offset = 0usize;
    while let Some(h) = read_box_header(buf, offset) {
       if &h.fourcc == b"moov" {
-         return Some((base_offset + offset as u64, h.total_size as u64));
+         return Some((base_offset.checked_add(offset as u64)?, h.total_size as u64));
       }
-      offset += h.total_size;
+      offset = offset.checked_add(h.total_size)?;
    }
    None
 }
@@ -127,10 +127,15 @@ fn find_moov_aligned(buf: &[u8], base_offset: u64) -> Option<(u64, u64)> {
 /// Check if first child box has a valid moov child fourcc.
 fn has_valid_moov_child(buf: &[u8], payload_start: usize) -> bool {
    // Need at least 8 bytes: 4 for child size + 4 for child fourcc
-   if payload_start + 8 > buf.len() {
+   let Some(child_start) = payload_start.checked_add(4) else {
       return false;
-   }
-   let child_fourcc = &buf[payload_start + 4..payload_start + 8];
+   };
+   let Some(child_end) = payload_start.checked_add(8) else {
+      return false;
+   };
+   let Some(child_fourcc) = buf.get(child_start..child_end) else {
+      return false;
+   };
    MOOV_CHILD_FOURCCS
       .iter()
       .any(|&valid| valid == child_fourcc)
@@ -144,18 +149,23 @@ fn find_moov_pattern(buf: &[u8], base_offset: u64, file_size: u64) -> Option<(u6
             continue;
          };
          let size32 = size32 as u64;
-         let (box_start, box_size) = if size32 == 1 && i >= 12 && i + 12 <= buf.len() {
-            // Extended size
-            let ext_size = read_u64_be(buf, i + 4)?;
-            (base_offset + i as u64 - 4, ext_size)
-         } else if size32 >= 8 {
-            (base_offset + i as u64 - 4, size32)
-         } else {
-            continue;
-         };
+         let (box_start, box_size) =
+            if size32 == 1 && i >= 12 && i.checked_add(12).is_some_and(|end| end <= buf.len()) {
+               // Extended size
+               let ext_size = read_u64_be(buf, i.checked_add(4)?)?;
+               (base_offset.checked_add(i as u64)?.checked_sub(4)?, ext_size)
+            } else if size32 >= 8 {
+               (base_offset.checked_add(i as u64)?.checked_sub(4)?, size32)
+            } else {
+               continue;
+            };
 
          // Validate: box fits in file AND has valid first child
-         if box_start + box_size <= file_size && has_valid_moov_child(buf, i + 4) {
+         if box_start
+            .checked_add(box_size)
+            .is_some_and(|box_end| box_end <= file_size)
+            && has_valid_moov_child(buf, i.checked_add(4)?)
+         {
             return Some((box_start, box_size));
          }
       }
