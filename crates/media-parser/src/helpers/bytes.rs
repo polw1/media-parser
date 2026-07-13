@@ -83,6 +83,16 @@ mod tests {
    }
 
    #[test]
+   fn test_read_with_overflowing_offset_returns_none() {
+      let buf = [0u8; 8];
+
+      assert_eq!(read_u16_be(&buf, usize::MAX), None);
+      assert_eq!(read_u16_le(&buf, usize::MAX), None);
+      assert_eq!(read_u32_be(&buf, usize::MAX), None);
+      assert_eq!(read_u64_be(&buf, usize::MAX), None);
+   }
+
+   #[test]
    fn test_read_empty_buffer() {
       let buf: [u8; 0] = [];
       assert_eq!(read_u16_be(&buf, 0), None);

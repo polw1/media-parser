@@ -166,6 +166,27 @@ mod tests {
    }
 
    #[test]
+   fn test_read_box_rejects_unrepresentable_extended_size() {
+      let mut data = vec![0u8; 8];
+      data.extend_from_slice(&1u32.to_be_bytes());
+      data.extend_from_slice(b"mdat");
+      data.extend_from_slice(&u64::MAX.to_be_bytes());
+
+      assert!(read_box(&data, 8).is_none());
+   }
+
+   #[cfg(target_pointer_width = "32")]
+   #[test]
+   fn test_read_box_header_rejects_unrepresentable_extended_size() {
+      let mut data = Vec::new();
+      data.extend_from_slice(&1u32.to_be_bytes());
+      data.extend_from_slice(b"mdat");
+      data.extend_from_slice(&u64::MAX.to_be_bytes());
+
+      assert!(read_box_header(&data, 0).is_none());
+   }
+
+   #[test]
    fn test_read_box_with_offset() {
       let mut data = make_box(b"ftyp", &[0; 8]);
       data.extend(make_box(b"moov", &[1, 2, 3, 4]));

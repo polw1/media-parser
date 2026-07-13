@@ -213,6 +213,16 @@ mod tests {
    }
 
    #[test]
+   fn test_find_moov_aligned_rejects_overflowing_box_offset() {
+      let mut buf = make_box(b"free", 0);
+      buf.extend_from_slice(&1u32.to_be_bytes());
+      buf.extend_from_slice(b"skip");
+      buf.extend_from_slice(&u64::MAX.to_be_bytes());
+
+      assert_eq!(find_moov_aligned(&buf, 0), None);
+   }
+
+   #[test]
    fn test_find_moov_pattern_unaligned() {
       // Simulate tail buffer that starts mid-file
       let mut buf = vec![0u8; 100]; // garbage prefix
@@ -239,6 +249,16 @@ mod tests {
 
       let result = find_moov_pattern(&buf, base_offset, file_size);
       assert!(result.is_none()); // Should reject fake moov
+   }
+
+   #[test]
+   fn test_find_moov_pattern_rejects_overflowing_file_end() {
+      let mut buf = Vec::new();
+      buf.extend_from_slice(&8u32.to_be_bytes());
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(b"mvhd");
+
+      assert_eq!(find_moov_pattern(&buf, u64::MAX - 1, u64::MAX), None);
    }
 
    #[test]
