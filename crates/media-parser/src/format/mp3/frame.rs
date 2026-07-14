@@ -101,11 +101,6 @@ pub enum FrameParseResult {
       /// Offset where frame starts.
       offset: u64,
    },
-   /// Sync bytes found but header is invalid.
-   InvalidHeader {
-      /// Offset where invalid sync was found.
-      offset: u64,
-   },
    /// No frame sync found in search range.
    NotFound,
    /// End of data reached.
@@ -121,11 +116,10 @@ impl FrameParseResult {
       }
    }
 
-   /// Returns the offset if a sync was found (valid or invalid).
+   /// Returns the offset if a valid frame was found.
    pub fn offset(&self) -> Option<u64> {
       match self {
          FrameParseResult::Found { offset, .. } => Some(*offset),
-         FrameParseResult::InvalidHeader { offset } => Some(*offset),
          _ => None,
       }
    }
@@ -249,7 +243,12 @@ pub async fn find_first_frame(
    let mut external_validations = 0usize;
 
    while offset < end_offset {
-      let read_size = ((end_offset - offset) as usize).min(BUFFER_SIZE);
+      let remaining = end_offset - offset;
+      if remaining < FRAME_HEADER_SIZE as u64 {
+         return FrameParseResult::NotFound;
+      }
+
+      let read_size = (remaining as usize).min(BUFFER_SIZE);
       let bytes_read = match reader.read_at(offset, &mut buffer[..read_size]).await {
          Ok(n) => n,
          Err(_) => return FrameParseResult::EndOfData,
@@ -333,6 +332,25 @@ pub async fn find_first_frame(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use async_trait::async_trait;
+
+   struct BytesReader(Vec<u8>);
+
+   #[async_trait]
+   impl StreamReader for BytesReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> crate::Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
 
    #[test]
    fn test_parse_header_mpeg1_l3_128kbps() {
@@ -462,5 +480,25 @@ mod tests {
       assert!(!not_found.is_found());
       assert_eq!(not_found.offset(), None);
       assert!(not_found.header().is_none());
+   }
+
+   #[tokio::test]
+   async fn test_find_first_frame_returns_not_found_after_scanning_window() {
+      let reader = BytesReader(vec![0; 16]);
+
+      assert!(matches!(
+         find_first_frame(&reader, 0, 16).await,
+         FrameParseResult::NotFound
+      ));
+   }
+
+   #[tokio::test]
+   async fn test_find_first_frame_returns_end_of_data_for_short_input() {
+      let reader = BytesReader(vec![0; FRAME_HEADER_SIZE - 1]);
+
+      assert!(matches!(
+         find_first_frame(&reader, 0, 16).await,
+         FrameParseResult::EndOfData
+      ));
    }
 }
