@@ -78,7 +78,7 @@ async fn parse_mp3(reader: &dyn StreamReader) -> Result<Metadata> {
 }
 
 async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
-   let (header, offset) = match frame::find_first_frame(reader, 0, frame::MAX_SYNC_SEARCH).await {
+   let (header, offset) = match frame::find_first_frame(reader, 0, frame::MAX_SYNC_SEARCH).await? {
       frame::FrameParseResult::Found { header, offset } => (header, offset),
       frame::FrameParseResult::NotFound | frame::FrameParseResult::EndOfData => {
          return Ok(Vec::new());
@@ -128,6 +128,8 @@ mod tests {
 
    struct BytesReader(Vec<u8>);
 
+   struct FailingReader;
+
    #[async_trait]
    impl StreamReader for BytesReader {
       async fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
@@ -141,6 +143,19 @@ mod tests {
 
       async fn size(&self) -> crate::Result<u64> {
          Ok(self.0.len() as u64)
+      }
+   }
+
+   #[async_trait]
+   impl StreamReader for FailingReader {
+      async fn read_at(&self, _: u64, _: &mut [u8]) -> crate::Result<usize> {
+         Err(crate::errors::MediaParserError::Other(
+            "read failure".into(),
+         ))
+      }
+
+      async fn size(&self) -> crate::Result<u64> {
+         Ok(0)
       }
    }
 
@@ -159,5 +174,13 @@ mod tests {
       let data = vec![0; frame::MAX_SYNC_SEARCH as usize];
 
       assert!(read_tracks(&BytesReader(data)).await.unwrap().is_empty());
+   }
+
+   #[tokio::test]
+   async fn read_tracks_propagates_reader_errors() {
+      assert!(matches!(
+         read_tracks(&FailingReader).await,
+         Err(crate::errors::MediaParserError::Other(message)) if message == "read failure"
+      ));
    }
 }

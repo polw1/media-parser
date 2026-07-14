@@ -411,7 +411,7 @@ pub async fn calculate_duration_with_strategy<S: DurationStrategy>(
    }
 
    // Find first audio frame
-   let frame_result = find_first_frame(reader, id3_size, MAX_SYNC_SEARCH).await;
+   let frame_result = find_first_frame(reader, id3_size, MAX_SYNC_SEARCH).await?;
 
    let (header, frame_offset) = match frame_result {
       FrameParseResult::Found { header, offset } => (header, offset),

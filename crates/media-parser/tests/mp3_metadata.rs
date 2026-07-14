@@ -71,7 +71,7 @@ async fn test_cbr_stereo_44100_192() {
    let path = fixtures_dir().join("stereo_cbr_192k.mp3");
    let reader = FileStreamReader::new(&path).expect("open fixture");
 
-   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await {
+   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await.unwrap() {
       FrameParseResult::Found { header, offset } => (header, offset),
       other => panic!("Expected Found, got {other:?}"),
    };
@@ -105,7 +105,7 @@ async fn test_cbr_stereo_32000_64() {
    let path = fixtures_dir().join("stereo_cbr_32khz_64k.mp3");
    let reader = FileStreamReader::new(&path).expect("open fixture");
 
-   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await {
+   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await.unwrap() {
       FrameParseResult::Found { header, offset } => (header, offset),
       other => panic!("Expected Found, got {other:?}"),
    };
@@ -137,7 +137,7 @@ async fn test_vbr_stereo_44100() {
    let path = fixtures_dir().join("stereo_vbr_128k.mp3");
    let reader = FileStreamReader::new(&path).expect("open fixture");
 
-   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await {
+   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await.unwrap() {
       FrameParseResult::Found { header, offset } => (header, offset),
       other => panic!("Expected Found, got {other:?}"),
    };
@@ -170,7 +170,7 @@ async fn test_vbr_mono_22050() {
    let path = fixtures_dir().join("mono_vbr_22khz.mp3");
    let reader = FileStreamReader::new(&path).expect("open fixture");
 
-   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await {
+   let (header, offset) = match find_first_frame(&reader, 0, MAX_SYNC_SEARCH).await.unwrap() {
       FrameParseResult::Found { header, offset } => (header, offset),
       other => panic!("Expected Found, got {other:?}"),
    };

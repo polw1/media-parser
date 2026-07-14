@@ -5,6 +5,7 @@
 use super::tables::{
    MpegLayer, MpegVersion, bitrate_kbps, frame_size, sample_rate_hz, samples_per_frame,
 };
+use crate::Result;
 use crate::stream::StreamReader;
 
 /// Frame header size in bytes.
@@ -224,38 +225,40 @@ pub fn parse_header(bytes: [u8; 4]) -> Option<FrameHeader> {
 /// ```no_run
 /// use media_parser::format::mp3::frame::{find_first_frame, MAX_SYNC_SEARCH};
 ///
-/// async fn example(reader: &dyn media_parser::StreamReader) {
-///     let result = find_first_frame(reader, 0, MAX_SYNC_SEARCH).await;
+/// async fn example(reader: &dyn media_parser::StreamReader) -> media_parser::Result<()> {
+///     let result = find_first_frame(reader, 0, MAX_SYNC_SEARCH).await?;
 ///     if let media_parser::format::mp3::frame::FrameParseResult::Found { header, offset } = result {
 ///         println!("Found frame at offset {}: {:?}", offset, header);
 ///     }
+///     Ok(())
 /// }
 /// ```
 pub async fn find_first_frame(
    reader: &dyn StreamReader,
    start_offset: u64,
    max_search: u64,
-) -> FrameParseResult {
+) -> Result<FrameParseResult> {
    const BUFFER_SIZE: usize = 4096;
    let mut buffer = vec![0u8; BUFFER_SIZE];
    let mut offset = start_offset;
-   let end_offset = start_offset + max_search;
+   let end_offset = start_offset.checked_add(max_search).ok_or_else(|| {
+      crate::errors::MediaParserError::Other("MP3 frame search range overflow".into())
+   })?;
    let mut external_validations = 0usize;
 
    while offset < end_offset {
       let remaining = end_offset - offset;
       if remaining < FRAME_HEADER_SIZE as u64 {
-         return FrameParseResult::NotFound;
+         return Ok(FrameParseResult::NotFound);
       }
 
-      let read_size = (remaining as usize).min(BUFFER_SIZE);
-      let bytes_read = match reader.read_at(offset, &mut buffer[..read_size]).await {
-         Ok(n) => n,
-         Err(_) => return FrameParseResult::EndOfData,
-      };
+      let read_size = usize::try_from(remaining)
+         .unwrap_or(BUFFER_SIZE)
+         .min(BUFFER_SIZE);
+      let bytes_read = reader.read_at(offset, &mut buffer[..read_size]).await?;
 
       if bytes_read < FRAME_HEADER_SIZE {
-         return FrameParseResult::EndOfData;
+         return Ok(FrameParseResult::EndOfData);
       }
 
       // Scan buffer for sync word
@@ -294,29 +297,27 @@ pub async fn find_first_frame(
                   // Next frame falls outside the buffer; pay for a bounded read.
                   external_validations += 1;
                   let mut next_header = [0u8; FRAME_HEADER_SIZE];
-                  matches!(
-                     reader.read_at(next_offset, &mut next_header).await,
-                     Ok(n) if n >= FRAME_HEADER_SIZE && parse_header(next_header).is_some()
-                  )
+                  let bytes_read = reader.read_at(next_offset, &mut next_header).await?;
+                  bytes_read >= FRAME_HEADER_SIZE && parse_header(next_header).is_some()
                } else {
                   false
                };
 
                if next_is_valid {
                   // Found valid frame with valid next frame.
-                  return FrameParseResult::Found {
+                  return Ok(FrameParseResult::Found {
                      header,
                      offset: frame_offset,
-                  };
+                  });
                }
 
                // No valid next frame, but this frame looks valid.
                // Accept it if we've searched enough bytes.
-               if frame_offset > start_offset + MIN_SEARCH_BEFORE_FALLBACK {
-                  return FrameParseResult::Found {
+               if frame_offset.saturating_sub(start_offset) > MIN_SEARCH_BEFORE_FALLBACK {
+                  return Ok(FrameParseResult::Found {
                      header,
                      offset: frame_offset,
-                  };
+                  });
                }
             }
          }
@@ -326,7 +327,7 @@ pub async fn find_first_frame(
       offset += (bytes_read - FRAME_HEADER_SIZE + 1) as u64;
    }
 
-   FrameParseResult::NotFound
+   Ok(FrameParseResult::NotFound)
 }
 
 #[cfg(test)]
@@ -335,6 +336,8 @@ mod tests {
    use async_trait::async_trait;
 
    struct BytesReader(Vec<u8>);
+
+   struct FailingReader;
 
    #[async_trait]
    impl StreamReader for BytesReader {
@@ -349,6 +352,19 @@ mod tests {
 
       async fn size(&self) -> crate::Result<u64> {
          Ok(self.0.len() as u64)
+      }
+   }
+
+   #[async_trait]
+   impl StreamReader for FailingReader {
+      async fn read_at(&self, _: u64, _: &mut [u8]) -> crate::Result<usize> {
+         Err(crate::errors::MediaParserError::Other(
+            "read failure".into(),
+         ))
+      }
+
+      async fn size(&self) -> crate::Result<u64> {
+         Ok(0)
       }
    }
 
@@ -487,7 +503,7 @@ mod tests {
       let reader = BytesReader(vec![0; 16]);
 
       assert!(matches!(
-         find_first_frame(&reader, 0, 16).await,
+         find_first_frame(&reader, 0, 16).await.unwrap(),
          FrameParseResult::NotFound
       ));
    }
@@ -497,8 +513,16 @@ mod tests {
       let reader = BytesReader(vec![0; FRAME_HEADER_SIZE - 1]);
 
       assert!(matches!(
-         find_first_frame(&reader, 0, 16).await,
+         find_first_frame(&reader, 0, 16).await.unwrap(),
          FrameParseResult::EndOfData
+      ));
+   }
+
+   #[tokio::test]
+   async fn test_find_first_frame_propagates_reader_errors() {
+      assert!(matches!(
+         find_first_frame(&FailingReader, 0, 16).await,
+         Err(crate::errors::MediaParserError::Other(message)) if message == "read failure"
       ));
    }
 }
