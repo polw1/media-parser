@@ -52,6 +52,16 @@ pub enum DurationMethod {
    Estimated,
 }
 
+impl std::fmt::Display for DurationMethod {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str(match self {
+         Self::VbrHeader => "VbrHeader",
+         Self::Cbr => "Cbr",
+         Self::Estimated => "Estimated",
+      })
+   }
+}
+
 /// VBR header information (Xing or VBRI).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VbrInfo {
@@ -394,6 +404,15 @@ pub async fn calculate_duration(reader: &dyn StreamReader, id3_size: u64) -> Res
    calculate_duration_with_strategy(reader, id3_size, &AutoStrategy).await
 }
 
+pub(super) async fn calculate_duration_from_frame(
+   reader: &dyn StreamReader,
+   header: &FrameHeader,
+   frame_offset: u64,
+) -> Result<Duration> {
+   let file_size = reader.size().await?;
+   Ok(calculate_duration_for_frame(reader, header, frame_offset, file_size, &AutoStrategy).await)
+}
+
 /// Calculates duration using a specific option.
 ///
 /// Allows dependency injection of custom options for testing
@@ -418,13 +437,21 @@ pub async fn calculate_duration_with_strategy<S: DurationStrategy>(
       _ => return Ok(Duration::zero()),
    };
 
+   Ok(calculate_duration_for_frame(reader, &header, frame_offset, file_size, strategy).await)
+}
+
+async fn calculate_duration_for_frame<S: DurationStrategy>(
+   reader: &dyn StreamReader,
+   header: &FrameHeader,
+   frame_offset: u64,
+   file_size: u64,
+   strategy: &S,
+) -> Duration {
    // Try to parse VBR header
-   let vbr_info = parse_vbr_header(reader, frame_offset, &header).await;
+   let vbr_info = parse_vbr_header(reader, frame_offset, header).await;
 
    // Calculate duration using strategy
-   let duration = strategy.calculate(&header, frame_offset, file_size, vbr_info.as_ref());
-
-   Ok(duration)
+   strategy.calculate(header, frame_offset, file_size, vbr_info.as_ref())
 }
 
 #[cfg(test)]

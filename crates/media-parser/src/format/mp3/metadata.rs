@@ -40,8 +40,7 @@ pub async fn read_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
       Some(h) => {
          let frames = read_id3_frames(reader, &h).await?;
          let values = frames_to_meta(frames);
-         let end = ID3_HEADER_SIZE as u64 + h.tag_size as u64;
-         (values, end)
+         (values, id3_end(&h))
       }
       None => (vec![], 0),
    };
@@ -62,6 +61,17 @@ struct Id3Header {
    #[allow(dead_code)]
    flags: u8,
    tag_size: u32,
+}
+
+const fn id3_end(header: &Id3Header) -> u64 {
+   ID3_HEADER_SIZE as u64 + header.tag_size as u64
+}
+
+pub(super) async fn read_id3_end(reader: &dyn StreamReader) -> Result<u64> {
+   Ok(try_read_id3_header(reader)
+      .await?
+      .as_ref()
+      .map_or(0, id3_end))
 }
 
 /// Tries to read the ID3v2 header. Returns None if not present.

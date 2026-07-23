@@ -78,24 +78,29 @@ async fn parse_mp3(reader: &dyn StreamReader) -> Result<Metadata> {
 }
 
 async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
-   let (header, offset) = match frame::find_first_frame(reader, 0, frame::MAX_SYNC_SEARCH).await? {
+   let id3_end = metadata::read_id3_end(reader).await?;
+   let (header, offset) = match frame::find_first_frame_with_fallback_origin(
+      reader,
+      id3_end,
+      frame::MAX_SYNC_SEARCH,
+      0,
+   )
+   .await?
+   {
       frame::FrameParseResult::Found { header, offset } => (header, offset),
       frame::FrameParseResult::NotFound | frame::FrameParseResult::EndOfData => {
          return Ok(Vec::new());
       }
    };
 
-   let duration = duration::calculate_duration(reader, 0).await?;
+   let duration = duration::calculate_duration_from_frame(reader, &header, offset).await?;
    let mut properties = HashMap::new();
    properties.insert("offset".to_string(), offset.to_string());
    properties.insert("bitrate_kbps".to_string(), header.bitrate_kbps.to_string());
-   properties.insert("mpeg_version".to_string(), format!("{:?}", header.version));
-   properties.insert("mpeg_layer".to_string(), format!("{:?}", header.layer));
+   properties.insert("mpeg_version".to_string(), header.version.to_string());
+   properties.insert("mpeg_layer".to_string(), header.layer.to_string());
    properties.insert("channel_mode".to_string(), header.channel_mode.to_string());
-   properties.insert(
-      "duration_method".to_string(),
-      format!("{:?}", duration.method),
-   );
+   properties.insert("duration_method".to_string(), duration.method.to_string());
 
    Ok(vec![TrackType::Audio(AudioTrackMeta {
       base: BaseTrackMeta {
@@ -159,6 +164,33 @@ mod tests {
       }
    }
 
+   fn mp3_with_id3(tag_size: usize, frame_count: usize) -> Vec<u8> {
+      const FRAME_SIZE: usize = 417;
+      let audio_start = 10 + tag_size;
+      let mut data = vec![0; audio_start + FRAME_SIZE * frame_count];
+      let syncsafe_size = tag_size as u32;
+
+      data[..10].copy_from_slice(&[
+         b'I',
+         b'D',
+         b'3',
+         4,
+         0,
+         0,
+         ((syncsafe_size >> 21) & 0x7f) as u8,
+         ((syncsafe_size >> 14) & 0x7f) as u8,
+         ((syncsafe_size >> 7) & 0x7f) as u8,
+         (syncsafe_size & 0x7f) as u8,
+      ]);
+
+      for index in 0..frame_count {
+         let offset = audio_start + FRAME_SIZE * index;
+         data[offset..offset + 4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+      }
+
+      data
+   }
+
    #[tokio::test]
    async fn read_tracks_returns_empty_for_end_of_data() {
       assert!(
@@ -174,6 +206,48 @@ mod tests {
       let data = vec![0; frame::MAX_SYNC_SEARCH as usize];
 
       assert!(read_tracks(&BytesReader(data)).await.unwrap().is_empty());
+   }
+
+   #[tokio::test]
+   async fn read_tracks_skips_large_id3v2_tag() {
+      let tag_size = frame::MAX_SYNC_SEARCH as usize + 1;
+      let audio_start = 10 + tag_size;
+
+      let tracks = read_tracks(&BytesReader(mp3_with_id3(tag_size, 2)))
+         .await
+         .unwrap();
+
+      assert_eq!(tracks.len(), 1);
+      let TrackType::Audio(track) = &tracks[0] else {
+         panic!("expected an audio track");
+      };
+      assert_eq!(
+         track.base.properties.get("offset"),
+         Some(&audio_start.to_string())
+      );
+      assert_eq!(track.base.duration, 52);
+      assert_eq!(track.channels, 2);
+      assert_eq!(track.sample_rate, 44_100);
+   }
+
+   #[tokio::test]
+   async fn read_tracks_keeps_single_frame_after_id3v2_tag() {
+      let tag_size = 2 * 1024;
+      let audio_start = 10 + tag_size;
+
+      let tracks = read_tracks(&BytesReader(mp3_with_id3(tag_size, 1)))
+         .await
+         .unwrap();
+
+      assert_eq!(tracks.len(), 1);
+      let TrackType::Audio(track) = &tracks[0] else {
+         panic!("expected an audio track");
+      };
+      assert_eq!(
+         track.base.properties.get("offset"),
+         Some(&audio_start.to_string())
+      );
+      assert_eq!(track.base.duration, 26);
    }
 
    #[tokio::test]

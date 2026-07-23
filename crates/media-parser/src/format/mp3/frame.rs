@@ -238,6 +238,15 @@ pub async fn find_first_frame(
    start_offset: u64,
    max_search: u64,
 ) -> Result<FrameParseResult> {
+   find_first_frame_with_fallback_origin(reader, start_offset, max_search, start_offset).await
+}
+
+pub(super) async fn find_first_frame_with_fallback_origin(
+   reader: &dyn StreamReader,
+   start_offset: u64,
+   max_search: u64,
+   fallback_origin: u64,
+) -> Result<FrameParseResult> {
    const BUFFER_SIZE: usize = 4096;
    let mut buffer = vec![0u8; BUFFER_SIZE];
    let mut offset = start_offset;
@@ -313,7 +322,7 @@ pub async fn find_first_frame(
 
                // No valid next frame, but this frame looks valid.
                // Accept it if we've searched enough bytes.
-               if frame_offset.saturating_sub(start_offset) > MIN_SEARCH_BEFORE_FALLBACK {
+               if frame_offset.saturating_sub(fallback_origin) > MIN_SEARCH_BEFORE_FALLBACK {
                   return Ok(FrameParseResult::Found {
                      header,
                      offset: frame_offset,
