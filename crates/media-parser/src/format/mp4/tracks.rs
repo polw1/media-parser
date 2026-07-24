@@ -4,7 +4,7 @@
 
 use super::atoms::{
    Mp4Nav, audio_params, find_and_read_moov_box, fourcc_string, iter_boxes, parse_hdlr, parse_mdhd,
-   parse_stsd, parse_tkhd, stts_sample_count, visual_dimensions,
+   parse_stsd, parse_tkhd, read_box, stts_sample_count, visual_dimensions,
 };
 use crate::Result;
 use crate::errors::MediaParserError;
@@ -38,25 +38,36 @@ enum SampleEntry {
 /// Reads all MP4 tracks from the `moov/trak` boxes.
 pub async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    let moov_data = find_and_read_moov_box(reader).await?;
-   let moov_payload = if moov_data.len() >= 8 && &moov_data[4..8] == b"moov" {
-      &moov_data[8..]
-   } else {
-      &moov_data
-   };
+   let moov_payload = read_box(&moov_data, 0)
+      .filter(|box_read| box_read.fourcc == *b"moov")
+      .map(|box_read| box_read.payload)
+      .ok_or_else(|| MediaParserError::InvalidFormat("invalid moov box".to_string()))?;
 
    let mut tracks = Vec::new();
+   let mut trak_count = 0usize;
+   let mut malformed_count = 0usize;
    for (fourcc, trak) in iter_boxes(moov_payload) {
       if &fourcc != b"trak" {
          continue;
       }
+      trak_count += 1;
 
       // Best-effort: skip a malformed trak (missing the spec-required
       // tkhd/mdia/mdhd) instead of failing the whole file, so one bad track
       // doesn't drop every other track.
       match parse_trak(trak) {
          Ok(track) => tracks.push(track),
-         Err(e) => tracing::warn!("skipping malformed trak: {e}"),
+         Err(e) => {
+            malformed_count += 1;
+            tracing::warn!("skipping malformed trak: {e}");
+         }
       }
+   }
+
+   if trak_count > 0 && tracks.is_empty() {
+      return Err(MediaParserError::InvalidFormat(format!(
+         "all trak boxes are malformed (count: {malformed_count})"
+      )));
    }
 
    Ok(tracks)
@@ -209,6 +220,14 @@ mod tests {
       b
    }
 
+   fn extended_mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+      let mut b = 1u32.to_be_bytes().to_vec();
+      b.extend_from_slice(fourcc);
+      b.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
+      b.extend_from_slice(payload);
+      b
+   }
+
    fn tkhd(id: u32) -> Vec<u8> {
       // version 0; track_id at offset 12, width/height (fixed 16.16) at 76/80.
       let mut p = vec![0u8; 84];
@@ -310,5 +329,30 @@ mod tests {
 
       assert_eq!(tracks.len(), 1);
       assert!(matches!(tracks[0], TrackType::Video(_)));
+   }
+
+   #[tokio::test]
+   async fn read_tracks_supports_extended_size_moov_header() {
+      let trak = mp4_box(b"trak", &trak_payload(1, b"vide"));
+      let moov = extended_mp4_box(b"moov", &trak);
+
+      let tracks = read_tracks(&BytesReader(moov)).await.unwrap();
+
+      assert_eq!(tracks.len(), 1);
+      assert!(matches!(tracks[0], TrackType::Video(_)));
+   }
+
+   #[tokio::test]
+   async fn read_tracks_errors_when_every_trak_is_malformed() {
+      let bad = mp4_box(b"trak", &mp4_box(b"tkhd", &tkhd(2)));
+      let moov = mp4_box(b"moov", &bad);
+
+      let error = read_tracks(&BytesReader(moov)).await.unwrap_err();
+
+      assert!(
+         error
+            .to_string()
+            .contains("all trak boxes are malformed (count: 1)")
+      );
    }
 }

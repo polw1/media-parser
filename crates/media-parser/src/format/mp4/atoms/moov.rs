@@ -149,13 +149,21 @@ fn find_moov_pattern(buf: &[u8], base_offset: u64, file_size: u64) -> Option<(u6
             continue;
          };
          let size32 = size32 as u64;
-         let (box_start, box_size) =
+         let (box_start, box_size, payload_start) =
             if size32 == 1 && i >= 12 && i.checked_add(12).is_some_and(|end| end <= buf.len()) {
                // Extended size
                let ext_size = read_u64_be(buf, i.checked_add(4)?)?;
-               (base_offset.checked_add(i as u64)?.checked_sub(4)?, ext_size)
+               (
+                  base_offset.checked_add(i as u64)?.checked_sub(4)?,
+                  ext_size,
+                  i.checked_add(12)?,
+               )
             } else if size32 >= 8 {
-               (base_offset.checked_add(i as u64)?.checked_sub(4)?, size32)
+               (
+                  base_offset.checked_add(i as u64)?.checked_sub(4)?,
+                  size32,
+                  i.checked_add(4)?,
+               )
             } else {
                continue;
             };
@@ -164,7 +172,7 @@ fn find_moov_pattern(buf: &[u8], base_offset: u64, file_size: u64) -> Option<(u6
          if box_start
             .checked_add(box_size)
             .is_some_and(|box_end| box_end <= file_size)
-            && has_valid_moov_child(buf, i.checked_add(4)?)
+            && has_valid_moov_child(buf, payload_start)
          {
             return Some((box_start, box_size));
          }
@@ -193,6 +201,18 @@ mod tests {
       let mut buf = Vec::with_capacity(total);
       buf.extend_from_slice(&(total as u32).to_be_bytes());
       buf.extend_from_slice(b"moov");
+      buf.extend(mvhd);
+      buf
+   }
+
+   /// Create an extended-size moov box with a valid mvhd child inside.
+   fn make_extended_moov_with_mvhd() -> Vec<u8> {
+      let mvhd = make_box(b"mvhd", 100);
+      let total = 16 + mvhd.len();
+      let mut buf = Vec::with_capacity(total);
+      buf.extend_from_slice(&1u32.to_be_bytes());
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(&(total as u64).to_be_bytes());
       buf.extend(mvhd);
       buf
    }
@@ -237,6 +257,23 @@ mod tests {
       let (pos, size) = result.unwrap();
       assert_eq!(size as usize, moov_size);
       assert_eq!(pos, base_offset + 100);
+   }
+
+   #[test]
+   fn test_find_extended_moov_pattern_unaligned() {
+      let mut buf = vec![0u8; 100];
+      let moov = make_extended_moov_with_mvhd();
+      let moov_size = moov.len();
+      buf.extend(moov);
+      let file_size = 10_000u64;
+      let base_offset = file_size - buf.len() as u64;
+
+      let result = find_moov_pattern(&buf, base_offset, file_size);
+
+      assert_eq!(
+         result,
+         Some((base_offset + 100, u64::try_from(moov_size).unwrap()))
+      );
    }
 
    #[test]

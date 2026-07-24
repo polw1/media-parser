@@ -45,8 +45,11 @@ const HDLR_HANDLER_TYPE_OFFSET: usize = 8;
 const STSD_ENTRIES_OFFSET: usize = 8;
 const VISUAL_WIDTH_OFFSET: usize = 24;
 const VISUAL_HEIGHT_OFFSET: usize = 26;
+const AUDIO_VERSION_OFFSET: usize = 8;
 const AUDIO_CHANNELS_OFFSET: usize = 16;
 const AUDIO_SAMPLE_RATE_OFFSET: usize = 24;
+const AUDIO_V2_SAMPLE_RATE_OFFSET: usize = 32;
+const AUDIO_V2_CHANNELS_OFFSET: usize = 40;
 
 pub fn parse_tkhd(tkhd: &[u8]) -> Option<TrackHeader> {
    let version = *tkhd.first()?;
@@ -138,10 +141,21 @@ pub fn visual_dimensions(payload: &[u8]) -> (Option<u32>, Option<u32>) {
 }
 
 pub fn audio_params(payload: &[u8]) -> (Option<u16>, Option<u32>) {
-   (
-      read_u16_be(payload, AUDIO_CHANNELS_OFFSET),
-      read_u32_be(payload, AUDIO_SAMPLE_RATE_OFFSET).map(|rate| rate >> 16),
-   )
+   match read_u16_be(payload, AUDIO_VERSION_OFFSET) {
+      Some(0 | 1) => (
+         read_u16_be(payload, AUDIO_CHANNELS_OFFSET),
+         read_u32_be(payload, AUDIO_SAMPLE_RATE_OFFSET).map(|rate| rate >> 16),
+      ),
+      Some(2) => (
+         read_u32_be(payload, AUDIO_V2_CHANNELS_OFFSET)
+            .and_then(|channels| u16::try_from(channels).ok()),
+         read_u64_be(payload, AUDIO_V2_SAMPLE_RATE_OFFSET).and_then(|bits| {
+            let rate = f64::from_bits(bits);
+            (rate.is_finite() && rate > 0.0 && rate <= u32::MAX as f64).then(|| rate.round() as u32)
+         }),
+      ),
+      _ => (None, None),
+   }
 }
 
 pub fn stts_sample_count(stts: &[u8]) -> Option<u32> {
@@ -276,12 +290,12 @@ mod tests {
    }
 
    #[test]
-   fn test_parse_stsd_audio_entry() {
+   fn test_parse_stsd_audio_v0_entry() {
       let mut audio_payload = vec![0u8; 28];
-      audio_payload[AUDIO_CHANNELS_OFFSET..AUDIO_CHANNELS_OFFSET + 2]
-         .copy_from_slice(&2u16.to_be_bytes());
-      audio_payload[AUDIO_SAMPLE_RATE_OFFSET..AUDIO_SAMPLE_RATE_OFFSET + 4]
-         .copy_from_slice(&(44_100u32 << 16).to_be_bytes());
+      // Spec-derived literals keep the test independent from parser constants.
+      audio_payload[8..10].copy_from_slice(&0u16.to_be_bytes());
+      audio_payload[16..18].copy_from_slice(&2u16.to_be_bytes());
+      audio_payload[24..28].copy_from_slice(&(44_100u32 << 16).to_be_bytes());
 
       let mut stsd = vec![0u8; 8];
       stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
@@ -290,6 +304,33 @@ mod tests {
       let parsed = parse_stsd(&stsd, audio_params).unwrap();
       assert_eq!(parsed.codec, "mp4a");
       assert_eq!(parsed.entry, (Some(2), Some(44_100)));
+   }
+
+   #[test]
+   fn test_parse_stsd_audio_v2_entry() {
+      let mut audio_payload = vec![0u8; 44];
+      // QuickTime v2 stores the rate as an IEEE-754 f64 and channels as u32.
+      audio_payload[8..10].copy_from_slice(&2u16.to_be_bytes());
+      audio_payload[32..40].copy_from_slice(&192_000f64.to_bits().to_be_bytes());
+      audio_payload[40..44].copy_from_slice(&6u32.to_be_bytes());
+
+      let mut stsd = vec![0u8; 8];
+      stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stsd.extend(make_box(b"lpcm", &audio_payload));
+
+      let parsed = parse_stsd(&stsd, audio_params).unwrap();
+      assert_eq!(parsed.codec, "lpcm");
+      assert_eq!(parsed.entry, (Some(6), Some(192_000)));
+   }
+
+   #[test]
+   fn test_audio_params_rejects_unknown_version() {
+      let mut audio_payload = vec![0u8; 28];
+      audio_payload[8..10].copy_from_slice(&3u16.to_be_bytes());
+      audio_payload[16..18].copy_from_slice(&2u16.to_be_bytes());
+      audio_payload[24..28].copy_from_slice(&(48_000u32 << 16).to_be_bytes());
+
+      assert_eq!(audio_params(&audio_payload), (None, None));
    }
 
    fn make_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
