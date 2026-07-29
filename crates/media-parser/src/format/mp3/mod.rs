@@ -79,19 +79,13 @@ async fn parse_mp3(reader: &dyn StreamReader) -> Result<Metadata> {
 
 async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    let id3_end = metadata::read_id3_end(reader).await?;
-   let (header, offset) = match frame::find_first_frame_with_fallback_origin(
-      reader,
-      id3_end,
-      frame::MAX_SYNC_SEARCH,
-      0,
-   )
-   .await?
-   {
-      frame::FrameParseResult::Found { header, offset } => (header, offset),
-      frame::FrameParseResult::NotFound | frame::FrameParseResult::EndOfData => {
-         return Ok(Vec::new());
-      }
-   };
+   let (header, offset) =
+      match frame::find_first_frame(reader, id3_end, frame::MAX_SYNC_SEARCH).await? {
+         frame::FrameParseResult::Found { header, offset } => (header, offset),
+         frame::FrameParseResult::NotFound | frame::FrameParseResult::EndOfData => {
+            return Ok(Vec::new());
+         }
+      };
 
    let duration = duration::calculate_duration_from_frame(reader, &header, offset).await?;
    let mut properties = HashMap::new();
@@ -231,23 +225,15 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn read_tracks_keeps_single_frame_after_id3v2_tag() {
+   async fn read_tracks_and_metadata_reject_single_unconfirmed_frame_after_id3v2_tag() {
       let tag_size = 2 * 1024;
-      let audio_start = 10 + tag_size;
+      let reader = BytesReader(mp3_with_id3(tag_size, 1));
 
-      let tracks = read_tracks(&BytesReader(mp3_with_id3(tag_size, 1)))
-         .await
-         .unwrap();
+      let tracks = read_tracks(&reader).await.unwrap();
+      let metadata = metadata::read_metadata(&reader).await.unwrap();
 
-      assert_eq!(tracks.len(), 1);
-      let TrackType::Audio(track) = &tracks[0] else {
-         panic!("expected an audio track");
-      };
-      assert_eq!(
-         track.base.properties.get("offset"),
-         Some(&audio_start.to_string())
-      );
-      assert_eq!(track.base.duration, 26);
+      assert!(tracks.is_empty());
+      assert_eq!(metadata.duration, 0);
    }
 
    #[tokio::test]

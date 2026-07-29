@@ -14,11 +14,6 @@ pub const FRAME_HEADER_SIZE: usize = 4;
 /// Maximum bytes to search for frame sync.
 pub const MAX_SYNC_SEARCH: u64 = 64 * 1024;
 
-/// Minimum search distance before accepting a frame without next-frame validation.
-/// After this point, we trust a valid-looking header even if we can't verify the next frame
-/// (e.g., near EOF or in truncated files).
-const MIN_SEARCH_BEFORE_FALLBACK: u64 = 1024;
-
 /// Cap on next-frame validations that fall outside the current buffer.
 /// In-buffer validations are free; out-of-buffer ones cost a real read (an HTTP
 /// range GET for `HttpStreamReader`), so a crafted stream of header-like bytes
@@ -78,6 +73,12 @@ impl FrameHeader {
          self.sample_rate_hz,
          self.padding,
       )
+   }
+
+   fn is_compatible_with(&self, other: &Self) -> bool {
+      self.version == other.version
+         && self.layer == other.layer
+         && self.sample_rate_hz == other.sample_rate_hz
    }
 
    /// Returns offset of Xing/Info header within frame data.
@@ -208,7 +209,9 @@ pub fn parse_header(bytes: [u8; 4]) -> Option<FrameHeader> {
 /// Finds first valid frame using a reader.
 ///
 /// Scans from `start_offset` up to `max_search` bytes looking for
-/// a valid MPEG frame sync and header.
+/// a valid MPEG frame sync and header. A candidate is accepted only
+/// when the header at its calculated next-frame offset has the same
+/// MPEG version, layer, and sample rate. Bitrate and padding may vary.
 ///
 /// # Parameters
 ///
@@ -237,15 +240,6 @@ pub async fn find_first_frame(
    reader: &dyn StreamReader,
    start_offset: u64,
    max_search: u64,
-) -> Result<FrameParseResult> {
-   find_first_frame_with_fallback_origin(reader, start_offset, max_search, start_offset).await
-}
-
-pub(super) async fn find_first_frame_with_fallback_origin(
-   reader: &dyn StreamReader,
-   start_offset: u64,
-   max_search: u64,
-   fallback_origin: u64,
 ) -> Result<FrameParseResult> {
    const BUFFER_SIZE: usize = 4096;
    let mut buffer = vec![0u8; BUFFER_SIZE];
@@ -286,7 +280,7 @@ pub(super) async fn find_first_frame_with_fallback_origin(
          let header_bytes = [buffer[i], buffer[i + 1], buffer[i + 2], buffer[i + 3]];
 
          if let Some(header) = parse_header(header_bytes) {
-            // Validate frame by checking that the next frame parses as a header.
+            // Validate the frame with a structurally compatible next header.
             if let Some(frame_size) = header.size() {
                let frame_offset = offset + i as u64;
                let next_offset = frame_offset + frame_size as u64;
@@ -301,28 +295,22 @@ pub(super) async fn find_first_frame_with_fallback_origin(
                      buffer[rel + 2],
                      buffer[rel + 3],
                   ];
-                  parse_header(next_bytes).is_some()
+                  parse_header(next_bytes)
+                     .is_some_and(|next_header| header.is_compatible_with(&next_header))
                } else if external_validations < MAX_OUT_OF_BUFFER_VALIDATIONS {
                   // Next frame falls outside the buffer; pay for a bounded read.
                   external_validations += 1;
                   let mut next_header = [0u8; FRAME_HEADER_SIZE];
                   let bytes_read = reader.read_at(next_offset, &mut next_header).await?;
-                  bytes_read >= FRAME_HEADER_SIZE && parse_header(next_header).is_some()
+                  bytes_read >= FRAME_HEADER_SIZE
+                     && parse_header(next_header)
+                        .is_some_and(|next_header| header.is_compatible_with(&next_header))
                } else {
                   false
                };
 
                if next_is_valid {
                   // Found valid frame with valid next frame.
-                  return Ok(FrameParseResult::Found {
-                     header,
-                     offset: frame_offset,
-                  });
-               }
-
-               // No valid next frame, but this frame looks valid.
-               // Accept it if we've searched enough bytes.
-               if frame_offset.saturating_sub(fallback_origin) > MIN_SEARCH_BEFORE_FALLBACK {
                   return Ok(FrameParseResult::Found {
                      header,
                      offset: frame_offset,
@@ -484,6 +472,14 @@ mod tests {
    }
 
    #[test]
+   fn test_frame_headers_allow_vbr_bitrate_and_padding_changes() {
+      let first = parse_header([0xFF, 0xFB, 0x90, 0x00]).expect("first header should parse");
+      let next = parse_header([0xFF, 0xFB, 0xA2, 0x00]).expect("next header should parse");
+
+      assert!(first.is_compatible_with(&next));
+   }
+
+   #[test]
    fn test_frame_parse_result_methods() {
       let found = FrameParseResult::Found {
          header: FrameHeader {
@@ -524,6 +520,23 @@ mod tests {
       assert!(matches!(
          find_first_frame(&reader, 0, 16).await.unwrap(),
          FrameParseResult::EndOfData
+      ));
+   }
+
+   #[tokio::test]
+   async fn test_find_first_frame_rejects_incompatible_following_header() {
+      const FIRST_FRAME_SIZE: usize = 417;
+      const SECOND_FRAME_SIZE: usize = 384;
+      let mut data = vec![0; FIRST_FRAME_SIZE + SECOND_FRAME_SIZE];
+      data[..FRAME_HEADER_SIZE].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+      data[FIRST_FRAME_SIZE..FIRST_FRAME_SIZE + FRAME_HEADER_SIZE]
+         .copy_from_slice(&[0xFF, 0xFB, 0x94, 0x00]);
+      let search_len = data.len() as u64;
+      let reader = BytesReader(data);
+
+      assert!(matches!(
+         find_first_frame(&reader, 0, search_len).await.unwrap(),
+         FrameParseResult::NotFound
       ));
    }
 
