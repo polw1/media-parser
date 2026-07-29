@@ -35,6 +35,8 @@ enum SampleEntry {
    None,
 }
 
+const MAX_TRACKS: usize = 1000;
+
 /// Reads all MP4 tracks from the `moov/trak` boxes.
 pub async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    let moov_data = find_and_read_moov_box(reader).await?;
@@ -49,6 +51,11 @@ pub async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    for (fourcc, trak) in iter_boxes(moov_payload) {
       if &fourcc != b"trak" {
          continue;
+      }
+      if trak_count == MAX_TRACKS {
+         return Err(MediaParserError::InvalidFormat(format!(
+            "track count exceeds limit of {MAX_TRACKS}"
+         )));
       }
       trak_count += 1;
 
@@ -354,5 +361,33 @@ mod tests {
             .to_string()
             .contains("all trak boxes are malformed (count: 1)")
       );
+   }
+
+   #[tokio::test]
+   async fn read_tracks_rejects_more_than_1000_trak_boxes_before_parsing() {
+      let valid = mp4_box(b"trak", &trak_payload(1, b"vide"));
+      let malformed = mp4_box(b"trak", &mp4_box(b"tkhd", &tkhd(2)));
+      let mut moov_payload = valid.repeat(1000);
+      moov_payload.extend(malformed);
+      let moov = mp4_box(b"moov", &moov_payload);
+
+      let error = read_tracks(&BytesReader(moov)).await.unwrap_err();
+
+      assert!(
+         error
+            .to_string()
+            .contains("track count exceeds limit of 1000"),
+         "unexpected error: {error}"
+      );
+   }
+
+   #[tokio::test]
+   async fn read_tracks_accepts_exactly_1000_trak_boxes() {
+      let valid = mp4_box(b"trak", &trak_payload(1, b"vide"));
+      let moov = mp4_box(b"moov", &valid.repeat(1000));
+
+      let tracks = read_tracks(&BytesReader(moov)).await.unwrap();
+
+      assert_eq!(tracks.len(), 1000);
    }
 }
