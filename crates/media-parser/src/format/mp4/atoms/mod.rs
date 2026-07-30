@@ -27,6 +27,7 @@ mod types;
 // Re-export public items
 pub use iter::{Mp4BoxIter, iter_boxes};
 pub use moov::find_and_read_moov_box;
+pub(super) use moov::parse_moov_payload;
 pub use nav::{Mp4Nav, find_box_ref};
 pub use read::{BoxRead, read_box};
 pub use tags::{fourcc_to_key, tag_name};

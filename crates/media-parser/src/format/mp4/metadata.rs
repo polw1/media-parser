@@ -6,7 +6,9 @@
 //!
 //! Navigation traverses byte slices directly without intermediate deserialization.
 
-use super::atoms::{Mp4Box, Mp4Nav, find_and_read_moov_box, fourcc_to_key, iter_boxes, tag_name};
+use super::atoms::{
+   Mp4Box, Mp4Nav, find_and_read_moov_box, fourcc_to_key, iter_boxes, parse_moov_payload, tag_name,
+};
 use crate::Result;
 use crate::errors::MediaParserError;
 use crate::helpers::{
@@ -38,12 +40,7 @@ const MVHD_V1_MIN_SIZE: usize = 32;
 /// - The `mvhd` box is missing or corrupted
 pub async fn read_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
    let moov_data = find_and_read_moov_box(reader).await?;
-
-   let moov_payload = if moov_data.len() >= 8 && &moov_data[4..8] == b"moov" {
-      &moov_data[8..]
-   } else {
-      &moov_data
-   };
+   let moov_payload = parse_moov_payload(&moov_data)?;
 
    let (timescale, duration) = extract_mvhd_info(moov_payload)?;
    let values = extract_metadata_tags(moov_payload);
@@ -173,6 +170,55 @@ fn parse_ilst_entries(ilst: &[u8], values: &mut Vec<types::Meta>) {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use async_trait::async_trait;
+
+   fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+      let mut data = ((8 + payload.len()) as u32).to_be_bytes().to_vec();
+      data.extend_from_slice(fourcc);
+      data.extend_from_slice(payload);
+      data
+   }
+
+   fn extended_mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+      let mut data = 1u32.to_be_bytes().to_vec();
+      data.extend_from_slice(fourcc);
+      data.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes());
+      data.extend_from_slice(payload);
+      data
+   }
+
+   struct BytesReader(Vec<u8>);
+
+   #[async_trait]
+   impl StreamReader for BytesReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
+
+   #[tokio::test]
+   async fn read_metadata_supports_extended_size_moov_header() {
+      // mvhd version 0: timescale at byte 12 and duration at byte 16.
+      let mut mvhd_payload = vec![0u8; 20];
+      mvhd_payload[12..16].copy_from_slice(&1000u32.to_be_bytes());
+      mvhd_payload[16..20].copy_from_slice(&5000u32.to_be_bytes());
+      let mvhd = mp4_box(b"mvhd", &mvhd_payload);
+      let moov = extended_mp4_box(b"moov", &mvhd);
+
+      let metadata = read_metadata(&BytesReader(moov)).await.unwrap();
+
+      assert_eq!(metadata.timescale, 1000);
+      assert_eq!(metadata.duration, 5000);
+   }
 
    #[test]
    fn test_fourcc_to_key() {

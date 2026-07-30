@@ -4,7 +4,7 @@
 
 use super::atoms::{
    Mp4Nav, audio_params, find_and_read_moov_box, fourcc_string, iter_boxes, parse_hdlr, parse_mdhd,
-   parse_stsd, parse_tkhd, read_box, stts_sample_count, visual_dimensions,
+   parse_moov_payload, parse_stsd, parse_tkhd, stts_sample_count, visual_dimensions,
 };
 use crate::Result;
 use crate::errors::MediaParserError;
@@ -40,10 +40,7 @@ const MAX_TRACKS: usize = 1000;
 /// Reads all MP4 tracks from the `moov/trak` boxes.
 pub async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    let moov_data = find_and_read_moov_box(reader).await?;
-   let moov_payload = read_box(&moov_data, 0)
-      .filter(|box_read| box_read.fourcc == *b"moov")
-      .map(|box_read| box_read.payload)
-      .ok_or_else(|| MediaParserError::InvalidFormat("invalid moov box".to_string()))?;
+   let moov_payload = parse_moov_payload(&moov_data)?;
 
    let mut tracks = Vec::new();
    let mut trak_count = 0usize;
