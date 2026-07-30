@@ -274,10 +274,9 @@ mod tests {
    #[test]
    fn test_parse_stsd_video_entry() {
       let mut visual_payload = vec![0u8; 78];
-      visual_payload[VISUAL_WIDTH_OFFSET..VISUAL_WIDTH_OFFSET + 2]
-         .copy_from_slice(&320u16.to_be_bytes());
-      visual_payload[VISUAL_HEIGHT_OFFSET..VISUAL_HEIGHT_OFFSET + 2]
-         .copy_from_slice(&180u16.to_be_bytes());
+      // Spec-derived literals keep the test independent from parser constants.
+      visual_payload[24..26].copy_from_slice(&320u16.to_be_bytes());
+      visual_payload[26..28].copy_from_slice(&180u16.to_be_bytes());
 
       let mut stsd = vec![0u8; 8];
       stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
