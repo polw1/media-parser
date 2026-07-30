@@ -9,13 +9,14 @@
       "permissions"
    ],
    "scripts": {
-      "build": "tsc -p guest-js/tsconfig.json",
+      "build": "tsc -p guest-js/tsconfig.json && npm run test:types",
       "check-node-version": "check-node-version --npm 10.5.0",
       "commitlint": "commitlint --from 3c4cb7c",
       "markdownlint": "markdownlint-cli2",
       "rust:lint": "cargo lint-clippy && cargo lint-fmt",
       "rust:lint:fix": "cargo fix-clippy && cargo fix-fmt",
-      "standards": "npm run markdownlint && npm run rust:lint"
+      "standards": "npm run markdownlint && npm run rust:lint",
+      "test:types": "tsc --noEmit --strict --target ES2020 --module ES2020 --moduleResolution node --lib ES2020,DOM guest-js/index.test.ts"
    },
    "author": "Jeremy Thomerson",
    "license": "MIT",

@@ -1,6 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 
-import type { Metadata, MetadataOptions, TrackInfo } from './types';
+import type {
+   CoverInfo,
+   Metadata,
+   MetadataOptions,
+   ThumbnailInfo,
+   ThumbnailsOptions,
+   TrackInfo,
+} from './types';
 
 export * from './types';
 
@@ -64,6 +71,67 @@ export async function getTracks(
       source,
       headers: options?.headers,
    });
+}
+
+/**
+ * Extract embedded cover artwork from a media file.
+ *
+ * @param source - Absolute path to a local file or URL of a remote media file
+ * @param options - Optional settings (headers are only used for URLs)
+ * @returns Cover artwork when present, otherwise null
+ */
+export async function getCover(
+   source: string,
+   options?: MetadataOptions,
+): Promise<CoverInfo | null> {
+   return await invoke<CoverInfo | null>('plugin:media-parser|get_cover', {
+      source,
+      headers: options?.headers,
+   });
+}
+
+/**
+ * Extract thumbnails for specific millisecond timestamps.
+ *
+ * Fast keyframe extraction is used by default. Set `accurate` to decode the
+ * exact requested frames.
+ *
+ * @param source - Absolute path to a local file or URL of a remote media file
+ * @param options - Timestamps, optional track, accuracy, and URL headers
+ * @returns Thumbnails in the same order as the requested timestamps
+ */
+export async function getThumbnails(
+   source: string,
+   options: ThumbnailsOptions,
+): Promise<ThumbnailInfo[]> {
+   const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_thumbnails', {
+      source,
+      timestamps: options.timestamps,
+      trackId: options.trackId,
+      accurate: options.accurate,
+      headers: options.headers,
+   });
+
+   return decodeThumbnailEnvelope(raw);
+}
+
+function decodeThumbnailEnvelope(raw: ArrayBuffer | Uint8Array): ThumbnailInfo[] {
+   const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+   const headerLength = view.getUint32(0, true);
+   const headerEnd = 4 + headerLength;
+   const header = buffer.subarray(4, headerEnd);
+
+   interface EnvelopeEntry extends Omit<ThumbnailInfo, 'data'> {
+      offset: number;
+      length: number;
+   }
+
+   const entries: EnvelopeEntry[] = JSON.parse(new TextDecoder().decode(header));
+   return entries.map(({ offset, length, ...info }) => ({
+      ...info,
+      data: buffer.subarray(headerEnd + offset, headerEnd + offset + length),
+   }));
 }
 
 // ============================================================================

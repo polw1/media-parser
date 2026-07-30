@@ -36,6 +36,41 @@ export interface MetadataOptions {
    headers?: Record<string, string>;
 }
 
+/**
+ * Embedded cover artwork.
+ */
+export interface CoverInfo {
+   format: 'jpeg' | 'png';
+   mimeType: 'image/jpeg' | 'image/png';
+   data: number[];
+}
+
+/**
+ * Thumbnail extracted from a video track.
+ */
+export interface ThumbnailInfo {
+   trackId: number;
+   width: number;
+   height: number;
+   timestampSec: number;
+   format: string;
+   mimeType: string;
+   /** Image bytes backed by the binary IPC response. */
+   data: Uint8Array;
+}
+
+/**
+ * Options for extracting thumbnails.
+ */
+export interface ThumbnailsOptions extends MetadataOptions {
+   /** Timestamps to extract, in milliseconds. */
+   timestamps: number[];
+   /** Track id to extract from. Defaults to the first video track. */
+   trackId?: number;
+   /** Decode the exact requested frames instead of preceding keyframes. */
+   accurate?: boolean;
+}
+
 // ============================================================================
 // Track Types
 // ============================================================================

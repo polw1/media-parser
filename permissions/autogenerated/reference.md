@@ -6,6 +6,8 @@ Default permissions for the media-parser plugin
 
 - `allow-get-metadata`
 - `allow-get-tracks`
+- `allow-get-cover`
+- `allow-get-thumbnails`
 
 ## Permission Table
 
@@ -15,6 +17,32 @@ Default permissions for the media-parser plugin
 <th>Description</th>
 </tr>
 
+
+<tr>
+<td>
+
+`media-parser:allow-get-cover`
+
+</td>
+<td>
+
+Enables the get_cover command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`media-parser:deny-get-cover`
+
+</td>
+<td>
+
+Denies the get_cover command without any pre-configured scope.
+
+</td>
+</tr>
 
 <tr>
 <td>
@@ -38,6 +66,32 @@ Enables the get_metadata command without any pre-configured scope.
 <td>
 
 Denies the get_metadata command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`media-parser:allow-get-thumbnails`
+
+</td>
+<td>
+
+Enables the get_thumbnails command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`media-parser:deny-get-thumbnails`
+
+</td>
+<td>
+
+Denies the get_thumbnails command without any pre-configured scope.
 
 </td>
 </tr>

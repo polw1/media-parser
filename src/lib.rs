@@ -44,7 +44,7 @@
 //! console.log(`Duration: ${metadata.duration / metadata.timescale} seconds`);
 //! ```
 
-use tauri::{Runtime, plugin::TauriPlugin};
+use tauri::{Manager, Runtime, plugin::TauriPlugin};
 
 mod commands;
 mod error;
@@ -68,9 +68,15 @@ pub use error::{Error, Result};
 /// ```
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
    tauri::plugin::Builder::new("media-parser")
+      .setup(|app, _api| {
+         app.manage(commands::ThumbnailSessions::default());
+         Ok(())
+      })
       .invoke_handler(tauri::generate_handler![
          commands::get_metadata,
-         commands::get_tracks
+         commands::get_tracks,
+         commands::get_cover,
+         commands::get_thumbnails
       ])
       .build()
 }
