@@ -1,7 +1,19 @@
 //! Integration tests for MP4 metadata extraction.
 
-use media_parser::{FileStreamReader, MediaParser, TrackType};
+use media_parser::{FileStreamReader, MediaParser, PixelFormat, TrackType};
+use std::io::Write;
 use std::path::PathBuf;
+use std::time::Duration;
+
+fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+   let size = 8 + payload.len();
+   let mut data = Vec::with_capacity(size);
+   data.extend_from_slice(&(size as u32).to_be_bytes());
+   data.extend_from_slice(fourcc);
+   data.extend_from_slice(payload);
+   data
+}
+
 fn fixtures_dir() -> PathBuf {
    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
       .join("tests")
@@ -23,6 +35,170 @@ async fn test_mp4_metadata_extraction() {
    assert_eq!(metadata.get("title"), Some("Tiny MP4 Title"));
    assert_eq!(metadata.get("artist"), Some("Tiny MP4 Artist"));
    assert_eq!(metadata.get("album"), Some("Tiny MP4 Album"));
+}
+
+#[tokio::test]
+async fn test_mp4_covr_cover_extraction() {
+   let image = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+   let mut data_payload = Vec::new();
+   data_payload.extend_from_slice(&13u32.to_be_bytes());
+   data_payload.extend_from_slice(&0u32.to_be_bytes());
+   data_payload.extend_from_slice(&image);
+
+   let data = mp4_box(b"data", &data_payload);
+   let covr = mp4_box(b"covr", &data);
+   let ilst = mp4_box(b"ilst", &covr);
+   let mut meta_payload = vec![0, 0, 0, 0];
+   meta_payload.extend_from_slice(&ilst);
+   let meta = mp4_box(b"meta", &meta_payload);
+   let udta = mp4_box(b"udta", &meta);
+   let moov = mp4_box(b"moov", &udta);
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp4");
+   file.write_all(&ftyp).expect("write ftyp");
+   file.write_all(&moov).expect("write moov");
+   file.flush().expect("flush temp mp4");
+
+   let reader = FileStreamReader::new(file.path()).expect("open temp mp4");
+   let parser = MediaParser::new(reader);
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.format, PixelFormat::Jpeg);
+   assert_eq!(cover.mime_type, "image/jpeg");
+   assert_eq!(cover.data, image);
+}
+
+#[tokio::test]
+async fn test_mp4_h264_thumbnail_extraction() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let parser = MediaParser::new(reader);
+
+   let frames = parser
+      .frames(0, &[Duration::ZERO])
+      .await
+      .expect("extract thumbnail");
+
+   assert_eq!(frames.len(), 1);
+   assert_eq!(frames[0].format, PixelFormat::Jpeg);
+   assert!(frames[0].width > 0);
+   assert!(frames[0].height > 0);
+   assert!(frames[0].data.starts_with(&[0xff, 0xd8]));
+   assert!(frames[0].data.ends_with(&[0xff, 0xd9]));
+}
+
+#[tokio::test]
+async fn test_mp4_h264_thumbnails_follow_presentation_order() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let parser = MediaParser::new(FileStreamReader::new(&path).expect("open MP4 fixture"));
+   let timestamps = [
+      Duration::ZERO,
+      Duration::from_millis(100),
+      Duration::from_millis(200),
+   ];
+
+   let frames = parser
+      .frames(0, &timestamps)
+      .await
+      .expect("extract presentation-ordered thumbnails");
+
+   assert_eq!(frames.len(), timestamps.len());
+   assert_eq!(
+      frames
+         .iter()
+         .map(|frame| frame.timestamp)
+         .collect::<Vec<_>>(),
+      timestamps
+   );
+   assert_ne!(frames[0].data, frames[1].data);
+   assert_ne!(frames[1].data, frames[2].data);
+}
+
+#[tokio::test]
+async fn test_mp4_frames_rejects_any_timestamp_outside_track_duration() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let parser = MediaParser::new(FileStreamReader::new(&path).expect("open MP4 fixture"));
+
+   let error = parser
+      .frames(0, &[Duration::ZERO, Duration::from_secs(10)])
+      .await
+      .expect_err("mixed valid and invalid timestamps must not change cardinality");
+
+   assert!(matches!(
+      error,
+      media_parser::MediaParserError::InvalidFormat(_)
+   ));
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_rejects_non_h264_video() {
+   let mut tkhd = vec![0; 84];
+   tkhd[12..16].copy_from_slice(&1u32.to_be_bytes());
+   let mut mdhd = vec![0; 24];
+   mdhd[12..16].copy_from_slice(&1_000u32.to_be_bytes());
+   mdhd[16..20].copy_from_slice(&1_000u32.to_be_bytes());
+   let mut hdlr = vec![0; 12];
+   hdlr[8..12].copy_from_slice(b"vide");
+
+   let mut stsd = vec![0; 8];
+   stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
+   stsd.extend(mp4_box(b"mp4v", &[0; 78]));
+   let mut stts = vec![0; 8];
+   stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+   stts.extend_from_slice(&1u32.to_be_bytes());
+   stts.extend_from_slice(&1_000u32.to_be_bytes());
+   let mut stsz = vec![0; 12];
+   stsz[4..8].copy_from_slice(&4u32.to_be_bytes());
+   stsz[8..12].copy_from_slice(&1u32.to_be_bytes());
+   let mut stsc = vec![0; 8];
+   stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+   stsc.extend_from_slice(&1u32.to_be_bytes());
+   stsc.extend_from_slice(&1u32.to_be_bytes());
+   stsc.extend_from_slice(&1u32.to_be_bytes());
+   let mut stco = vec![0; 8];
+   stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+   stco.extend_from_slice(&0u32.to_be_bytes());
+
+   let stbl = mp4_box(
+      b"stbl",
+      &[
+         mp4_box(b"stsd", &stsd),
+         mp4_box(b"stts", &stts),
+         mp4_box(b"stsz", &stsz),
+         mp4_box(b"stsc", &stsc),
+         mp4_box(b"stco", &stco),
+      ]
+      .concat(),
+   );
+   let minf = mp4_box(b"minf", &stbl);
+   let mdia = mp4_box(
+      b"mdia",
+      &[mp4_box(b"mdhd", &mdhd), mp4_box(b"hdlr", &hdlr), minf].concat(),
+   );
+   let trak = mp4_box(b"trak", &[mp4_box(b"tkhd", &tkhd), mdia].concat());
+   let moov = mp4_box(b"moov", &trak);
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp4");
+   file.write_all(&ftyp).expect("write ftyp");
+   file.write_all(&moov).expect("write moov");
+   file.flush().expect("flush temp mp4");
+
+   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp4"));
+   let error = parser
+      .frame(0, Duration::ZERO)
+      .await
+      .expect_err("non-H.264 video should not produce a thumbnail");
+
+   assert!(matches!(
+      error,
+      media_parser::MediaParserError::UnsupportedCodec(_)
+   ));
 }
 
 #[tokio::test]

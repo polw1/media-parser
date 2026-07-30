@@ -39,11 +39,14 @@ pub mod thumbnails;
 pub mod tracks;
 
 use crate::Result;
-use crate::format::{AsyncParser, AsyncTrackParser, Format};
+use crate::format::{
+   AsyncCoverParser, AsyncFrameParser, AsyncFramesParser, AsyncParser, AsyncTrackParser, Format,
+};
 use crate::stream::StreamReader;
-use crate::types::{Metadata, TrackType};
+use crate::types::{CoverArt, Frame, Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 /// MP4 format signature for detection.
 pub use crate::format::signatures::MP4 as SIGNATURE;
@@ -59,11 +62,36 @@ fn parse_tracks(
    Box::pin(tracks::read_tracks(reader))
 }
 
+fn parse_cover(
+   reader: &dyn StreamReader,
+) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + '_>> {
+   Box::pin(read_cover(reader))
+}
+
+fn parse_frame(
+   reader: &dyn StreamReader,
+   track_id: u32,
+   timestamp: Duration,
+) -> Pin<Box<dyn Future<Output = Result<Frame>> + Send + '_>> {
+   Box::pin(thumbnails::read_frame(reader, track_id, timestamp))
+}
+
+fn parse_frames<'a>(
+   reader: &'a dyn StreamReader,
+   track_id: u32,
+   timestamps: &'a [Duration],
+) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>>> + Send + 'a>> {
+   Box::pin(thumbnails::read_frames(reader, track_id, timestamps))
+}
+
 /// MP4 format definition registered in the global table.
 pub static FORMAT: Format = Format::new(
    SIGNATURE,
    parse as AsyncParser,
    parse_tracks as AsyncTrackParser,
+   parse_cover as AsyncCoverParser,
+   parse_frame as AsyncFrameParser,
+   parse_frames as AsyncFramesParser,
 );
 
 /// Main parsing function.
@@ -71,6 +99,13 @@ async fn parse_mp4(reader: &dyn StreamReader) -> Result<Metadata> {
    metadata::read_metadata(reader).await
 }
 
+pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
+   let moov = atoms::find_and_read_moov_box(reader).await?;
+   let moov_payload = atoms::parse_moov_payload(&moov)?;
+   Ok(atoms::parse_cover_art(moov_payload))
+}
+
 // Re-export for direct access
 pub use metadata::read_metadata;
+pub use thumbnails::{read_frame, read_frames};
 pub use tracks::read_tracks;

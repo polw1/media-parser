@@ -15,15 +15,16 @@
 
 use super::duration::calculate_duration;
 use super::tags::{frame_id_to_key, frame_name};
-use crate::Result;
 use crate::helpers::{
    decode_latin1, decode_utf8, decode_utf16_be, decode_utf16_with_bom, trim_null_and_whitespace,
 };
 use crate::stream::StreamReader;
-use crate::types::{Meta, Metadata};
+use crate::types::{CoverArt, Meta, Metadata, PixelFormat};
+use crate::{MediaParserError, Result};
 
 const ID3_HEADER_SIZE: usize = 10;
 const ID3_FRAME_HEADER_SIZE: usize = 10;
+const MAX_ID3_TAG_BYTES: usize = 64 * 1024 * 1024;
 
 /// Reads metadata from an MP3 file.
 ///
@@ -55,10 +56,31 @@ pub async fn read_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
    })
 }
 
+/// Reads embedded ID3v2 APIC cover artwork, when present.
+pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
+   let Some(header) = try_read_id3_header(reader).await? else {
+      return Ok(None);
+   };
+
+   let frames = read_id3_frames(reader, &header).await?;
+   let mut fallback = None;
+   for frame in frames {
+      if frame.id != *b"APIC" {
+         continue;
+      }
+      if let Some((picture_type, cover)) = decode_apic_frame(&frame.data) {
+         if picture_type == 3 {
+            return Ok(Some(cover));
+         }
+         fallback.get_or_insert(cover);
+      }
+   }
+   Ok(fallback)
+}
+
 #[derive(Debug)]
 struct Id3Header {
    version: (u8, u8),
-   #[allow(dead_code)]
    flags: u8,
    tag_size: u32,
 }
@@ -107,35 +129,79 @@ struct Id3Frame {
 
 /// Reads all ID3v2 frames from the tag.
 async fn read_id3_frames(reader: &dyn StreamReader, header: &Id3Header) -> Result<Vec<Id3Frame>> {
+   let tag_size = usize::try_from(header.tag_size)
+      .map_err(|_| MediaParserError::InvalidFormat("ID3 tag is too large".to_string()))?;
+   if tag_size > MAX_ID3_TAG_BYTES {
+      return Err(MediaParserError::InvalidFormat(format!(
+         "ID3 tag exceeds {MAX_ID3_TAG_BYTES} bytes"
+      )));
+   }
+
+   let mut tag_data = Vec::new();
+   tag_data
+      .try_reserve_exact(tag_size)
+      .map_err(|_| MediaParserError::InvalidFormat("ID3 tag is too large".to_string()))?;
+   tag_data.resize(tag_size, 0);
+   let bytes_read = reader
+      .read_at(ID3_HEADER_SIZE as u64, &mut tag_data)
+      .await?;
+   if bytes_read != tag_size {
+      return Err(MediaParserError::InvalidFormat(format!(
+         "truncated ID3 tag: expected {tag_size} bytes, read {bytes_read}"
+      )));
+   }
+
+   let tag_unsynchronized = header.flags & 0x80 != 0;
+   if tag_unsynchronized && header.version.0 < 4 {
+      tag_data = deunsynchronize(&tag_data)?;
+   }
+   parse_id3_frames(&tag_data, header, tag_unsynchronized)
+}
+
+fn parse_id3_frames(
+   tag_data: &[u8],
+   header: &Id3Header,
+   tag_unsynchronized: bool,
+) -> Result<Vec<Id3Frame>> {
    let mut frames = Vec::new();
-   let mut offset = ID3_HEADER_SIZE as u64;
-   let end_offset = ID3_HEADER_SIZE as u64 + header.tag_size as u64;
+   let mut offset = 0usize;
 
    // Skip extended header if present (bit 6 of flags)
    if header.flags & 0x40 != 0 {
-      let mut ext_size_bytes = [0u8; 4];
-      if reader.read_at(offset, &mut ext_size_bytes).await? >= 4 {
-         let ext_size = if header.version.0 >= 4 {
-            // ID3v2.4: syncsafe integer, size includes the 4 bytes itself
-            ((ext_size_bytes[0] as u32 & 0x7F) << 21)
-               | ((ext_size_bytes[1] as u32 & 0x7F) << 14)
-               | ((ext_size_bytes[2] as u32 & 0x7F) << 7)
-               | (ext_size_bytes[3] as u32 & 0x7F)
-         } else {
-            // ID3v2.3: regular big-endian, size excludes the 4 bytes itself
-            u32::from_be_bytes(ext_size_bytes) + 4
-         };
-         offset += ext_size as u64;
+      let ext_size_bytes: [u8; 4] = tag_data
+         .get(0..4)
+         .and_then(|bytes| bytes.try_into().ok())
+         .ok_or_else(|| {
+            MediaParserError::InvalidFormat("truncated ID3 extended header".to_string())
+         })?;
+      let ext_size = if header.version.0 >= 4 {
+         usize::try_from(decode_syncsafe(ext_size_bytes)).map_err(|_| {
+            MediaParserError::InvalidFormat("ID3 extended header is too large".to_string())
+         })?
+      } else {
+         usize::try_from(u32::from_be_bytes(ext_size_bytes))
+            .ok()
+            .and_then(|size| size.checked_add(4))
+            .ok_or_else(|| {
+               MediaParserError::InvalidFormat("ID3 extended header is too large".to_string())
+            })?
+      };
+      if ext_size < 4 || ext_size > tag_data.len() {
+         return Err(MediaParserError::InvalidFormat(
+            "invalid ID3 extended header size".to_string(),
+         ));
       }
+      offset = ext_size;
    }
 
-   while offset + ID3_FRAME_HEADER_SIZE as u64 <= end_offset {
-      let mut frame_header = [0u8; ID3_FRAME_HEADER_SIZE];
-      let bytes_read = reader.read_at(offset, &mut frame_header).await?;
-
-      if bytes_read < ID3_FRAME_HEADER_SIZE {
-         break;
-      }
+   while offset
+      .checked_add(ID3_FRAME_HEADER_SIZE)
+      .is_some_and(|end| end <= tag_data.len())
+   {
+      let frame_header: [u8; ID3_FRAME_HEADER_SIZE] = tag_data
+         .get(offset..offset + ID3_FRAME_HEADER_SIZE)
+         .and_then(|bytes| bytes.try_into().ok())
+         .ok_or_else(|| MediaParserError::InvalidFormat("truncated ID3 frame".to_string()))?;
 
       let id = [
          frame_header[0],
@@ -152,10 +218,12 @@ async fn read_id3_frames(reader: &dyn StreamReader, header: &Id3Header) -> Resul
       // Frame size (ID3v2.4 uses syncsafe, ID3v2.3 uses regular)
       let size = if header.version.0 >= 4 {
          // Syncsafe integer for ID3v2.4
-         ((frame_header[4] as u32 & 0x7F) << 21)
-            | ((frame_header[5] as u32 & 0x7F) << 14)
-            | ((frame_header[6] as u32 & 0x7F) << 7)
-            | (frame_header[7] as u32 & 0x7F)
+         decode_syncsafe([
+            frame_header[4],
+            frame_header[5],
+            frame_header[6],
+            frame_header[7],
+         ])
       } else {
          // Regular integer for ID3v2.3 and earlier
          ((frame_header[4] as u32) << 24)
@@ -164,20 +232,101 @@ async fn read_id3_frames(reader: &dyn StreamReader, header: &Id3Header) -> Resul
             | (frame_header[7] as u32)
       };
 
-      offset += ID3_FRAME_HEADER_SIZE as u64;
+      offset += ID3_FRAME_HEADER_SIZE;
+      let size = usize::try_from(size)
+         .map_err(|_| MediaParserError::InvalidFormat("ID3 frame is too large".to_string()))?;
+      let frame_end = offset
+         .checked_add(size)
+         .ok_or_else(|| MediaParserError::InvalidFormat("ID3 frame size overflow".to_string()))?;
 
-      if size == 0 || offset + size as u64 > end_offset {
+      if size == 0 {
          break;
       }
+      if frame_end > tag_data.len() {
+         return Err(MediaParserError::InvalidFormat(
+            "truncated ID3 frame data".to_string(),
+         ));
+      }
 
-      let mut data = vec![0u8; size as usize];
-      reader.read_at(offset, &mut data).await?;
-      offset += size as u64;
+      let format_flags = frame_header[9];
+      let mut data = Vec::new();
+      data
+         .try_reserve_exact(size)
+         .map_err(|_| MediaParserError::InvalidFormat("ID3 frame is too large".to_string()))?;
+      data.extend_from_slice(&tag_data[offset..frame_end]);
+      offset = frame_end;
+
+      if header.version.0 >= 4 {
+         if format_flags & 0x0c != 0 {
+            return Err(MediaParserError::InvalidFormat(format!(
+               "compressed or encrypted ID3 frame {} is unsupported",
+               String::from_utf8_lossy(&id)
+            )));
+         }
+         if tag_unsynchronized || format_flags & 0x02 != 0 {
+            data = deunsynchronize(&data)?;
+         }
+         if format_flags & 0x40 != 0 {
+            if data.is_empty() {
+               return Err(MediaParserError::InvalidFormat(
+                  "truncated ID3 grouping identity".to_string(),
+               ));
+            }
+            data.remove(0);
+         }
+         if format_flags & 0x01 != 0 {
+            if data.len() < 4 {
+               return Err(MediaParserError::InvalidFormat(
+                  "truncated ID3 data length indicator".to_string(),
+               ));
+            }
+            data.drain(..4);
+         }
+      } else {
+         if format_flags & 0xc0 != 0 {
+            return Err(MediaParserError::InvalidFormat(format!(
+               "compressed or encrypted ID3 frame {} is unsupported",
+               String::from_utf8_lossy(&id)
+            )));
+         }
+         if format_flags & 0x20 != 0 {
+            if data.is_empty() {
+               return Err(MediaParserError::InvalidFormat(
+                  "truncated ID3 grouping identity".to_string(),
+               ));
+            }
+            data.remove(0);
+         }
+      }
 
       frames.push(Id3Frame { id, data });
    }
 
    Ok(frames)
+}
+
+fn decode_syncsafe(bytes: [u8; 4]) -> u32 {
+   ((bytes[0] as u32 & 0x7f) << 21)
+      | ((bytes[1] as u32 & 0x7f) << 14)
+      | ((bytes[2] as u32 & 0x7f) << 7)
+      | (bytes[3] as u32 & 0x7f)
+}
+
+fn deunsynchronize(data: &[u8]) -> Result<Vec<u8>> {
+   let mut decoded = Vec::new();
+   decoded
+      .try_reserve(data.len())
+      .map_err(|_| MediaParserError::InvalidFormat("ID3 tag is too large".to_string()))?;
+   let mut offset = 0usize;
+   while offset < data.len() {
+      let byte = data[offset];
+      decoded.push(byte);
+      offset += 1;
+      if byte == 0xff && data.get(offset) == Some(&0) {
+         offset += 1;
+      }
+   }
+   Ok(decoded)
 }
 
 /// Decodes ID3v2 text frame data based on encoding byte.
@@ -198,6 +347,63 @@ fn decode_id3_text(data: &[u8]) -> Option<String> {
    };
 
    trim_null_and_whitespace(&text)
+}
+
+fn decode_apic_frame(data: &[u8]) -> Option<(u8, CoverArt)> {
+   let encoding = *data.first()?;
+   let mime_end = data.get(1..)?.iter().position(|byte| *byte == 0)? + 1;
+   let mime = std::str::from_utf8(data.get(1..mime_end)?).ok()?;
+   let picture_type = *data.get(mime_end + 1)?;
+   let description_offset = mime_end.checked_add(2)?;
+   if description_offset > data.len() {
+      return None;
+   }
+
+   let image_offset = find_encoded_terminator(data, description_offset, encoding)?;
+   let image = data.get(image_offset..)?;
+   if image.is_empty() {
+      return None;
+   }
+   let format = cover_format(mime, image)?;
+   let mut image_data = Vec::new();
+   image_data.try_reserve_exact(image.len()).ok()?;
+   image_data.extend_from_slice(image);
+
+   Some((
+      picture_type,
+      CoverArt {
+         mime_type: format.mime_type().to_string(),
+         format,
+         data: image_data,
+      },
+   ))
+}
+
+fn find_encoded_terminator(data: &[u8], start: usize, encoding: u8) -> Option<usize> {
+   match encoding {
+      1 | 2 => data
+         .get(start..)?
+         .chunks_exact(2)
+         .position(|unit| unit == [0, 0])
+         .map(|position| start + position * 2 + 2),
+      _ => data
+         .get(start..)?
+         .iter()
+         .position(|byte| *byte == 0)
+         .map(|position| start + position + 1),
+   }
+}
+
+fn cover_format(mime: &str, image: &[u8]) -> Option<PixelFormat> {
+   match mime.to_ascii_lowercase().as_str() {
+      "image/jpeg" | "image/jpg" => Some(PixelFormat::Jpeg),
+      "image/png" => Some(PixelFormat::Png),
+      _ if image.starts_with(&[0xff, 0xd8, 0xff]) => Some(PixelFormat::Jpeg),
+      _ if image.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) => {
+         Some(PixelFormat::Png)
+      }
+      _ => None,
+   }
 }
 
 /// Converts ID3 frames to Meta values.

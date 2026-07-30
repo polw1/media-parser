@@ -121,6 +121,7 @@
 //! }
 //! ```
 
+mod decoders;
 pub mod errors;
 pub mod format;
 pub mod helpers;
@@ -132,12 +133,13 @@ use std::time::Duration;
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{
-   detect_format, get_format_info, is_supported, parse_metadata, parse_tracks, supported_formats,
+   detect_format, get_format_info, is_supported, parse_cover, parse_frame, parse_frames,
+   parse_metadata, parse_tracks, supported_formats,
 };
 pub use stream::{FileStreamReader, HttpStreamReader, StreamReader};
 pub use types::{
-   AudioTrackMeta, BaseTrackMeta, Frame, Meta, Metadata, PixelFormat, SubtitleCue, SubtitleTrack,
-   SubtitleTrackMeta, TrackFilter, TrackType, UnknownTrackMeta, VideoTrackMeta,
+   AudioTrackMeta, BaseTrackMeta, CoverArt, Frame, Meta, Metadata, PixelFormat, SubtitleCue,
+   SubtitleTrack, SubtitleTrackMeta, TrackFilter, TrackType, UnknownTrackMeta, VideoTrackMeta,
 };
 
 /// High-level parser handle.
@@ -161,6 +163,11 @@ impl<R: StreamReader> MediaParser<R> {
       format::registry::parse_tracks(&self.reader).await
    }
 
+   /// Extract embedded cover artwork, when present.
+   pub async fn cover(&self) -> Result<Option<CoverArt>> {
+      format::registry::parse_cover(&self.reader).await
+   }
+
    /// Extract subtitle tracks from the media file.
    pub async fn subtitles(&self, filter: Option<TrackFilter>) -> Result<Vec<SubtitleTrack>> {
       // TODO: Implement actual subtitle parsing
@@ -170,36 +177,12 @@ impl<R: StreamReader> MediaParser<R> {
 
    /// Extract a single frame from a video track at the specified timestamp.
    pub async fn frame(&self, track_id: u32, timestamp: Duration) -> Result<Frame> {
-      // TODO: Implement actual frame extraction
-      Ok(Frame {
-         track_id,
-         width: 1920,
-         height: 1080,
-         timestamp,
-         format: PixelFormat::Yuv420p,
-         data: vec![0; 1920 * 1080 * 3 / 2],  // YUV420p size
-         strides: Some(vec![1920, 960, 960]), // Y, U, V strides
-      })
+      format::registry::parse_frame(&self.reader, track_id, timestamp).await
    }
 
    /// Extract multiple frames from a video track at the specified timestamps.
    pub async fn frames(&self, track_id: u32, timestamps: &[Duration]) -> Result<Vec<Frame>> {
-      // TODO: Implement actual frame extraction
-      let mut frames = Vec::new();
-
-      for &timestamp in timestamps {
-         frames.push(Frame {
-            track_id,
-            width: 1920,
-            height: 1080,
-            timestamp,
-            format: PixelFormat::Yuv420p,
-            data: vec![0; 1920 * 1080 * 3 / 2],  // YUV420p size
-            strides: Some(vec![1920, 960, 960]), // Y, U, V strides
-         });
-      }
-
-      Ok(frames)
+      format::registry::parse_frames(&self.reader, track_id, timestamps).await
    }
 
    /// List all supported format names.

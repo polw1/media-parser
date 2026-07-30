@@ -5,7 +5,8 @@ use media_parser::format::mp3::{
    DurationMethod, FrameParseResult, MAX_SYNC_SEARCH, VbrHeaderType, calculate_duration,
    find_first_frame, parse_vbr_header,
 };
-use media_parser::{FileStreamReader, MediaParser, TrackType};
+use media_parser::{FileStreamReader, MediaParser, PixelFormat, TrackType};
+use std::io::Write;
 use std::path::PathBuf;
 fn fixtures_dir() -> PathBuf {
    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -25,6 +26,271 @@ async fn test_id3v2_metadata_extraction() {
    assert_eq!(metadata.get("title"), Some("Test Title"));
    assert_eq!(metadata.get("artist"), Some("Test Artist"));
    assert_eq!(metadata.get("album"), Some("Test Album"));
+}
+
+#[tokio::test]
+async fn test_id3v2_apic_cover_extraction() {
+   let image = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3];
+   let mut frame_data = Vec::new();
+   frame_data.push(3);
+   frame_data.extend_from_slice(b"image/png");
+   frame_data.push(0);
+   frame_data.push(3);
+   frame_data.extend_from_slice(b"front");
+   frame_data.push(0);
+   frame_data.extend_from_slice(&image);
+
+   let mut frame = Vec::new();
+   frame.extend_from_slice(b"APIC");
+   frame.extend_from_slice(&(frame_data.len() as u32).to_be_bytes());
+   frame.extend_from_slice(&[0, 0]);
+   frame.extend_from_slice(&frame_data);
+
+   let tag_size = frame.len() as u32;
+   let syncsafe_size = [
+      ((tag_size >> 21) & 0x7f) as u8,
+      ((tag_size >> 14) & 0x7f) as u8,
+      ((tag_size >> 7) & 0x7f) as u8,
+      (tag_size & 0x7f) as u8,
+   ];
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp3");
+   file.write_all(b"ID3").expect("write id3 marker");
+   file.write_all(&[3, 0, 0]).expect("write id3 version");
+   file.write_all(&syncsafe_size).expect("write id3 size");
+   file.write_all(&frame).expect("write apic frame");
+   file.flush().expect("flush temp mp3");
+
+   let reader = FileStreamReader::new(file.path()).expect("open temp mp3");
+   let parser = MediaParser::new(reader);
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.format, PixelFormat::Png);
+   assert_eq!(cover.mime_type, "image/png");
+   assert_eq!(cover.data, image);
+}
+
+#[tokio::test]
+async fn test_id3v2_apic_utf16_description_preserves_image_bytes() {
+   let image = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+   let mut frame_data = Vec::new();
+   frame_data.push(1);
+   frame_data.extend_from_slice(b"image/jpeg");
+   frame_data.push(0);
+   frame_data.push(3);
+   frame_data.extend_from_slice(&[
+      0xff, 0xfe, b'f', 0, b'r', 0, b'o', 0, b'n', 0, b't', 0, 0, 0,
+   ]);
+   frame_data.extend_from_slice(&image);
+
+   let mut frame = Vec::new();
+   frame.extend_from_slice(b"APIC");
+   frame.extend_from_slice(&(frame_data.len() as u32).to_be_bytes());
+   frame.extend_from_slice(&[0, 0]);
+   frame.extend_from_slice(&frame_data);
+
+   let tag_size = frame.len() as u32;
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp3");
+   file.write_all(b"ID3").expect("write id3 marker");
+   file.write_all(&[3, 0, 0]).expect("write id3 version");
+   file
+      .write_all(&[
+         ((tag_size >> 21) & 0x7f) as u8,
+         ((tag_size >> 14) & 0x7f) as u8,
+         ((tag_size >> 7) & 0x7f) as u8,
+         (tag_size & 0x7f) as u8,
+      ])
+      .expect("write id3 size");
+   file.write_all(&frame).expect("write apic frame");
+   file.flush().expect("flush temp mp3");
+
+   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp3"));
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.data, image);
+}
+
+#[tokio::test]
+async fn test_id3v23_apic_cover_removes_tag_unsynchronization() {
+   let image = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 0xff, 0x00, 3, 0xff, 0xd9];
+   let mut frame_data = Vec::new();
+   frame_data.push(0);
+   frame_data.extend_from_slice(b"image/jpeg");
+   frame_data.push(0);
+   frame_data.push(3);
+   frame_data.push(0);
+   frame_data.extend_from_slice(&image);
+
+   let mut frame = Vec::new();
+   frame.extend_from_slice(b"APIC");
+   frame.extend_from_slice(&(frame_data.len() as u32).to_be_bytes());
+   frame.extend_from_slice(&[0, 0]);
+   frame.extend_from_slice(&frame_data);
+
+   let unsynchronized = frame
+      .iter()
+      .enumerate()
+      .flat_map(|(index, byte)| {
+         let next = frame.get(index + 1).copied();
+         let insert_zero = *byte == 0xff && next.is_some_and(|next| next == 0 || next >= 0xe0);
+         [Some(*byte), insert_zero.then_some(0)]
+            .into_iter()
+            .flatten()
+      })
+      .collect::<Vec<_>>();
+   let tag_size = unsynchronized.len() as u32;
+   let syncsafe_size = [
+      ((tag_size >> 21) & 0x7f) as u8,
+      ((tag_size >> 14) & 0x7f) as u8,
+      ((tag_size >> 7) & 0x7f) as u8,
+      (tag_size & 0x7f) as u8,
+   ];
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp3");
+   file.write_all(b"ID3").expect("write id3 marker");
+   file.write_all(&[3, 0, 0x80]).expect("write id3 version");
+   file.write_all(&syncsafe_size).expect("write id3 size");
+   file.write_all(&unsynchronized).expect("write APIC frame");
+   file.flush().expect("flush temp mp3");
+
+   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp3"));
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.data, image);
+}
+
+#[tokio::test]
+async fn test_id3v24_apic_cover_handles_frame_unsync_and_dli() {
+   let image = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+   let mut frame_data = Vec::new();
+   frame_data.push(0);
+   frame_data.extend_from_slice(b"image/jpeg");
+   frame_data.push(0);
+   frame_data.push(3);
+   frame_data.push(0);
+   frame_data.extend_from_slice(&image);
+   let frame_data = frame_data
+      .iter()
+      .enumerate()
+      .flat_map(|(index, byte)| {
+         let next = frame_data.get(index + 1).copied();
+         let insert_zero = *byte == 0xff && next.is_some_and(|next| next == 0 || next >= 0xe0);
+         [Some(*byte), insert_zero.then_some(0)]
+            .into_iter()
+            .flatten()
+      })
+      .collect::<Vec<_>>();
+
+   let mut encoded_data = Vec::new();
+   encoded_data.extend_from_slice(&[0, 0, 0, 0]);
+   encoded_data.extend_from_slice(&frame_data);
+   let frame_size = encoded_data.len() as u32;
+   let syncsafe_frame_size = [
+      ((frame_size >> 21) & 0x7f) as u8,
+      ((frame_size >> 14) & 0x7f) as u8,
+      ((frame_size >> 7) & 0x7f) as u8,
+      (frame_size & 0x7f) as u8,
+   ];
+
+   let mut frame = Vec::new();
+   frame.extend_from_slice(b"APIC");
+   frame.extend_from_slice(&syncsafe_frame_size);
+   frame.extend_from_slice(&[0, 0x03]);
+   frame.extend_from_slice(&encoded_data);
+   let tag_size = frame.len() as u32;
+   let syncsafe_tag_size = [
+      ((tag_size >> 21) & 0x7f) as u8,
+      ((tag_size >> 14) & 0x7f) as u8,
+      ((tag_size >> 7) & 0x7f) as u8,
+      (tag_size & 0x7f) as u8,
+   ];
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp3");
+   file.write_all(b"ID3").expect("write id3 marker");
+   file.write_all(&[4, 0, 0]).expect("write id3 version");
+   file.write_all(&syncsafe_tag_size).expect("write id3 size");
+   file.write_all(&frame).expect("write APIC frame");
+   file.flush().expect("flush temp mp3");
+
+   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp3"));
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.data, image);
+}
+
+#[tokio::test]
+async fn test_id3v24_apic_cover_handles_tag_unsynchronization() {
+   let image = [0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 0xff, 0xd9];
+   let mut frame_data = Vec::new();
+   frame_data.push(0);
+   frame_data.extend_from_slice(b"image/jpeg");
+   frame_data.push(0);
+   frame_data.push(3);
+   frame_data.push(0);
+   frame_data.extend_from_slice(&image);
+   let encoded_data = frame_data
+      .iter()
+      .enumerate()
+      .flat_map(|(index, byte)| {
+         let next = frame_data.get(index + 1).copied();
+         let insert_zero = *byte == 0xff && next.is_some_and(|next| next == 0 || next >= 0xe0);
+         [Some(*byte), insert_zero.then_some(0)]
+            .into_iter()
+            .flatten()
+      })
+      .collect::<Vec<_>>();
+   let frame_size = encoded_data.len() as u32;
+
+   let mut frame = Vec::new();
+   frame.extend_from_slice(b"APIC");
+   frame.extend_from_slice(&[
+      ((frame_size >> 21) & 0x7f) as u8,
+      ((frame_size >> 14) & 0x7f) as u8,
+      ((frame_size >> 7) & 0x7f) as u8,
+      (frame_size & 0x7f) as u8,
+   ]);
+   frame.extend_from_slice(&[0, 0]);
+   frame.extend_from_slice(&encoded_data);
+   let tag_size = frame.len() as u32;
+
+   let mut file = tempfile::NamedTempFile::new().expect("create temp mp3");
+   file.write_all(b"ID3").expect("write id3 marker");
+   file.write_all(&[4, 0, 0x80]).expect("write id3 version");
+   file
+      .write_all(&[
+         ((tag_size >> 21) & 0x7f) as u8,
+         ((tag_size >> 14) & 0x7f) as u8,
+         ((tag_size >> 7) & 0x7f) as u8,
+         (tag_size & 0x7f) as u8,
+      ])
+      .expect("write id3 size");
+   file.write_all(&frame).expect("write APIC frame");
+   file.flush().expect("flush temp mp3");
+
+   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp3"));
+   let cover = parser
+      .cover()
+      .await
+      .expect("parse cover")
+      .expect("cover should exist");
+
+   assert_eq!(cover.data, image);
 }
 
 #[tokio::test]
