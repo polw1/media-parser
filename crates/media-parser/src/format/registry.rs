@@ -60,10 +60,7 @@ pub async fn parse_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
    reader.read_at(0, &mut header).await?;
 
    let format = detect_format(&header).ok_or_else(|| {
-      MediaParserError::InvalidFormat(format!(
-         "Could not detect format from header: {:02X?}",
-         &header[..header.len().min(16)]
-      ))
+      MediaParserError::InvalidFormat("Could not detect format from file header".to_string())
    })?;
 
    (format.track_parser)(reader).await
