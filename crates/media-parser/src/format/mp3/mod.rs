@@ -44,15 +44,12 @@ pub mod tables;
 pub mod tags;
 
 use crate::Result;
-use crate::format::{
-   AsyncCoverParser, AsyncFrameParser, AsyncFramesParser, AsyncParser, AsyncTrackParser, Format,
-};
+use crate::format::{AsyncCoverParser, AsyncParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::{AudioTrackMeta, BaseTrackMeta, CoverArt, Frame, Metadata, TrackType};
+use crate::types::{AudioTrackMeta, BaseTrackMeta, CoverArt, Metadata, TrackType};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration as StdDuration;
 
 /// MP3 format signature for detection.
 pub use crate::format::signatures::MP3 as SIGNATURE;
@@ -74,30 +71,12 @@ fn parse_cover(
    Box::pin(metadata::read_cover(reader))
 }
 
-fn parse_frame(
-   reader: &dyn StreamReader,
-   track_id: u32,
-   timestamp: StdDuration,
-) -> Pin<Box<dyn Future<Output = Result<Frame>> + Send + '_>> {
-   Box::pin(read_frame(reader, track_id, timestamp))
-}
-
-fn parse_frames<'a>(
-   reader: &'a dyn StreamReader,
-   track_id: u32,
-   timestamps: &'a [StdDuration],
-) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>>> + Send + 'a>> {
-   Box::pin(read_frames(reader, track_id, timestamps))
-}
-
 /// MP3 format definition registered in the global table.
 pub static FORMAT: Format = Format::new(
    SIGNATURE,
    parse as AsyncParser,
    parse_tracks as AsyncTrackParser,
    parse_cover as AsyncCoverParser,
-   parse_frame as AsyncFrameParser,
-   parse_frames as AsyncFramesParser,
 );
 
 /// Main parsing function.
@@ -136,29 +115,6 @@ async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
       channels: if header.channel_mode == 3 { 1 } else { 2 },
       sample_rate: header.sample_rate_hz,
    })])
-}
-
-async fn read_frame(
-   _reader: &dyn StreamReader,
-   _track_id: u32,
-   _timestamp: StdDuration,
-) -> Result<Frame> {
-   Err(crate::errors::MediaParserError::UnsupportedCodec(
-      "MP3 does not contain video frames".to_string(),
-   ))
-}
-
-async fn read_frames(
-   reader: &dyn StreamReader,
-   track_id: u32,
-   timestamps: &[StdDuration],
-) -> Result<Vec<Frame>> {
-   let Some(timestamp) = timestamps.first() else {
-      return Ok(Vec::new());
-   };
-   read_frame(reader, track_id, *timestamp)
-      .await
-      .map(|frame| vec![frame])
 }
 
 // Re-export public types

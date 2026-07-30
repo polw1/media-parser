@@ -36,16 +36,13 @@ pub(super) async fn read_samples_coalesced(
 ) -> Result<HashMap<u32, Vec<u8>>> {
    let batches = plan_read_batches(sample_indices, sizes, stsc, chunk_offsets)?;
    let batch_results = stream::iter(batches.into_iter().map(|batch| async move {
-      let mut data = Vec::new();
-      data
-         .try_reserve_exact(batch.size)
-         .map_err(|_| MediaParserError::InvalidFormat("sample batch is too large".to_string()))?;
-      data.resize(batch.size, 0);
-      let read = reader.read_at(batch.offset, &mut data).await?;
-      if read != batch.size {
+      let data = reader.read_vec(batch.offset, batch.size).await?;
+      if data.len() != batch.size {
          return Err(MediaParserError::InvalidFormat(format!(
-            "truncated sample batch at {}: expected {} bytes, read {read}",
-            batch.offset, batch.size
+            "truncated sample batch at {}: expected {} bytes, read {}",
+            batch.offset,
+            batch.size,
+            data.len()
          )));
       }
 

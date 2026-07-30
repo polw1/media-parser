@@ -16,3 +16,6 @@ expectType<Promise<ThumbnailInfo[]>>(
       headers: { Authorization: 'Bearer token' },
    }),
 );
+
+declare const cover: CoverInfo;
+expectType<Uint8Array>(cover.data);

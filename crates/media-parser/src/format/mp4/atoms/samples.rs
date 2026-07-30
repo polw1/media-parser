@@ -34,6 +34,14 @@ pub struct SampleSelection {
 
 const MAX_SAMPLES_PER_RANGE: usize = 16_384;
 
+/// Reads the entry count of a full-box table (8-byte header of version/flags
+/// plus entry count) and validates that `entry_size`-byte entries fit in the
+/// box payload.
+pub fn table_entries(buf: &[u8], entry_size: usize) -> Option<usize> {
+   let entry_count = usize::try_from(read_u32_be(buf, 4)?).ok()?;
+   (entry_count <= buf.len().checked_sub(8)? / entry_size).then_some(entry_count)
+}
+
 pub fn parse_avc_config(sample_entry_payload: &[u8]) -> Option<AvcConfig> {
    let children = sample_entry_payload.get(78..)?;
    let avcc =
@@ -98,10 +106,7 @@ pub fn parse_sample_sizes(stsz: &[u8]) -> Option<SampleSizes> {
 }
 
 pub fn parse_stsc(stsc: &[u8]) -> Option<Vec<StscEntry>> {
-   let entry_count = usize::try_from(read_u32_be(stsc, 4)?).ok()?;
-   if entry_count > stsc.len().checked_sub(8)? / 12 {
-      return None;
-   }
+   let entry_count = table_entries(stsc, 12)?;
 
    let mut entries = Vec::new();
    entries.try_reserve(entry_count).ok()?;
@@ -131,10 +136,7 @@ pub fn parse_stsc(stsc: &[u8]) -> Option<Vec<StscEntry>> {
 
 pub fn parse_chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
    if let Some(stco) = stbl.nav(&[*b"stco"]) {
-      let entry_count = usize::try_from(read_u32_be(stco, 4)?).ok()?;
-      if entry_count > stco.len().checked_sub(8)? / 4 {
-         return None;
-      }
+      let entry_count = table_entries(stco, 4)?;
       let mut offsets = Vec::new();
       offsets.try_reserve(entry_count).ok()?;
       for index in 0..entry_count {
@@ -144,10 +146,7 @@ pub fn parse_chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
    }
 
    let co64 = stbl.nav(&[*b"co64"])?;
-   let entry_count = usize::try_from(read_u32_be(co64, 4)?).ok()?;
-   if entry_count > co64.len().checked_sub(8)? / 8 {
-      return None;
-   }
+   let entry_count = table_entries(co64, 8)?;
    let mut offsets = Vec::new();
    offsets.try_reserve(entry_count).ok()?;
    for index in 0..entry_count {
@@ -157,10 +156,7 @@ pub fn parse_chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
 }
 
 pub fn parse_stss(stss: &[u8]) -> Option<Vec<u32>> {
-   let entry_count = usize::try_from(read_u32_be(stss, 4)?).ok()?;
-   if entry_count > stss.len().checked_sub(8)? / 4 {
-      return None;
-   }
+   let entry_count = table_entries(stss, 4)?;
    let mut samples = Vec::new();
    samples.try_reserve(entry_count).ok()?;
    for index in 0..entry_count {
@@ -177,10 +173,7 @@ pub fn parse_ctts(ctts: &[u8]) -> Option<Vec<CompositionOffset>> {
    if version > 1 {
       return None;
    }
-   let entry_count = usize::try_from(read_u32_be(ctts, 4)?).ok()?;
-   if entry_count > ctts.len().checked_sub(8)? / 8 {
-      return None;
-   }
+   let entry_count = table_entries(ctts, 8)?;
 
    let mut offsets = Vec::new();
    offsets.try_reserve(entry_count).ok()?;
@@ -203,85 +196,178 @@ pub fn parse_ctts(ctts: &[u8]) -> Option<Vec<CompositionOffset>> {
    Some(offsets)
 }
 
+/// One stts/ctts segment in decode order: `sample_count` samples starting at
+/// `first_sample` that share one sample delta and one composition offset.
+#[derive(Debug, Clone, Copy)]
+struct TimingSegment {
+   first_sample: u32,
+   decode_tick: u64,
+   sample_count: u32,
+   sample_delta: u64,
+   composition_offset: i64,
+}
+
+/// Result of advancing a [`TimingWalker`].
+enum TimingStep {
+   Segment(TimingSegment),
+   /// All stts entries were consumed.
+   Exhausted,
+   /// The timing tables are malformed (zero count/delta, missing ctts entry,
+   /// or tick overflow).
+   Invalid,
+}
+
+/// Walks the stts/ctts sample timing tables segment by segment in decode
+/// order, keeping the running sample index and decode tick.
+struct TimingWalker<'a> {
+   stts: &'a [u8],
+   composition_offsets: Option<&'a [CompositionOffset]>,
+   entry_count: usize,
+   sample_index: u32,
+   decode_tick: u64,
+   stts_index: usize,
+   stts_remaining: u32,
+   sample_delta: u64,
+   ctts_index: usize,
+   ctts_remaining: u32,
+   composition_offset: i64,
+}
+
+impl<'a> TimingWalker<'a> {
+   fn new(stts: &'a [u8], composition_offsets: Option<&'a [CompositionOffset]>) -> Option<Self> {
+      let entry_count = table_entries(stts, 8)?;
+      Some(Self {
+         stts,
+         composition_offsets,
+         entry_count,
+         sample_index: 1,
+         decode_tick: 0,
+         stts_index: 0,
+         stts_remaining: 0,
+         sample_delta: 0,
+         ctts_index: 0,
+         ctts_remaining: 0,
+         composition_offset: 0,
+      })
+   }
+
+   fn next_segment(&mut self) -> TimingStep {
+      if self.stts_remaining == 0 {
+         if self.stts_index == self.entry_count {
+            return TimingStep::Exhausted;
+         }
+         let offset = 8 + self.stts_index * 8;
+         let (Some(remaining), Some(delta)) = (
+            read_u32_be(self.stts, offset),
+            read_u32_be(self.stts, offset + 4),
+         ) else {
+            return TimingStep::Invalid;
+         };
+         if remaining == 0 || delta == 0 {
+            return TimingStep::Invalid;
+         }
+         self.stts_remaining = remaining;
+         self.sample_delta = u64::from(delta);
+         self.stts_index += 1;
+      }
+
+      if let Some(offsets) = self.composition_offsets {
+         if self.ctts_remaining == 0 {
+            let Some(entry) = offsets.get(self.ctts_index) else {
+               return TimingStep::Invalid;
+            };
+            self.ctts_remaining = entry.sample_count;
+            self.composition_offset = entry.sample_offset;
+            self.ctts_index += 1;
+         }
+      } else {
+         self.ctts_remaining = self.stts_remaining;
+         self.composition_offset = 0;
+      }
+
+      let segment_count = self.stts_remaining.min(self.ctts_remaining);
+      let segment = TimingSegment {
+         first_sample: self.sample_index,
+         decode_tick: self.decode_tick,
+         sample_count: segment_count,
+         sample_delta: self.sample_delta,
+         composition_offset: self.composition_offset,
+      };
+      let advance = u64::from(segment_count)
+         .checked_mul(self.sample_delta)
+         .and_then(|duration| self.decode_tick.checked_add(duration))
+         .and_then(|decode_tick| {
+            self
+               .sample_index
+               .checked_add(segment_count)
+               .map(|sample_index| (decode_tick, sample_index))
+         });
+      let Some((decode_tick, next_sample_index)) = advance else {
+         return TimingStep::Invalid;
+      };
+      self.decode_tick = decode_tick;
+      self.sample_index = next_sample_index;
+      self.stts_remaining -= segment_count;
+      self.ctts_remaining -= segment_count;
+      TimingStep::Segment(segment)
+   }
+
+   /// 1-based index of the next sample the walker will describe.
+   fn sample_index(&self) -> u32 {
+      self.sample_index
+   }
+
+   /// Whether any ctts-described samples remain after the stts table ended.
+   fn has_unconsumed_ctts(&self) -> bool {
+      self.ctts_remaining != 0
+         || self
+            .composition_offsets
+            .is_some_and(|offsets| self.ctts_index != offsets.len())
+   }
+}
+
 pub fn select_sample_by_time(
    stts: &[u8],
    composition_offsets: Option<&[CompositionOffset]>,
    presentation_offset: i64,
    target_tick: u64,
 ) -> Option<SampleSelection> {
-   let entry_count = usize::try_from(read_u32_be(stts, 4)?).ok()?;
-   if entry_count > stts.len().checked_sub(8)? / 8 {
-      return None;
-   }
-
-   let mut sample_index = 1u32;
-   let mut decode_tick = 0u64;
-   let mut stts_index = 0usize;
-   let mut stts_remaining = 0u32;
-   let mut sample_delta = 0u64;
-   let mut ctts_index = 0usize;
-   let mut ctts_remaining = 0u32;
-   let mut composition_offset = 0i64;
+   let mut walker = TimingWalker::new(stts, composition_offsets)?;
    let mut before: Option<SampleSelection> = None;
    let mut after: Option<SampleSelection> = None;
 
    loop {
-      if stts_remaining == 0 {
-         if stts_index == entry_count {
-            break;
+      match walker.next_segment() {
+         TimingStep::Segment(segment) => {
+            let first_presentation_tick = i128::from(segment.decode_tick)
+               .checked_add(i128::from(segment.composition_offset))?
+               .checked_sub(i128::from(presentation_offset))?;
+            consider_presentation_segment(
+               &mut before,
+               &mut after,
+               segment.first_sample,
+               first_presentation_tick,
+               segment.sample_count,
+               segment.sample_delta,
+               target_tick,
+            )?;
          }
-         let offset = 8 + stts_index * 8;
-         stts_remaining = read_u32_be(stts, offset)?;
-         sample_delta = u64::from(read_u32_be(stts, offset + 4)?);
-         if stts_remaining == 0 || sample_delta == 0 {
-            return None;
-         }
-         stts_index += 1;
+         TimingStep::Exhausted => break,
+         TimingStep::Invalid => return None,
       }
-
-      if let Some(offsets) = composition_offsets {
-         if ctts_remaining == 0 {
-            let entry = offsets.get(ctts_index)?;
-            ctts_remaining = entry.sample_count;
-            composition_offset = entry.sample_offset;
-            ctts_index += 1;
-         }
-      } else {
-         ctts_remaining = stts_remaining;
-         composition_offset = 0;
-      }
-
-      let segment_count = stts_remaining.min(ctts_remaining);
-      let first_presentation_tick = i128::from(decode_tick)
-         .checked_add(i128::from(composition_offset))?
-         .checked_sub(i128::from(presentation_offset))?;
-      consider_presentation_segment(
-         &mut before,
-         &mut after,
-         sample_index,
-         first_presentation_tick,
-         segment_count,
-         sample_delta,
-         target_tick,
-      )?;
-
-      let segment_duration = u64::from(segment_count).checked_mul(sample_delta)?;
-      decode_tick = decode_tick.checked_add(segment_duration)?;
-      sample_index = sample_index.checked_add(segment_count)?;
-      stts_remaining -= segment_count;
-      ctts_remaining -= segment_count;
    }
 
-   if composition_offsets.is_some()
-      && (ctts_remaining != 0
-         || composition_offsets.is_some_and(|offsets| ctts_index != offsets.len()))
-   {
+   if walker.has_unconsumed_ctts() {
       return None;
    }
 
    before.or(after)
 }
 
+/// Considers one presentation segment for sample selection.
+///
+/// The caller must guarantee `sample_delta` is non-zero (the stts/ctts walker
+/// rejects zero deltas while producing segments).
 fn consider_presentation_segment(
    before: &mut Option<SampleSelection>,
    after: &mut Option<SampleSelection>,
@@ -291,6 +377,7 @@ fn consider_presentation_segment(
    sample_delta: u64,
    target_tick: u64,
 ) -> Option<()> {
+   debug_assert!(sample_delta > 0);
    let delta = i128::from(sample_delta);
    let count = i128::from(sample_count);
    let first_nonnegative = if first_tick < 0 {
@@ -388,6 +475,92 @@ struct SampleLocation {
    sample_description_index: u32,
 }
 
+/// One stsc run: `chunk_count` consecutive chunks of `samples_per_chunk`
+/// samples each, starting at 0-based `first_sample_index`.
+#[derive(Debug, Clone, Copy)]
+struct StscRun {
+   first_chunk: u32,
+   samples_per_chunk: u32,
+   sample_description_index: u32,
+   first_sample_index: u32,
+   sample_count: u32,
+}
+
+/// Iterates the chunk runs described by the stsc table. Once a run fails
+/// validation the iterator stays exhausted and [`StscRuns::failed`] reports
+/// that the table was malformed.
+struct StscRuns<'a> {
+   stsc: &'a [StscEntry],
+   final_chunk: u32,
+   next_entry: usize,
+   first_sample_index: u32,
+   failed: bool,
+}
+
+impl<'a> StscRuns<'a> {
+   fn new(stsc: &'a [StscEntry], chunk_count: usize) -> Option<Self> {
+      let final_chunk = u32::try_from(chunk_count).ok()?.checked_add(1)?;
+      Some(Self {
+         stsc,
+         final_chunk,
+         next_entry: 0,
+         first_sample_index: 0,
+         failed: false,
+      })
+   }
+
+   fn failed(&self) -> bool {
+      self.failed
+   }
+}
+
+impl Iterator for StscRuns<'_> {
+   type Item = StscRun;
+
+   fn next(&mut self) -> Option<StscRun> {
+      if self.failed {
+         return None;
+      }
+      let entry = self.stsc.get(self.next_entry)?;
+      let next_chunk = self
+         .stsc
+         .get(self.next_entry + 1)
+         .map(|next| next.first_chunk)
+         .unwrap_or(self.final_chunk);
+      let run = if entry.first_chunk < next_chunk && next_chunk <= self.final_chunk {
+         next_chunk
+            .checked_sub(entry.first_chunk)
+            .and_then(|chunk_count| chunk_count.checked_mul(entry.samples_per_chunk))
+            .and_then(|sample_count| {
+               self
+                  .first_sample_index
+                  .checked_add(sample_count)
+                  .map(|run_end| {
+                     (
+                        StscRun {
+                           first_chunk: entry.first_chunk,
+                           samples_per_chunk: entry.samples_per_chunk,
+                           sample_description_index: entry.sample_description_index,
+                           first_sample_index: self.first_sample_index,
+                           sample_count,
+                        },
+                        run_end,
+                     )
+                  })
+            })
+      } else {
+         None
+      };
+      let Some((run, run_end)) = run else {
+         self.failed = true;
+         return None;
+      };
+      self.next_entry += 1;
+      self.first_sample_index = run_end;
+      Some(run)
+   }
+}
+
 fn sample_location(
    sample_index: u32,
    sizes: &SampleSizes,
@@ -403,37 +576,25 @@ fn sample_location(
    }
 
    let target = sample_index - 1;
-   let mut first_sample_in_run = 0u32;
-   let final_chunk = u32::try_from(chunk_offsets.len()).ok()?.checked_add(1)?;
-   for (entry_index, entry) in stsc.iter().enumerate() {
-      let next_chunk = stsc
-         .get(entry_index + 1)
-         .map(|next| next.first_chunk)
-         .unwrap_or(final_chunk);
-      if entry.first_chunk >= next_chunk || next_chunk > final_chunk {
-         return None;
-      }
-
-      let chunk_count = next_chunk.checked_sub(entry.first_chunk)?;
-      let samples_in_run = chunk_count.checked_mul(entry.samples_per_chunk)?;
-      let run_end = first_sample_in_run.checked_add(samples_in_run)?;
+   for run in StscRuns::new(stsc, chunk_offsets.len())? {
+      let run_end = run.first_sample_index.checked_add(run.sample_count)?;
       if target < run_end {
-         let within_run = target.checked_sub(first_sample_in_run)?;
-         let chunk_in_run = within_run / entry.samples_per_chunk;
-         let within_chunk = within_run % entry.samples_per_chunk;
-         let chunk_number = entry.first_chunk.checked_add(chunk_in_run)?;
-         let first_sample_in_chunk =
-            first_sample_in_run.checked_add(chunk_in_run.checked_mul(entry.samples_per_chunk)?)?;
+         let within_run = target.checked_sub(run.first_sample_index)?;
+         let chunk_in_run = within_run / run.samples_per_chunk;
+         let within_chunk = within_run % run.samples_per_chunk;
+         let chunk_number = run.first_chunk.checked_add(chunk_in_run)?;
+         let first_sample_in_chunk = run
+            .first_sample_index
+            .checked_add(chunk_in_run.checked_mul(run.samples_per_chunk)?)?;
          let prior_bytes = sum_sample_sizes(first_sample_in_chunk, within_chunk, sizes)?;
          let file_offset = chunk_offsets
             .get(usize::try_from(chunk_number.checked_sub(1)?).ok()?)?
             .checked_add(prior_bytes)?;
          return Some(SampleLocation {
             file_offset,
-            sample_description_index: entry.sample_description_index,
+            sample_description_index: run.sample_description_index,
          });
       }
-      first_sample_in_run = run_end;
    }
 
    None
@@ -507,26 +668,15 @@ pub fn validate_sample_tables(
       return None;
    }
 
-   let final_chunk = u32::try_from(chunk_offsets.len()).ok()?.checked_add(1)?;
    let mut described_samples = 0u32;
-   for (index, entry) in stsc.iter().enumerate() {
-      let next_chunk = stsc
-         .get(index + 1)
-         .map(|next| next.first_chunk)
-         .unwrap_or(final_chunk);
-      if entry.first_chunk >= next_chunk
-         || next_chunk > final_chunk
-         || usize::try_from(entry.sample_description_index).ok()? > sample_description_count
-      {
+   let mut runs = StscRuns::new(stsc, chunk_offsets.len())?;
+   for run in &mut runs {
+      if usize::try_from(run.sample_description_index).ok()? > sample_description_count {
          return None;
       }
-      described_samples = described_samples.checked_add(
-         next_chunk
-            .checked_sub(entry.first_chunk)?
-            .checked_mul(entry.samples_per_chunk)?,
-      )?;
+      described_samples = described_samples.checked_add(run.sample_count)?;
    }
-   if described_samples != sizes.sample_count {
+   if runs.failed() || described_samples != sizes.sample_count {
       return None;
    }
 
@@ -549,71 +699,41 @@ pub fn presentation_ticks_for_range(
    end_sample: u32,
 ) -> Option<Vec<(u32, i128)>> {
    validate_sample_range(start_sample, end_sample, usize::MAX).ok()?;
-   let entry_count = usize::try_from(read_u32_be(stts, 4)?).ok()?;
-   if entry_count > stts.len().checked_sub(8)? / 8 {
-      return None;
-   }
+   let range_len = usize::try_from(
+      end_sample
+         .checked_sub(start_sample)
+         .and_then(|count| count.checked_add(1))?,
+   )
+   .ok()?;
+   let mut walker = TimingWalker::new(stts, composition_offsets)?;
 
    let mut result = Vec::new();
-   result
-      .try_reserve(usize::try_from(end_sample - start_sample + 1).ok()?)
-      .ok()?;
-   let mut sample_index = 1u32;
-   let mut decode_tick = 0u64;
-   let mut stts_index = 0usize;
-   let mut stts_remaining = 0u32;
-   let mut sample_delta = 0u64;
-   let mut ctts_index = 0usize;
-   let mut ctts_remaining = 0u32;
-   let mut composition_offset = 0i64;
-
-   while sample_index <= end_sample {
-      if stts_remaining == 0 {
-         if stts_index == entry_count {
-            return None;
-         }
-         let offset = 8 + stts_index * 8;
-         stts_remaining = read_u32_be(stts, offset)?;
-         sample_delta = u64::from(read_u32_be(stts, offset + 4)?);
-         if stts_remaining == 0 || sample_delta == 0 {
-            return None;
-         }
-         stts_index += 1;
-      }
-      if let Some(offsets) = composition_offsets {
-         if ctts_remaining == 0 {
-            let entry = offsets.get(ctts_index)?;
-            ctts_remaining = entry.sample_count;
-            composition_offset = entry.sample_offset;
-            ctts_index += 1;
-         }
-      } else {
-         ctts_remaining = stts_remaining;
-         composition_offset = 0;
-      }
-
-      let count = stts_remaining.min(ctts_remaining);
-      let segment_end = sample_index.checked_add(count)?;
-      let wanted_start = start_sample.saturating_sub(sample_index).min(count);
+   result.try_reserve(range_len).ok()?;
+   while walker.sample_index() <= end_sample {
+      let TimingStep::Segment(segment) = walker.next_segment() else {
+         return None;
+      };
+      let count = segment.sample_count;
+      let wanted_start = start_sample.saturating_sub(segment.first_sample).min(count);
       let wanted_end = end_sample
          .checked_add(1)?
-         .saturating_sub(sample_index)
+         .saturating_sub(segment.first_sample)
          .min(count);
       for position in wanted_start..wanted_end {
-         let sample_decode_tick =
-            decode_tick.checked_add(u64::from(position).checked_mul(sample_delta)?)?;
+         let sample_decode_tick = segment
+            .decode_tick
+            .checked_add(u64::from(position).checked_mul(segment.sample_delta)?)?;
          let presentation_tick = i128::from(sample_decode_tick)
-            .checked_add(i128::from(composition_offset))?
+            .checked_add(i128::from(segment.composition_offset))?
             .checked_sub(i128::from(presentation_offset))?;
-         result.push((sample_index.checked_add(position)?, presentation_tick));
+         result.push((
+            segment.first_sample.checked_add(position)?,
+            presentation_tick,
+         ));
       }
-      decode_tick = decode_tick.checked_add(u64::from(count).checked_mul(sample_delta)?)?;
-      sample_index = segment_end;
-      stts_remaining -= count;
-      ctts_remaining -= count;
    }
 
-   (result.len() == usize::try_from(end_sample - start_sample + 1).ok()?).then_some(result)
+   (result.len() == range_len).then_some(result)
 }
 
 pub fn duration_to_ticks(duration: Duration, timescale: u32) -> u64 {
@@ -622,12 +742,19 @@ pub fn duration_to_ticks(duration: Duration, timescale: u32) -> u64 {
 }
 
 fn stts_sample_count(stts: &[u8]) -> Option<u32> {
-   let entry_count = usize::try_from(read_u32_be(stts, 4)?).ok()?;
-   if entry_count > stts.len().checked_sub(8)? / 8 {
-      return None;
-   }
+   let entry_count = table_entries(stts, 8)?;
    (0..entry_count).try_fold(0u32, |total, index| {
       total.checked_add(read_u32_be(stts, 8 + index * 8)?)
+   })
+}
+
+/// Total duration in media ticks described by the stts table.
+pub fn stts_duration_ticks(stts: &[u8]) -> Option<u64> {
+   let entry_count = table_entries(stts, 8)?;
+   (0..entry_count).try_fold(0u64, |total, index| {
+      let count = u64::from(read_u32_be(stts, 8 + index * 8)?);
+      let delta = u64::from(read_u32_be(stts, 8 + index * 8 + 4)?);
+      total.checked_add(count.checked_mul(delta)?)
    })
 }
 
@@ -693,6 +820,38 @@ mod tests {
 
       assert_eq!(selection.sample_index, 3);
       assert_eq!(selection.presentation_tick, 1_000);
+   }
+
+   #[test]
+   fn rejects_zero_sample_delta_while_selecting() {
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stts.extend_from_slice(&2u32.to_be_bytes());
+      stts.extend_from_slice(&0u32.to_be_bytes());
+
+      assert!(select_sample_by_time(&stts, None, 0, 1_000).is_none());
+   }
+
+   #[test]
+   fn sums_stts_duration_with_checked_arithmetic() {
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&2u32.to_be_bytes());
+      stts.extend_from_slice(&3u32.to_be_bytes());
+      stts.extend_from_slice(&1_000u32.to_be_bytes());
+      stts.extend_from_slice(&2u32.to_be_bytes());
+      stts.extend_from_slice(&500u32.to_be_bytes());
+
+      assert_eq!(stts_duration_ticks(&stts), Some(4_000));
+
+      let mut large = vec![0; 8];
+      large[4..8].copy_from_slice(&1u32.to_be_bytes());
+      large.extend_from_slice(&u32::MAX.to_be_bytes());
+      large.extend_from_slice(&u32::MAX.to_be_bytes());
+
+      assert_eq!(
+         stts_duration_ticks(&large),
+         Some(u64::from(u32::MAX) * u64::from(u32::MAX))
+      );
    }
 
    #[test]

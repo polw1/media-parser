@@ -45,6 +45,6 @@ pub(super) use samples::{
    CompositionOffset, SampleSizes, StscEntry, duration_to_ticks, nearest_sync_sample,
    next_sync_sample, parse_avc_config, parse_chunk_offsets, parse_ctts, parse_sample_sizes,
    parse_stsc, parse_stss, presentation_ticks_for_range, sample_description_index,
-   sample_file_offset, sample_size, select_sample_by_time, ticks_to_duration,
-   validate_sample_tables,
+   sample_file_offset, sample_size, select_sample_by_time, stts_duration_ticks, table_entries,
+   ticks_to_duration, validate_sample_tables,
 };

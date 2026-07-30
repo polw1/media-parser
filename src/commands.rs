@@ -13,6 +13,9 @@ use crate::Result;
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
 const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
+
+type EnvelopeMeta = serde_json::Map<String, serde_json::Value>;
 
 struct SessionCache<K, V> {
    capacity: usize,
@@ -94,12 +97,29 @@ fn is_http_source(source: &str) -> bool {
       .unwrap_or(false)
 }
 
-fn thumbnail_session_key(
+/// Builds the reader for a source, with optional HTTP headers for URLs.
+async fn open_reader(
+   source: &str,
+   headers: Option<&HashMap<String, String>>,
+   is_remote: bool,
+) -> Result<Arc<dyn StreamReader>> {
+   if is_remote {
+      let reader = match headers {
+         Some(headers) => HttpStreamReader::with_headers(source, headers.clone()).await?,
+         None => HttpStreamReader::new(source).await?,
+      };
+      Ok(Arc::new(reader))
+   } else {
+      Ok(Arc::new(FileStreamReader::new(source)?))
+   }
+}
+
+async fn thumbnail_session_key(
    source: &str,
    headers: Option<&HashMap<String, String>>,
    track_id: u32,
+   is_remote: bool,
 ) -> ThumbnailSessionKey {
-   let is_remote = is_http_source(source);
    let mut headers = if is_remote {
       headers
          .into_iter()
@@ -110,17 +130,23 @@ fn thumbnail_session_key(
       Vec::new()
    };
    headers.sort_unstable();
-   let local_version = (!is_remote)
-      .then(|| std::fs::metadata(source).ok())
-      .flatten()
-      .map(|metadata| LocalSourceVersion {
-         length: metadata.len(),
-         modified_nanos: metadata
-            .modified()
-            .ok()
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|elapsed| elapsed.as_nanos()),
-      });
+   let local_version = if is_remote {
+      None
+   } else {
+      let path = source.to_string();
+      tauri::async_runtime::spawn_blocking(move || std::fs::metadata(path).ok())
+         .await
+         .ok()
+         .flatten()
+         .map(|metadata| LocalSourceVersion {
+            length: metadata.len(),
+            modified_nanos: metadata
+               .modified()
+               .ok()
+               .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+               .map(|elapsed| elapsed.as_nanos()),
+         })
+   };
    ThumbnailSessionKey {
       source: source.to_string(),
       headers,
@@ -129,8 +155,8 @@ fn thumbnail_session_key(
    }
 }
 
-fn thumbnail_session_expiration(source: &str, now: Instant) -> Option<Instant> {
-   is_http_source(source)
+fn thumbnail_session_expiration(is_remote: bool, now: Instant) -> Option<Instant> {
+   is_remote
       .then(|| now.checked_add(REMOTE_THUMBNAIL_SESSION_TTL))
       .flatten()
 }
@@ -141,7 +167,8 @@ async fn thumbnail_session(
    headers: Option<&HashMap<String, String>>,
    track_id: u32,
 ) -> Result<Arc<ThumbnailSession>> {
-   let key = thumbnail_session_key(source, headers, track_id);
+   let is_remote = is_http_source(source);
+   let key = thumbnail_session_key(source, headers, track_id, is_remote).await;
    let now = Instant::now();
    if let Some(session) = sessions
       .cache
@@ -152,17 +179,10 @@ async fn thumbnail_session(
       return Ok(session);
    }
 
-   let reader: Arc<dyn StreamReader> = if is_http_source(source) {
-      match headers {
-         Some(headers) => Arc::new(HttpStreamReader::with_headers(source, headers.clone()).await?),
-         None => Arc::new(HttpStreamReader::new(source).await?),
-      }
-   } else {
-      Arc::new(FileStreamReader::new(source)?)
-   };
+   let reader = open_reader(source, headers, is_remote).await?;
    let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
    let session = Arc::new(ThumbnailSession { reader, index });
-   let expires_at = thumbnail_session_expiration(source, now);
+   let expires_at = thumbnail_session_expiration(is_remote, now);
    sessions
       .cache
       .lock()
@@ -198,24 +218,6 @@ async fn thumbnail_frames(
    }
 }
 
-/// Helper macro to handle stream instantiation based on the source (URL or File).
-macro_rules! with_reader {
-   ($source:expr, $headers:expr, |$reader:ident| $body:expr) => {{
-      if is_http_source(&$source) {
-         let reader = match $headers {
-            Some(h) => HttpStreamReader::with_headers(&$source, h).await?,
-            None => HttpStreamReader::new(&$source).await?,
-         };
-         let $reader = reader;
-         $body
-      } else {
-         let reader = FileStreamReader::new(&$source)?;
-         let $reader = reader;
-         $body
-      }
-   }};
-}
-
 /// Extract metadata from a media file (local path or URL).
 ///
 /// # Arguments
@@ -229,10 +231,11 @@ pub(crate) async fn get_metadata(
    source: String,
    headers: Option<HashMap<String, String>>,
 ) -> Result<Metadata> {
-   with_reader!(source, headers, |reader| {
-      let parser = MediaParser::new(reader);
-      parser.metadata().await.map_err(Into::into)
-   })
+   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   MediaParser::new(reader.as_ref())
+      .metadata()
+      .await
+      .map_err(Into::into)
 }
 
 /// Extract track information from a media file (local path or URL).
@@ -241,10 +244,11 @@ pub(crate) async fn get_tracks(
    source: String,
    headers: Option<HashMap<String, String>>,
 ) -> Result<Vec<TrackInfo>> {
-   let tracks = with_reader!(source, headers, |reader| {
-      let parser = MediaParser::new(reader);
-      parser.tracks().await
-   })?;
+   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   let tracks = MediaParser::new(reader.as_ref())
+      .tracks()
+      .await
+      .map_err(crate::Error::from)?;
 
    Ok(tracks.into_iter().map(TrackInfo::from).collect())
 }
@@ -254,13 +258,14 @@ pub(crate) async fn get_tracks(
 pub(crate) async fn get_cover(
    source: String,
    headers: Option<HashMap<String, String>>,
-) -> Result<Option<CoverInfo>> {
-   let cover = with_reader!(source, headers, |reader| {
-      let parser = MediaParser::new(reader);
-      parser.cover().await
-   })?;
+) -> Result<tauri::ipc::Response> {
+   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   let cover = MediaParser::new(reader.as_ref())
+      .cover()
+      .await
+      .map_err(crate::Error::from)?;
 
-   Ok(cover.map(CoverInfo::from))
+   Ok(tauri::ipc::Response::new(cover_envelope(cover)?))
 }
 
 /// Extract thumbnails from a video track at millisecond timestamps.
@@ -274,36 +279,33 @@ pub(crate) async fn get_thumbnails(
    sessions: State<'_, ThumbnailSessions>,
 ) -> Result<tauri::ipc::Response> {
    let timestamps = thumbnail_durations(&timestamps);
+   // Extraction is deterministic per timestamp: dedup repeats so each unique
+   // frame is decoded and transferred only once.
+   let mut unique_timestamps = Vec::new();
+   let mut index_by_timestamp = HashMap::new();
+   let mut order = Vec::new();
+   for timestamp in timestamps {
+      let next_index = unique_timestamps.len();
+      let index = *index_by_timestamp.entry(timestamp).or_insert(next_index);
+      if index == next_index {
+         unique_timestamps.push(timestamp);
+      }
+      order.push(index);
+   }
    let frames = thumbnail_frames(
       &sessions,
       &source,
-      &timestamps,
+      &unique_timestamps,
       track_id.unwrap_or(0),
       accurate.unwrap_or(false),
       headers.as_ref(),
    )
    .await?;
    Ok(tauri::ipc::Response::new(encode_thumbnail_envelope(
-      frames,
+      &frames,
+      &order,
+      MAX_THUMBNAIL_OUTPUT_BYTES,
    )?))
-}
-
-#[derive(serde::Serialize, Clone, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct CoverInfo {
-   pub format: String,
-   pub mime_type: String,
-   pub data: Vec<u8>,
-}
-
-impl From<CoverArt> for CoverInfo {
-   fn from(cover: CoverArt) -> Self {
-      Self {
-         format: cover.format.label().to_string(),
-         mime_type: cover.mime_type,
-         data: cover.data,
-      }
-   }
 }
 
 fn thumbnail_durations(timestamps_ms: &[u64]) -> Vec<Duration> {
@@ -314,57 +316,94 @@ fn thumbnail_durations(timestamps_ms: &[u64]) -> Vec<Duration> {
       .collect()
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ThumbnailEnvelopeEntry {
-   track_id: u32,
-   width: u32,
-   height: u32,
-   timestamp_sec: f64,
-   format: String,
-   mime_type: String,
-   offset: usize,
-   length: usize,
+fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
+   let Some(cover) = cover else {
+      return encode_binary_envelope(Vec::new(), &[]);
+   };
+   let mut meta = EnvelopeMeta::new();
+   meta.insert("format".into(), cover.format.label().into());
+   meta.insert("mimeType".into(), cover.mime_type.into());
+   meta.insert("offset".into(), 0.into());
+   meta.insert("length".into(), cover.data.len().into());
+   let payloads = [cover.data.as_slice()];
+   encode_binary_envelope(vec![meta], &payloads)
 }
 
-fn encode_thumbnail_envelope(frames: Vec<Frame>) -> Result<Vec<u8>> {
-   let mut entries = Vec::new();
-   entries
+fn thumbnail_envelope_entry(frame: &Frame, offset: usize) -> EnvelopeMeta {
+   let mut meta = EnvelopeMeta::new();
+   meta.insert("trackId".into(), frame.track_id.into());
+   meta.insert("width".into(), frame.width.into());
+   meta.insert("height".into(), frame.height.into());
+   meta.insert("timestampSec".into(), frame.timestamp.as_secs_f64().into());
+   meta.insert("format".into(), frame.format.label().into());
+   meta.insert("mimeType".into(), frame.format.mime_type().into());
+   meta.insert("offset".into(), offset.into());
+   meta.insert("length".into(), frame.data.len().into());
+   meta
+}
+
+/// Encodes one metadata entry per requested timestamp into the binary
+/// envelope. `order` maps each output entry to a frame in `frames`, so
+/// duplicate timestamps share the same payload bytes.
+fn encode_thumbnail_envelope(
+   frames: &[Frame],
+   order: &[usize],
+   max_output_bytes: usize,
+) -> Result<Vec<u8>> {
+   let mut offsets = Vec::new();
+   offsets
       .try_reserve_exact(frames.len())
       .map_err(|_| crate::Error::Custom("too many thumbnail entries".to_string()))?;
    let mut payload_len = 0usize;
-   for frame in &frames {
-      entries.push(ThumbnailEnvelopeEntry {
-         track_id: frame.track_id,
-         width: frame.width,
-         height: frame.height,
-         timestamp_sec: frame.timestamp.as_secs_f64(),
-         format: frame.format.label().to_string(),
-         mime_type: frame.format.mime_type().to_string(),
-         offset: payload_len,
-         length: frame.data.len(),
-      });
+   for frame in frames {
+      offsets.push(payload_len);
       payload_len = payload_len
          .checked_add(frame.data.len())
+         .filter(|total| *total <= max_output_bytes)
          .ok_or_else(|| crate::Error::Custom("thumbnail payload is too large".to_string()))?;
    }
 
+   let mut entries = Vec::new();
+   entries
+      .try_reserve_exact(order.len())
+      .map_err(|_| crate::Error::Custom("too many thumbnail entries".to_string()))?;
+   for &index in order {
+      let frame = frames
+         .get(index)
+         .ok_or_else(|| crate::Error::Custom("thumbnail frame index out of range".to_string()))?;
+      entries.push(thumbnail_envelope_entry(frame, offsets[index]));
+   }
+   let payloads = frames
+      .iter()
+      .map(|frame| frame.data.as_slice())
+      .collect::<Vec<_>>();
+   encode_binary_envelope(entries, &payloads)
+}
+
+/// Binary envelope shared by covers and thumbnails: a little-endian u32
+/// header length, a JSON array of entry metadata, then the concatenated
+/// payloads. Each entry carries its own `offset`/`length` into the payload.
+fn encode_binary_envelope(entries: Vec<EnvelopeMeta>, payloads: &[&[u8]]) -> Result<Vec<u8>> {
+   let payload_len = payloads
+      .iter()
+      .try_fold(0usize, |total, payload| total.checked_add(payload.len()))
+      .ok_or_else(|| crate::Error::Custom("envelope payload is too large".to_string()))?;
    let header = serde_json::to_vec(&entries)
-      .map_err(|error| crate::Error::Custom(format!("could not encode thumbnails: {error}")))?;
+      .map_err(|error| crate::Error::Custom(format!("could not encode envelope: {error}")))?;
    let header_len = u32::try_from(header.len())
-      .map_err(|_| crate::Error::Custom("thumbnail header is too large".to_string()))?;
+      .map_err(|_| crate::Error::Custom("envelope header is too large".to_string()))?;
    let envelope_len = 4usize
       .checked_add(header.len())
       .and_then(|length| length.checked_add(payload_len))
-      .ok_or_else(|| crate::Error::Custom("thumbnail response is too large".to_string()))?;
+      .ok_or_else(|| crate::Error::Custom("envelope is too large".to_string()))?;
    let mut envelope = Vec::new();
    envelope
       .try_reserve_exact(envelope_len)
-      .map_err(|_| crate::Error::Custom("thumbnail response is too large".to_string()))?;
+      .map_err(|_| crate::Error::Custom("envelope is too large".to_string()))?;
    envelope.extend_from_slice(&header_len.to_le_bytes());
    envelope.extend_from_slice(&header);
-   for frame in frames {
-      envelope.extend_from_slice(&frame.data);
+   for payload in payloads {
+      envelope.extend_from_slice(payload);
    }
    Ok(envelope)
 }
@@ -453,39 +492,8 @@ mod tests {
          .into_owned()
    }
 
-   #[test]
-   fn serializes_cover_info_contract() {
-      let cover = CoverInfo::from(CoverArt {
-         format: PixelFormat::Jpeg,
-         mime_type: "image/jpeg".to_string(),
-         data: vec![1, 2, 3],
-      });
-
-      assert_eq!(
-         serde_json::to_value(cover).expect("cover should serialize"),
-         serde_json::json!({
-            "format": "jpeg",
-            "mimeType": "image/jpeg",
-            "data": [1, 2, 3],
-         })
-      );
-   }
-
-   #[test]
-   fn thumbnail_durations_use_milliseconds() {
-      assert_eq!(
-         thumbnail_durations(&[0, 250, 1_000]),
-         vec![
-            std::time::Duration::ZERO,
-            std::time::Duration::from_millis(250),
-            std::time::Duration::from_secs(1),
-         ]
-      );
-   }
-
-   #[test]
-   fn encodes_thumbnail_metadata_and_image_bytes_in_one_binary_envelope() {
-      let frames = vec![
+   fn test_frames() -> Vec<Frame> {
+      vec![
          Frame {
             track_id: 3,
             width: 320,
@@ -504,13 +512,64 @@ mod tests {
             data: vec![4, 5],
             strides: None,
          },
-      ];
+      ]
+   }
 
-      let envelope = encode_thumbnail_envelope(frames).expect("envelope should encode");
+   fn envelope_parts(envelope: &[u8]) -> (serde_json::Value, &[u8]) {
       let header_len = u32::from_le_bytes(envelope[..4].try_into().unwrap()) as usize;
       let header_end = 4 + header_len;
-      let header: serde_json::Value =
-         serde_json::from_slice(&envelope[4..header_end]).expect("header should be JSON");
+      let header = serde_json::from_slice(&envelope[4..header_end]).expect("header should be JSON");
+      (header, &envelope[header_end..])
+   }
+
+   #[test]
+   fn encodes_cover_as_a_single_entry_binary_envelope() {
+      let envelope = cover_envelope(Some(CoverArt {
+         format: PixelFormat::Jpeg,
+         mime_type: "image/jpeg".to_string(),
+         data: vec![1, 2, 3],
+      }))
+      .expect("cover should encode");
+      let (header, payload) = envelope_parts(&envelope);
+
+      assert_eq!(
+         header,
+         serde_json::json!([{
+            "format": "jpeg",
+            "mimeType": "image/jpeg",
+            "offset": 0,
+            "length": 3,
+         }])
+      );
+      assert_eq!(payload, &[1, 2, 3]);
+   }
+
+   #[test]
+   fn encodes_missing_cover_as_an_empty_envelope() {
+      let envelope = cover_envelope(None).expect("empty cover should encode");
+      let (header, payload) = envelope_parts(&envelope);
+
+      assert_eq!(header, serde_json::json!([]));
+      assert!(payload.is_empty());
+   }
+
+   #[test]
+   fn thumbnail_durations_use_milliseconds() {
+      assert_eq!(
+         thumbnail_durations(&[0, 250, 1_000]),
+         vec![
+            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(250),
+            std::time::Duration::from_secs(1),
+         ]
+      );
+   }
+
+   #[test]
+   fn encodes_thumbnail_metadata_and_image_bytes_in_one_binary_envelope() {
+      let envelope = encode_thumbnail_envelope(&test_frames(), &[0, 1], usize::MAX)
+         .expect("envelope should encode");
+      let (header, payload) = envelope_parts(&envelope);
 
       assert_eq!(
          header,
@@ -537,7 +596,28 @@ mod tests {
             },
          ])
       );
-      assert_eq!(&envelope[header_end..], &[1, 2, 3, 4, 5]);
+      assert_eq!(payload, &[1, 2, 3, 4, 5]);
+   }
+
+   #[test]
+   fn duplicate_thumbnail_timestamps_share_the_same_payload_bytes() {
+      let envelope = encode_thumbnail_envelope(&test_frames(), &[0, 1, 0], usize::MAX)
+         .expect("envelope should encode");
+      let (header, payload) = envelope_parts(&envelope);
+
+      let entries = header.as_array().expect("header should be an array");
+      assert_eq!(entries.len(), 3);
+      assert_eq!(entries[0]["offset"], entries[2]["offset"]);
+      assert_eq!(entries[0]["length"], entries[2]["length"]);
+      assert_eq!(entries[1]["offset"], serde_json::json!(3));
+      assert_eq!(payload, &[1, 2, 3, 4, 5]);
+   }
+
+   #[test]
+   fn thumbnail_envelope_rejects_payloads_beyond_the_output_cap() {
+      let result = encode_thumbnail_envelope(&test_frames(), &[0, 1], 4);
+
+      assert!(result.is_err());
    }
 
    #[test]
@@ -566,8 +646,8 @@ mod tests {
       assert_eq!(cache.get(&"remote".to_string(), deadline), None);
    }
 
-   #[test]
-   fn thumbnail_session_key_normalizes_http_header_names_and_order() {
+   #[tokio::test]
+   async fn thumbnail_session_key_normalizes_http_header_names_and_order() {
       let first_headers = HashMap::from([
          ("X-Test".to_string(), "one".to_string()),
          ("Authorization".to_string(), "Bearer token".to_string()),
@@ -577,25 +657,37 @@ mod tests {
          ("x-test".to_string(), "one".to_string()),
       ]);
 
-      let first = thumbnail_session_key("https://example.com/video.mp4", Some(&first_headers), 7);
-      let second = thumbnail_session_key("https://example.com/video.mp4", Some(&second_headers), 7);
+      let first = thumbnail_session_key(
+         "https://example.com/video.mp4",
+         Some(&first_headers),
+         7,
+         true,
+      )
+      .await;
+      let second = thumbnail_session_key(
+         "https://example.com/video.mp4",
+         Some(&second_headers),
+         7,
+         true,
+      )
+      .await;
 
       assert!(first == second);
    }
 
-   #[test]
-   fn thumbnail_session_key_ignores_headers_for_local_sources() {
+   #[tokio::test]
+   async fn thumbnail_session_key_ignores_headers_for_local_sources() {
       let source = video_fixture_source();
       let headers = HashMap::from([("Authorization".to_string(), "ignored".to_string())]);
 
       assert!(
-         thumbnail_session_key(&source, None, 1)
-            == thumbnail_session_key(&source, Some(&headers), 1)
+         thumbnail_session_key(&source, None, 1, false).await
+            == thumbnail_session_key(&source, Some(&headers), 1, false).await
       );
    }
 
-   #[test]
-   fn thumbnail_session_key_changes_when_a_local_file_changes() {
+   #[tokio::test]
+   async fn thumbnail_session_key_changes_when_a_local_file_changes() {
       let unique = std::time::SystemTime::now()
          .duration_since(std::time::UNIX_EPOCH)
          .unwrap()
@@ -606,10 +698,10 @@ mod tests {
       ));
       std::fs::write(&path, [1]).unwrap();
       let source = path.to_string_lossy();
-      let first = thumbnail_session_key(&source, None, 1);
+      let first = thumbnail_session_key(&source, None, 1, false).await;
 
       std::fs::write(&path, [1, 2]).unwrap();
-      let second = thumbnail_session_key(&source, None, 1);
+      let second = thumbnail_session_key(&source, None, 1, false).await;
       std::fs::remove_file(&path).unwrap();
 
       assert!(first != second);
@@ -620,10 +712,10 @@ mod tests {
       let now = Instant::now();
 
       assert_eq!(
-         thumbnail_session_expiration("https://example.com/video.mp4", now),
+         thumbnail_session_expiration(true, now),
          now.checked_add(REMOTE_THUMBNAIL_SESSION_TTL)
       );
-      assert_eq!(thumbnail_session_expiration("/video.mp4", now), None);
+      assert_eq!(thumbnail_session_expiration(false, now), None);
    }
 
    #[tokio::test]

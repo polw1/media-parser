@@ -65,10 +65,9 @@ pub mod signatures;
 
 use crate::Result;
 use crate::stream::StreamReader;
-use crate::types::{CoverArt, Frame, Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
 /// Async parser function type.
 ///
@@ -87,21 +86,6 @@ pub type AsyncCoverParser =
    for<'a> fn(
       &'a dyn StreamReader,
    ) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + 'a>>;
-
-/// Async single-frame parser function type.
-pub type AsyncFrameParser = for<'a> fn(
-   &'a dyn StreamReader,
-   u32,
-   Duration,
-) -> Pin<Box<dyn Future<Output = Result<Frame>> + Send + 'a>>;
-
-/// Async multi-frame parser function type.
-pub type AsyncFramesParser =
-   for<'a> fn(
-      &'a dyn StreamReader,
-      u32,
-      &'a [Duration],
-   ) -> Pin<Box<dyn Future<Output = Result<Vec<Frame>>> + Send + 'a>>;
 
 /// Format signature for identification.
 ///
@@ -127,8 +111,6 @@ pub struct Format {
    pub parser: AsyncParser,
    pub track_parser: AsyncTrackParser,
    pub cover_parser: AsyncCoverParser,
-   pub frame_parser: AsyncFrameParser,
-   pub frames_parser: AsyncFramesParser,
 }
 
 impl Format {
@@ -137,16 +119,12 @@ impl Format {
       parser: AsyncParser,
       track_parser: AsyncTrackParser,
       cover_parser: AsyncCoverParser,
-      frame_parser: AsyncFrameParser,
-      frames_parser: AsyncFramesParser,
    ) -> Self {
       Self {
          signature,
          parser,
          track_parser,
          cover_parser,
-         frame_parser,
-         frames_parser,
       }
    }
 

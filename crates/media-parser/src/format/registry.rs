@@ -17,9 +17,8 @@ use super::{Format, FormatSignature};
 use crate::Result;
 use crate::errors::MediaParserError;
 use crate::stream::StreamReader;
-use crate::types::{CoverArt, Frame, Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, TrackType};
 use std::sync::LazyLock;
-use std::time::Duration;
 
 /// Global registry of supported formats.
 static FORMATS: LazyLock<Vec<&'static Format>> = LazyLock::new(|| {
@@ -66,26 +65,6 @@ pub async fn parse_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
 pub async fn parse_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
    let format = detect_format_async(reader).await?;
    (format.cover_parser)(reader).await
-}
-
-/// Parses a frame at the requested timestamp.
-pub async fn parse_frame(
-   reader: &dyn StreamReader,
-   track_id: u32,
-   timestamp: Duration,
-) -> Result<Frame> {
-   let format = detect_format_async(reader).await?;
-   (format.frame_parser)(reader, track_id, timestamp).await
-}
-
-/// Parses multiple frames while detecting the format only once.
-pub async fn parse_frames(
-   reader: &dyn StreamReader,
-   track_id: u32,
-   timestamps: &[Duration],
-) -> Result<Vec<Frame>> {
-   let format = detect_format_async(reader).await?;
-   (format.frames_parser)(reader, track_id, timestamps).await
 }
 
 /// Returns an iterator over all supported format signatures.

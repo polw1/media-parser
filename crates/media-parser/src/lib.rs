@@ -127,14 +127,13 @@ pub mod format;
 pub mod helpers;
 pub mod stream;
 pub mod types;
-use std::time::Duration;
 
 // Public API
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{
-   detect_format, get_format_info, is_supported, parse_cover, parse_frame, parse_frames,
-   parse_metadata, parse_tracks, supported_formats,
+   detect_format, get_format_info, is_supported, parse_cover, parse_metadata, parse_tracks,
+   supported_formats,
 };
 pub use stream::{FileStreamReader, HttpStreamReader, StreamReader};
 pub use types::{
@@ -173,16 +172,6 @@ impl<R: StreamReader> MediaParser<R> {
       // TODO: Implement actual subtitle parsing
       let _ = filter; // Suppress unused parameter warning
       Ok(vec![])
-   }
-
-   /// Extract a single frame from a video track at the specified timestamp.
-   pub async fn frame(&self, track_id: u32, timestamp: Duration) -> Result<Frame> {
-      format::registry::parse_frame(&self.reader, track_id, timestamp).await
-   }
-
-   /// Extract multiple frames from a video track at the specified timestamps.
-   pub async fn frames(&self, track_id: u32, timestamps: &[Duration]) -> Result<Vec<Frame>> {
-      format::registry::parse_frames(&self.reader, track_id, timestamps).await
    }
 
    /// List all supported format names.

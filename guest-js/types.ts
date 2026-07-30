@@ -42,7 +42,8 @@ export interface MetadataOptions {
 export interface CoverInfo {
    format: 'jpeg' | 'png';
    mimeType: 'image/jpeg' | 'image/png';
-   data: number[];
+   /** Image bytes backed by the binary IPC response. */
+   data: Uint8Array;
 }
 
 /**

@@ -16,7 +16,8 @@
 use super::duration::calculate_duration;
 use super::tags::{frame_id_to_key, frame_name};
 use crate::helpers::{
-   decode_latin1, decode_utf8, decode_utf16_be, decode_utf16_with_bom, trim_null_and_whitespace,
+   decode_latin1, decode_utf8, decode_utf16_be, decode_utf16_with_bom, detect_image_format,
+   trim_null_and_whitespace,
 };
 use crate::stream::StreamReader;
 use crate::types::{CoverArt, Meta, Metadata, PixelFormat};
@@ -398,11 +399,7 @@ fn cover_format(mime: &str, image: &[u8]) -> Option<PixelFormat> {
    match mime.to_ascii_lowercase().as_str() {
       "image/jpeg" | "image/jpg" => Some(PixelFormat::Jpeg),
       "image/png" => Some(PixelFormat::Png),
-      _ if image.starts_with(&[0xff, 0xd8, 0xff]) => Some(PixelFormat::Jpeg),
-      _ if image.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) => {
-         Some(PixelFormat::Png)
-      }
-      _ => None,
+      _ => detect_image_format(image),
    }
 }
 

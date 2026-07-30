@@ -78,16 +78,20 @@ export async function getTracks(
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Optional settings (headers are only used for URLs)
- * @returns Cover artwork when present, otherwise null
+ * @returns Cover artwork when present, otherwise null. The `data` bytes are
+ * backed by the binary IPC response.
  */
 export async function getCover(
    source: string,
    options?: MetadataOptions,
 ): Promise<CoverInfo | null> {
-   return await invoke<CoverInfo | null>('plugin:media-parser|get_cover', {
+   const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_cover', {
       source,
       headers: options?.headers,
    });
+
+   const entries = decodeEnvelope<Omit<CoverInfo, 'data'>>(raw);
+   return entries.length === 0 ? null : entries[0];
 }
 
 /**
@@ -116,22 +120,26 @@ export async function getThumbnails(
 }
 
 function decodeThumbnailEnvelope(raw: ArrayBuffer | Uint8Array): ThumbnailInfo[] {
+   return decodeEnvelope<Omit<ThumbnailInfo, 'data'>>(raw);
+}
+
+function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
    const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
    const headerLength = view.getUint32(0, true);
    const headerEnd = 4 + headerLength;
    const header = buffer.subarray(4, headerEnd);
 
-   interface EnvelopeEntry extends Omit<ThumbnailInfo, 'data'> {
+   interface EnvelopeEntry {
       offset: number;
       length: number;
    }
 
-   const entries: EnvelopeEntry[] = JSON.parse(new TextDecoder().decode(header));
+   const entries: (T & EnvelopeEntry)[] = JSON.parse(new TextDecoder().decode(header));
    return entries.map(({ offset, length, ...info }) => ({
       ...info,
       data: buffer.subarray(headerEnd + offset, headerEnd + offset + length),
-   }));
+   })) as (T & { data: Uint8Array })[];
 }
 
 // ============================================================================

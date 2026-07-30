@@ -102,8 +102,51 @@ pub trait StreamReader: Send + Sync {
    /// if `offset >= size()` or if `buf.is_empty()`.
    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
+   /// Reads up to `len` bytes at the specified offset into a new buffer.
+   ///
+   /// The returned buffer is truncated to the number of bytes actually read,
+   /// which may be less than `len` if EOF is reached, and is empty if
+   /// `offset >= size()`. The default implementation reads through `read_at`;
+   /// implementations may override it to avoid an intermediate copy.
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      let mut buf = vec![0u8; len];
+      let read = self.read_at(offset, &mut buf).await?;
+      buf.truncate(read);
+      Ok(buf)
+   }
+
    /// Returns the total size of the stream in bytes.
    async fn size(&self) -> Result<u64>;
+}
+
+#[async_trait]
+impl<T: StreamReader + ?Sized> StreamReader for &T {
+   async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+      (**self).read_at(offset, buf).await
+   }
+
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      (**self).read_vec(offset, len).await
+   }
+
+   async fn size(&self) -> Result<u64> {
+      (**self).size().await
+   }
+}
+
+#[async_trait]
+impl<T: StreamReader + ?Sized> StreamReader for Arc<T> {
+   async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+      (**self).read_at(offset, buf).await
+   }
+
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      (**self).read_vec(offset, len).await
+   }
+
+   async fn size(&self) -> Result<u64> {
+      (**self).size().await
+   }
 }
 
 /// `StreamReader` implementation backed by a local file handle.
@@ -169,20 +212,31 @@ impl StreamReader for FileStreamReader {
          return Ok(0);
       }
 
-      let file = Arc::clone(&self.file);
-      let len = buf.len();
+      let data = self.read_vec(offset, buf.len()).await?;
+      Ok(copy_into(buf, &data))
+   }
 
-      let mut temp_buf = vec![0u8; len];
-      let bytes_read = tokio::task::spawn_blocking(move || {
-         let read = Self::sync_read_into(&file, offset, &mut temp_buf)?;
-         Ok::<_, MediaParserError>((read, temp_buf))
+   /// Reads data from the file at the specified offset into a new buffer.
+   ///
+   /// Reads directly into the returned buffer inside the blocking task, avoiding
+   /// the extra copy `read_at` needs to fill a caller-provided buffer.
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      if len == 0 {
+         return Ok(Vec::new());
+      }
+
+      let file = Arc::clone(&self.file);
+
+      let buf = tokio::task::spawn_blocking(move || {
+         let mut buf = vec![0u8; len];
+         let read = Self::sync_read_into(&file, offset, &mut buf)?;
+         buf.truncate(read);
+         Ok::<_, MediaParserError>(buf)
       })
       .await
       .map_err(|e| MediaParserError::BlockingTask(format!("spawn_blocking failed: {}", e)))??;
 
-      let (bytes_read, temp_buf) = bytes_read;
-      copy_into(buf, &temp_buf[..bytes_read]);
-      Ok(bytes_read)
+      Ok(buf)
    }
 
    /// Returns the file size in bytes.
@@ -814,6 +868,26 @@ mod tests {
       assert!(
          matches!(error, MediaParserError::HttpRequest(message) if message.contains("ignored"))
       );
+   }
+
+   #[tokio::test]
+   async fn test_file_read_vec_truncates_at_eof() {
+      let test_file = create_test_file(TEST_CONTENT);
+      let reader = FileStreamReader::new(test_file.path()).unwrap();
+
+      // Ask for more bytes than remain; the result is truncated to EOF
+      let data = reader
+         .read_vec(TEST_CONTENT.len() as u64 - 4, 100)
+         .await
+         .unwrap();
+      assert_eq!(data, &TEST_CONTENT[TEST_CONTENT.len() - 4..]);
+
+      // Reads starting beyond EOF return an empty buffer
+      let data = reader
+         .read_vec(TEST_CONTENT.len() as u64 + 100, 16)
+         .await
+         .unwrap();
+      assert!(data.is_empty());
    }
 
    #[tokio::test]

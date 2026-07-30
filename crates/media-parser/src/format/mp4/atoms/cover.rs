@@ -1,7 +1,7 @@
 //! Embedded MP4 cover-art parsing.
 
 use super::Mp4Nav;
-use crate::helpers::read_u32_be;
+use crate::helpers::{detect_image_format, read_u32_be};
 use crate::types::{CoverArt, PixelFormat};
 
 pub fn parse_cover_art(moov_payload: &[u8]) -> Option<CoverArt> {
@@ -19,9 +19,7 @@ pub fn parse_cover_art(moov_payload: &[u8]) -> Option<CoverArt> {
    let format = match read_u32_be(data, 0)? {
       13 => PixelFormat::Jpeg,
       14 => PixelFormat::Png,
-      _ if image.starts_with(&[0xff, 0xd8, 0xff]) => PixelFormat::Jpeg,
-      _ if image.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) => PixelFormat::Png,
-      _ => return None,
+      _ => detect_image_format(image)?,
    };
 
    let mut image_data = Vec::new();

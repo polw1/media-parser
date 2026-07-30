@@ -1,7 +1,8 @@
 //! Integration tests for MP4 metadata extraction.
 
 use media_parser::{
-   FileStreamReader, MediaParser, PixelFormat, StreamReader, TrackType, format::mp4::ThumbnailIndex,
+   FileStreamReader, MediaParser, PixelFormat, StreamReader, TrackType,
+   format::mp4::{ThumbnailIndex, read_frames},
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -21,6 +22,19 @@ fn fixtures_dir() -> PathBuf {
    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
       .join("tests")
       .join("fixtures")
+}
+
+/// FNV-1a digest used to pin the exact decoded JPEG bytes, fixing the
+/// presentation-order contract against regressions. The pinned values depend
+/// on the OpenH264 and jpeg-encoder versions and must be updated when those
+/// dependencies change output bytes.
+fn fnv1a(data: &[u8]) -> u64 {
+   let mut hash = 0xcbf2_9ce4_8422_2325u64;
+   for byte in data {
+      hash ^= u64::from(*byte);
+      hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+   }
+   hash
 }
 
 struct CountingReader {
@@ -114,10 +128,8 @@ async fn test_mp4_covr_cover_extraction() {
 async fn test_mp4_h264_thumbnail_extraction() {
    let path = fixtures_dir().join("multitrack_video.mp4");
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
-   let parser = MediaParser::new(reader);
 
-   let frames = parser
-      .frames(0, &[Duration::ZERO])
+   let frames = read_frames(&reader, 0, &[Duration::ZERO])
       .await
       .expect("extract thumbnail");
 
@@ -132,15 +144,14 @@ async fn test_mp4_h264_thumbnail_extraction() {
 #[tokio::test]
 async fn test_mp4_h264_thumbnails_follow_presentation_order() {
    let path = fixtures_dir().join("multitrack_video.mp4");
-   let parser = MediaParser::new(FileStreamReader::new(&path).expect("open MP4 fixture"));
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
    let timestamps = [
       Duration::ZERO,
       Duration::from_millis(100),
       Duration::from_millis(200),
    ];
 
-   let frames = parser
-      .frames(0, &timestamps)
+   let frames = read_frames(&reader, 0, &timestamps)
       .await
       .expect("extract presentation-ordered thumbnails");
 
@@ -152,8 +163,59 @@ async fn test_mp4_h264_thumbnails_follow_presentation_order() {
          .collect::<Vec<_>>(),
       timestamps
    );
-   assert_ne!(frames[0].data, frames[1].data);
-   assert_ne!(frames[1].data, frames[2].data);
+   // The fixture holds an I/B/P GOP with real ctts reordering; pin the exact
+   // decoded bytes so a frame swap cannot slip through silently.
+   assert_eq!(
+      frames
+         .iter()
+         .map(|frame| fnv1a(&frame.data))
+         .collect::<Vec<_>>(),
+      [
+         0x60cf_af45_c4bb_b19d,
+         0xfaaf_98fb_5875_7231,
+         0x53af_95e8_f945_80f4
+      ]
+   );
+}
+
+#[tokio::test]
+async fn test_mp4_h264_thumbnails_follow_presentation_order_with_deep_b_frames() {
+   let path = fixtures_dir().join("bframes_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   // 9 frames at 100 ms with three consecutive B-frames between P-frames.
+   let timestamps = (0..9)
+      .map(|index| Duration::from_millis(index * 100))
+      .collect::<Vec<_>>();
+
+   let frames = read_frames(&reader, 0, &timestamps)
+      .await
+      .expect("extract reordered thumbnails");
+
+   assert_eq!(frames.len(), timestamps.len());
+   assert_eq!(
+      frames
+         .iter()
+         .map(|frame| frame.timestamp)
+         .collect::<Vec<_>>(),
+      timestamps
+   );
+   assert_eq!(
+      frames
+         .iter()
+         .map(|frame| fnv1a(&frame.data))
+         .collect::<Vec<_>>(),
+      [
+         0x9190_4ea4_16ce_2814,
+         0xbf83_13c4_8b71_3e3b,
+         0xa0bd_15ff_1423_543d,
+         0xea1d_a3e4_e707_f08c,
+         0xc978_b83f_79b9_b1d7,
+         0xa9a3_7b8d_fc5e_a227,
+         0xe472_d8a3_5b90_a1cb,
+         0x299e_1536_6076_e3ff,
+         0x112a_8c63_5120_2a12,
+      ]
+   );
 }
 
 #[tokio::test]
@@ -265,10 +327,9 @@ async fn test_mp4_thumbnail_batch_rejects_too_many_outputs() {
 #[tokio::test]
 async fn test_mp4_frames_rejects_any_timestamp_outside_track_duration() {
    let path = fixtures_dir().join("multitrack_video.mp4");
-   let parser = MediaParser::new(FileStreamReader::new(&path).expect("open MP4 fixture"));
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
 
-   let error = parser
-      .frames(0, &[Duration::ZERO, Duration::from_secs(10)])
+   let error = read_frames(&reader, 0, &[Duration::ZERO, Duration::from_secs(10)])
       .await
       .expect_err("mixed valid and invalid timestamps must not change cardinality");
 
@@ -332,9 +393,8 @@ async fn test_mp4_thumbnail_rejects_non_h264_video() {
    file.write_all(&moov).expect("write moov");
    file.flush().expect("flush temp mp4");
 
-   let parser = MediaParser::new(FileStreamReader::new(file.path()).expect("open temp mp4"));
-   let error = parser
-      .frame(0, Duration::ZERO)
+   let reader = FileStreamReader::new(file.path()).expect("open temp mp4");
+   let error = read_frames(&reader, 0, &[Duration::ZERO])
       .await
       .expect_err("non-H.264 video should not produce a thumbnail");
 
