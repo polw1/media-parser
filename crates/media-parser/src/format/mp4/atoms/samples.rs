@@ -4,7 +4,6 @@ use super::{Mp4Nav, iter_boxes};
 use crate::decoders::h264::AvcConfig;
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
-use crate::stream::StreamReader;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Copy)]
@@ -452,105 +451,6 @@ pub fn sample_size(sample_index: u32, sizes: &SampleSizes) -> Option<u32> {
          .get(usize::try_from(sample_index - 1).ok()?)
          .copied()
    }
-}
-
-pub async fn read_sample_data(
-   reader: &dyn StreamReader,
-   sample_index: u32,
-   sizes: &SampleSizes,
-   stsc: &[StscEntry],
-   chunk_offsets: &[u64],
-   max_sample_bytes: usize,
-) -> Result<Vec<u8>> {
-   let offset = sample_file_offset(sample_index, sizes, stsc, chunk_offsets).ok_or_else(|| {
-      MediaParserError::InvalidFormat(format!("could not locate sample {sample_index}"))
-   })?;
-   let size = sample_size(sample_index, sizes).ok_or_else(|| {
-      MediaParserError::InvalidFormat(format!("could not read sample {sample_index} size"))
-   })?;
-   let size = usize::try_from(size)
-      .map_err(|_| MediaParserError::InvalidFormat("sample too large".to_string()))?;
-   if size > max_sample_bytes {
-      return Err(MediaParserError::InvalidFormat(format!(
-         "sample too large: {size} bytes"
-      )));
-   }
-
-   let mut data = Vec::new();
-   data
-      .try_reserve_exact(size)
-      .map_err(|_| MediaParserError::InvalidFormat("sample too large".to_string()))?;
-   data.resize(size, 0);
-   let read = reader.read_at(offset, &mut data).await?;
-   if read != size {
-      return Err(MediaParserError::InvalidFormat(format!(
-         "truncated sample {sample_index}: expected {size} bytes, read {read}"
-      )));
-   }
-   Ok(data)
-}
-
-pub async fn read_sample_range(
-   reader: &dyn StreamReader,
-   start_sample: u32,
-   end_sample: u32,
-   sizes: &SampleSizes,
-   stsc: &[StscEntry],
-   chunk_offsets: &[u64],
-   max_total_bytes: usize,
-) -> Result<Vec<Vec<u8>>> {
-   let capacity = validate_sample_range(start_sample, end_sample, max_total_bytes)?;
-   if end_sample > sizes.sample_count {
-      return Err(MediaParserError::InvalidFormat(format!(
-         "sample range exceeds sample count: {end_sample} > {}",
-         sizes.sample_count
-      )));
-   }
-
-   let mut total_bytes = 0usize;
-   for sample_index in start_sample..=end_sample {
-      let size = usize::try_from(sample_size(sample_index, sizes).ok_or_else(|| {
-         MediaParserError::InvalidFormat(format!("could not read sample {sample_index} size"))
-      })?)
-      .map_err(|_| MediaParserError::InvalidFormat("sample too large".to_string()))?;
-      total_bytes = total_bytes
-         .checked_add(size)
-         .ok_or_else(|| MediaParserError::InvalidFormat("sample range too large".to_string()))?;
-      if total_bytes > max_total_bytes {
-         return Err(MediaParserError::InvalidFormat(format!(
-            "sample range too large: {total_bytes} bytes"
-         )));
-      }
-   }
-
-   let allocation_bytes = capacity
-      .checked_mul(std::mem::size_of::<Vec<u8>>())
-      .and_then(|overhead| overhead.checked_add(total_bytes))
-      .ok_or_else(|| MediaParserError::InvalidFormat("sample range too large".to_string()))?;
-   if allocation_bytes > max_total_bytes {
-      return Err(MediaParserError::InvalidFormat(format!(
-         "sample range allocation too large: {allocation_bytes} bytes"
-      )));
-   }
-
-   let mut samples = Vec::new();
-   samples
-      .try_reserve(capacity)
-      .map_err(|_| MediaParserError::InvalidFormat("sample range too large".to_string()))?;
-   for sample_index in start_sample..=end_sample {
-      samples.push(
-         read_sample_data(
-            reader,
-            sample_index,
-            sizes,
-            stsc,
-            chunk_offsets,
-            max_total_bytes,
-         )
-         .await?,
-      );
-   }
-   Ok(samples)
 }
 
 pub fn validate_sample_range(

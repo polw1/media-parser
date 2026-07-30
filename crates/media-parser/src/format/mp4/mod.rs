@@ -35,6 +35,7 @@
 pub mod atoms;
 pub mod metadata;
 pub mod subtitles;
+mod thumbnail_io;
 pub mod thumbnails;
 pub mod tracks;
 
@@ -107,5 +108,5 @@ pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
 
 // Re-export for direct access
 pub use metadata::read_metadata;
-pub use thumbnails::{read_frame, read_frames};
+pub use thumbnails::{ThumbnailIndex, read_frame, read_frames, read_keyframes};
 pub use tracks::read_tracks;

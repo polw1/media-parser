@@ -4,34 +4,279 @@ use super::atoms::{
    CompositionOffset, Mp4Nav, SampleSizes, StscEntry, duration_to_ticks, find_and_read_moov_box,
    iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config, parse_chunk_offsets,
    parse_ctts, parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes, parse_stsc,
-   parse_stss, parse_tkhd, presentation_ticks_for_range, read_sample_range,
-   sample_description_index, select_sample_by_time, ticks_to_duration, validate_sample_tables,
+   parse_stss, parse_tkhd, presentation_ticks_for_range, sample_description_index,
+   select_sample_by_time, ticks_to_duration, validate_sample_tables,
 };
-use crate::decoders::h264::{AvcConfig, decode_frame_to_jpeg};
+use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
+use crate::decoders::h264::{AvcConfig, DecodedImage, decode_frames_to_jpeg};
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u32_be, read_u64_be};
 use crate::stream::StreamReader;
 use crate::types::{Frame, PixelFormat};
+use futures::stream::{self, StreamExt, TryStreamExt};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
+const MAX_CONCURRENT_DECODES: usize = 4;
 
-struct VideoTrack<'a> {
+#[derive(Debug)]
+struct VideoTrack {
    id: u32,
    timescale: u32,
    duration: u64,
    presentation_offset: i64,
-   stbl: &'a [u8],
 }
 
-struct VideoSampleTables<'a> {
-   stts: &'a [u8],
+#[derive(Debug)]
+struct VideoSampleTables {
+   stts: Vec<u8>,
    composition_offsets: Option<Vec<CompositionOffset>>,
    sizes: SampleSizes,
    stsc: Vec<StscEntry>,
    chunk_offsets: Vec<u64>,
    sync_samples: Option<Vec<u32>>,
    avc_configs: Vec<Option<AvcConfig>>,
+}
+
+/// Parsed MP4 video index that can be reused across thumbnail requests.
+#[derive(Debug)]
+pub struct ThumbnailIndex {
+   track: VideoTrack,
+   tables: VideoSampleTables,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Gop {
+   start_sample: u32,
+   end_sample: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactTarget {
+   gop: Gop,
+   sample_index: u32,
+   presentation_tick: u64,
+   output_index: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyframeTarget {
+   sample_index: u32,
+   presentation_tick: u64,
+}
+
+impl ThumbnailIndex {
+   /// Reads and parses the selected video track's sample index.
+   pub async fn read(reader: &dyn StreamReader, track_id: u32) -> Result<Self> {
+      let moov = find_and_read_moov_box(reader).await?;
+      let moov_payload = parse_moov_payload(&moov)?;
+      let (track, tables) = find_video_track(moov_payload, track_id)?.ok_or(
+         MediaParserError::TrackNotFound(if track_id == 0 { 1 } else { track_id }),
+      )?;
+      Ok(Self { track, tables })
+   }
+
+   /// Extracts exact frames while reusing the parsed index.
+   pub async fn frames(
+      &self,
+      reader: &dyn StreamReader,
+      timestamps: &[Duration],
+   ) -> Result<Vec<Frame>> {
+      self.validate_timestamps(timestamps)?;
+      let targets = timestamps
+         .iter()
+         .copied()
+         .map(|timestamp| exact_target(&self.track, &self.tables, timestamp))
+         .collect::<Result<Vec<_>>>()?;
+      let mut targets_by_gop = BTreeMap::<Gop, Vec<ExactTarget>>::new();
+      for target in targets.iter().copied() {
+         targets_by_gop.entry(target.gop).or_default().push(target);
+      }
+
+      let wanted_samples = samples_for_gops(targets_by_gop.keys().copied())?;
+      let mut samples = read_samples_coalesced(
+         reader,
+         &wanted_samples,
+         &self.tables.sizes,
+         &self.tables.stsc,
+         &self.tables.chunk_offsets,
+      )
+      .await?;
+
+      let mut decode_jobs = Vec::new();
+      decode_jobs
+         .try_reserve(targets_by_gop.len())
+         .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail GOPs".to_string()))?;
+      for (gop, gop_targets) in &targets_by_gop {
+         let avc_config =
+            avc_config_for_range(&self.tables, gop.start_sample, gop.end_sample)?.clone();
+         let mut gop_samples = Vec::new();
+         gop_samples
+            .try_reserve(usize::try_from(gop.end_sample - gop.start_sample + 1).unwrap_or(0))
+            .map_err(|_| {
+               MediaParserError::InvalidFormat("thumbnail GOP is too large".to_string())
+            })?;
+         for sample_index in gop.start_sample..=gop.end_sample {
+            gop_samples.push(samples.remove(&sample_index).ok_or_else(|| {
+               MediaParserError::InvalidFormat(format!("missing thumbnail sample {sample_index}"))
+            })?);
+         }
+         let mut output_indices = gop_targets
+            .iter()
+            .map(|target| target.output_index)
+            .collect::<Vec<_>>();
+         output_indices.sort_unstable();
+         output_indices.dedup();
+         decode_jobs.push((*gop, avc_config, gop_samples, output_indices));
+      }
+
+      let decoded = stream::iter(decode_jobs.into_iter().map(
+         |(gop, avc_config, samples, output_indices)| async move {
+            let decoded = tokio::task::spawn_blocking(move || {
+               decode_frames_to_jpeg(&avc_config, &samples, &output_indices)
+                  .map(|images| (output_indices, images))
+            })
+            .await
+            .map_err(|error| {
+               MediaParserError::BlockingTask(format!("thumbnail decode task failed: {error}"))
+            })?
+            .map_err(|error| {
+               MediaParserError::UnsupportedCodec(format!("H.264 decode failed: {error}"))
+            })?;
+            Ok::<_, MediaParserError>((gop, decoded))
+         },
+      ))
+      .buffer_unordered(MAX_CONCURRENT_DECODES)
+      .try_collect::<Vec<_>>()
+      .await?;
+
+      let mut images = HashMap::<(Gop, usize), DecodedImage>::new();
+      for (gop, (output_indices, decoded_images)) in decoded {
+         for (output_index, image) in output_indices.into_iter().zip(decoded_images) {
+            images.insert((gop, output_index), image);
+         }
+      }
+
+      let mut frames = Vec::new();
+      frames.try_reserve(targets.len()).map_err(|_| {
+         MediaParserError::InvalidFormat("too many thumbnail timestamps".to_string())
+      })?;
+      for target in targets {
+         let image = images
+            .get(&(target.gop, target.output_index))
+            .ok_or_else(|| {
+               MediaParserError::InvalidFormat(format!(
+                  "missing decoded thumbnail sample {}",
+                  target.sample_index
+               ))
+            })?;
+         frames.push(frame_from_image(
+            &self.track,
+            target.presentation_tick,
+            image.clone(),
+         ));
+      }
+      Ok(frames)
+   }
+
+   /// Extracts the nearest preceding keyframe for each timestamp.
+   pub async fn keyframes(
+      &self,
+      reader: &dyn StreamReader,
+      timestamps: &[Duration],
+   ) -> Result<Vec<Frame>> {
+      self.validate_timestamps(timestamps)?;
+      let targets = timestamps
+         .iter()
+         .copied()
+         .map(|timestamp| keyframe_target(&self.track, &self.tables, timestamp))
+         .collect::<Result<Vec<_>>>()?;
+      let mut unique_samples = targets
+         .iter()
+         .map(|target| target.sample_index)
+         .collect::<Vec<_>>();
+      unique_samples.sort_unstable();
+      unique_samples.dedup();
+      let mut samples = read_samples_coalesced(
+         reader,
+         &unique_samples,
+         &self.tables.sizes,
+         &self.tables.stsc,
+         &self.tables.chunk_offsets,
+      )
+      .await?;
+
+      let mut decode_jobs = Vec::new();
+      decode_jobs.try_reserve(unique_samples.len()).map_err(|_| {
+         MediaParserError::InvalidFormat("too many thumbnail keyframes".to_string())
+      })?;
+      for sample_index in unique_samples {
+         let avc_config = avc_config_for_range(&self.tables, sample_index, sample_index)?.clone();
+         let sample = samples.remove(&sample_index).ok_or_else(|| {
+            MediaParserError::InvalidFormat(format!("missing thumbnail sample {sample_index}"))
+         })?;
+         decode_jobs.push((sample_index, avc_config, sample));
+      }
+
+      let decoded = stream::iter(decode_jobs.into_iter().map(
+         |(sample_index, avc_config, sample)| async move {
+            let image = tokio::task::spawn_blocking(move || {
+               decode_frames_to_jpeg(&avc_config, &[sample], &[0])
+                  .and_then(|mut images| images.pop().ok_or_else(|| "no decoded frame".to_string()))
+            })
+            .await
+            .map_err(|error| {
+               MediaParserError::BlockingTask(format!("thumbnail decode task failed: {error}"))
+            })?
+            .map_err(|error| {
+               MediaParserError::UnsupportedCodec(format!("H.264 decode failed: {error}"))
+            })?;
+            Ok::<_, MediaParserError>((sample_index, image))
+         },
+      ))
+      .buffer_unordered(MAX_CONCURRENT_DECODES)
+      .try_collect::<HashMap<_, _>>()
+      .await?;
+
+      let mut frames = Vec::new();
+      frames.try_reserve(targets.len()).map_err(|_| {
+         MediaParserError::InvalidFormat("too many thumbnail timestamps".to_string())
+      })?;
+      for target in targets {
+         let image = decoded.get(&target.sample_index).ok_or_else(|| {
+            MediaParserError::InvalidFormat(format!(
+               "missing decoded thumbnail sample {}",
+               target.sample_index
+            ))
+         })?;
+         frames.push(frame_from_image(
+            &self.track,
+            target.presentation_tick,
+            image.clone(),
+         ));
+      }
+      Ok(frames)
+   }
+
+   fn validate_timestamps(&self, timestamps: &[Duration]) -> Result<()> {
+      if timestamps.len() > MAX_THUMBNAIL_OUTPUTS {
+         return Err(MediaParserError::InvalidFormat(format!(
+            "too many thumbnail timestamps: {}",
+            timestamps.len()
+         )));
+      }
+      for timestamp in timestamps {
+         if self.track.duration != 0
+            && duration_to_ticks(*timestamp, self.track.timescale) >= self.track.duration
+         {
+            return Err(MediaParserError::InvalidFormat(format!(
+               "thumbnail timestamp {timestamp:?} is outside the video track duration"
+            )));
+         }
+      }
+      Ok(())
+   }
 }
 
 pub async fn read_frame(
@@ -56,35 +301,31 @@ pub async fn read_frames(
       return Ok(Vec::new());
    }
 
-   let moov = find_and_read_moov_box(reader).await?;
-   let moov_payload = parse_moov_payload(&moov)?;
-   let track = find_video_track(moov_payload, track_id)?.ok_or(MediaParserError::TrackNotFound(
-      if track_id == 0 { 1 } else { track_id },
-   ))?;
-   let tables = parse_video_sample_tables(track.stbl)?;
+   ThumbnailIndex::read(reader, track_id)
+      .await?
+      .frames(reader, timestamps)
+      .await
+}
 
-   for timestamp in timestamps {
-      if track.duration != 0 && duration_to_ticks(*timestamp, track.timescale) >= track.duration {
-         return Err(MediaParserError::InvalidFormat(format!(
-            "thumbnail timestamp {timestamp:?} is outside the video track duration"
-         )));
-      }
+/// Extracts nearest preceding keyframes while parsing the MP4 index once.
+pub async fn read_keyframes(
+   reader: &dyn StreamReader,
+   track_id: u32,
+   timestamps: &[Duration],
+) -> Result<Vec<Frame>> {
+   if timestamps.is_empty() {
+      return Ok(Vec::new());
    }
-
-   let mut frames = Vec::new();
-   frames
-      .try_reserve(timestamps.len())
-      .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail timestamps".to_string()))?;
-   for timestamp in timestamps.iter().copied() {
-      frames.push(extract_frame(reader, &track, &tables, timestamp).await?);
-   }
-   Ok(frames)
+   ThumbnailIndex::read(reader, track_id)
+      .await?
+      .keyframes(reader, timestamps)
+      .await
 }
 
 fn find_video_track(
    moov_payload: &[u8],
    requested_track_id: u32,
-) -> Result<Option<VideoTrack<'_>>> {
+) -> Result<Option<(VideoTrack, VideoSampleTables)>> {
    for (_, trak) in iter_boxes(moov_payload).filter(|(fourcc, _)| fourcc == b"trak") {
       let Some(tkhd) = trak.nav(&[*b"tkhd"]).and_then(parse_tkhd) else {
          continue;
@@ -117,18 +358,21 @@ fn find_video_track(
          None => 0,
       };
 
-      return Ok(Some(VideoTrack {
-         id: tkhd.id,
-         timescale: mdhd.timescale,
-         duration: mdhd.duration,
-         presentation_offset,
-         stbl,
-      }));
+      let tables = parse_video_sample_tables(stbl)?;
+      return Ok(Some((
+         VideoTrack {
+            id: tkhd.id,
+            timescale: mdhd.timescale,
+            duration: mdhd.duration,
+            presentation_offset,
+         },
+         tables,
+      )));
    }
    Ok(None)
 }
 
-fn parse_video_sample_tables(stbl: &[u8]) -> Result<VideoSampleTables<'_>> {
+fn parse_video_sample_tables(stbl: &[u8]) -> Result<VideoSampleTables> {
    let stts = stbl
       .nav(&[*b"stts"])
       .ok_or_else(|| MediaParserError::InvalidFormat("video track missing stts".to_string()))?;
@@ -176,7 +420,7 @@ fn parse_video_sample_tables(stbl: &[u8]) -> Result<VideoSampleTables<'_>> {
    })?;
 
    Ok(VideoSampleTables {
-      stts,
+      stts: stts.to_vec(),
       composition_offsets,
       sizes,
       stsc,
@@ -186,15 +430,14 @@ fn parse_video_sample_tables(stbl: &[u8]) -> Result<VideoSampleTables<'_>> {
    })
 }
 
-async fn extract_frame(
-   reader: &dyn StreamReader,
-   track: &VideoTrack<'_>,
-   tables: &VideoSampleTables<'_>,
+fn exact_target(
+   track: &VideoTrack,
+   tables: &VideoSampleTables,
    timestamp: Duration,
-) -> Result<Frame> {
+) -> Result<ExactTarget> {
    let target_tick = duration_to_ticks(timestamp, track.timescale);
    let selection = select_sample_by_time(
-      tables.stts,
+      &tables.stts,
       tables.composition_offsets.as_deref(),
       track.presentation_offset,
       target_tick,
@@ -209,7 +452,7 @@ async fn extract_frame(
    .and_then(|sample| sample.checked_sub(1))
    .unwrap_or(tables.sizes.sample_count);
    let presentation_order = presentation_ticks_for_range(
-      tables.stts,
+      &tables.stts,
       tables.composition_offsets.as_deref(),
       track.presentation_offset,
       sync_sample,
@@ -224,44 +467,86 @@ async fn extract_frame(
       .ok_or_else(|| {
          MediaParserError::InvalidFormat("selected sample is outside its GOP".to_string())
       })?;
-
-   let avc_config = avc_config_for_range(tables, sync_sample, end_sample)?;
-   let samples = read_sample_range(
-      reader,
-      sync_sample,
-      end_sample,
-      &tables.sizes,
-      &tables.stsc,
-      &tables.chunk_offsets,
-      MAX_FRAME_BYTES,
-   )
-   .await?;
-   let avc_config = avc_config.clone();
-   let decoded = tokio::task::spawn_blocking(move || {
-      decode_frame_to_jpeg(&avc_config, &samples, output_index)
-   })
-   .await
-   .map_err(|error| {
-      MediaParserError::BlockingTask(format!("thumbnail decode task failed: {error}"))
-   })?
-   .map_err(|error| MediaParserError::UnsupportedCodec(format!("H.264 decode failed: {error}")))?;
-
-   Ok(Frame {
-      track_id: track.id,
-      width: decoded.width,
-      height: decoded.height,
-      timestamp: ticks_to_duration(selection.presentation_tick, track.timescale),
-      format: PixelFormat::Jpeg,
-      data: decoded.data,
-      strides: None,
+   Ok(ExactTarget {
+      gop: Gop {
+         start_sample: sync_sample,
+         end_sample,
+      },
+      sample_index: selection.sample_index,
+      presentation_tick: selection.presentation_tick,
+      output_index,
    })
 }
 
-fn avc_config_for_range<'a>(
-   tables: &'a VideoSampleTables<'_>,
+fn keyframe_target(
+   track: &VideoTrack,
+   tables: &VideoSampleTables,
+   timestamp: Duration,
+) -> Result<KeyframeTarget> {
+   let target_tick = duration_to_ticks(timestamp, track.timescale);
+   let selection = select_sample_by_time(
+      &tables.stts,
+      tables.composition_offsets.as_deref(),
+      track.presentation_offset,
+      target_tick,
+   )
+   .ok_or_else(|| MediaParserError::InvalidFormat("could not select video sample".to_string()))?;
+   let sync_sample = nearest_sync_sample(selection.sample_index, tables.sync_samples.as_deref());
+   let presentation_tick = presentation_ticks_for_range(
+      &tables.stts,
+      tables.composition_offsets.as_deref(),
+      track.presentation_offset,
+      sync_sample,
+      sync_sample,
+   )
+   .and_then(|timings| timings.into_iter().next())
+   .map(|(_, tick)| u64::try_from(tick).unwrap_or(0))
+   .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
+   Ok(KeyframeTarget {
+      sample_index: sync_sample,
+      presentation_tick,
+   })
+}
+
+fn frame_from_image(track: &VideoTrack, presentation_tick: u64, image: DecodedImage) -> Frame {
+   Frame {
+      track_id: track.id,
+      width: image.width,
+      height: image.height,
+      timestamp: ticks_to_duration(presentation_tick, track.timescale),
+      format: PixelFormat::Jpeg,
+      data: image.data,
+      strides: None,
+   }
+}
+
+fn samples_for_gops(gops: impl Iterator<Item = Gop>) -> Result<Vec<u32>> {
+   let gops = gops.collect::<Vec<_>>();
+   let sample_count = gops.iter().try_fold(0usize, |total, gop| {
+      let count = gop
+         .end_sample
+         .checked_sub(gop.start_sample)?
+         .checked_add(1)?;
+      total.checked_add(usize::try_from(count).ok()?)
+   });
+   let sample_count = sample_count
+      .filter(|count| *count <= MAX_SAMPLES_PER_THUMBNAIL_BATCH)
+      .ok_or_else(|| MediaParserError::InvalidFormat("too many thumbnail samples".to_string()))?;
+   let mut samples = Vec::new();
+   samples
+      .try_reserve(sample_count)
+      .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail samples".to_string()))?;
+   for gop in gops {
+      samples.extend(gop.start_sample..=gop.end_sample);
+   }
+   Ok(samples)
+}
+
+fn avc_config_for_range(
+   tables: &VideoSampleTables,
    start_sample: u32,
    end_sample: u32,
-) -> Result<&'a AvcConfig> {
+) -> Result<&AvcConfig> {
    let description_index = sample_description_index(
       start_sample,
       &tables.sizes,
@@ -350,7 +635,7 @@ mod tests {
    fn uses_the_stsc_selected_sample_description() {
       let stts = [0; 16];
       let tables = VideoSampleTables {
-         stts: &stts,
+         stts: stts.to_vec(),
          composition_offsets: None,
          sizes: SampleSizes {
             fixed_size: 1,

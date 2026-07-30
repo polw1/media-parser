@@ -10,11 +10,10 @@ use crate::errors::{MediaParserError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
-use reqwest::header::{CONTENT_LENGTH, HeaderMap, HeaderName, HeaderValue, RANGE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -44,6 +43,39 @@ impl FileReadAt for std::fs::File {
 // Constants
 /// HTTP status code for partial content (Range request success)
 const HTTP_PARTIAL_CONTENT: u16 = 206;
+/// HTTP status code for an unsatisfiable Range request.
+const HTTP_RANGE_NOT_SATISFIABLE: u16 = 416;
+/// Small random reads share a bounded read-ahead window.
+const HTTP_READ_AHEAD_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentRange {
+   Bytes {
+      start: u64,
+      end: u64,
+      total: Option<u64>,
+   },
+   Unsatisfied {
+      total: u64,
+   },
+}
+
+fn parse_content_range(value: &str) -> Option<ContentRange> {
+   let value = value.strip_prefix("bytes ")?;
+   let (range, total) = value.split_once('/')?;
+   let total = if total == "*" {
+      None
+   } else {
+      Some(total.parse().ok()?)
+   };
+   if range == "*" {
+      return Some(ContentRange::Unsatisfied { total: total? });
+   }
+   let (start, end) = range.split_once('-')?;
+   let start = start.parse().ok()?;
+   let end = end.parse().ok()?;
+   (end >= start).then_some(ContentRange::Bytes { start, end, total })
+}
 
 /// Copies bytes from `src` into `dst` and returns the count.
 fn copy_into(dst: &mut [u8], src: &[u8]) -> usize {
@@ -186,8 +218,8 @@ impl StreamReader for FileStreamReader {
 
 /// `StreamReader` implementation that issues HTTP range requests.
 ///
-/// Uses an initial HEAD request to cache `Content-Length`. Optional custom
-/// headers can be provided for authentication or other metadata.
+/// Learns the stream size lazily from range responses. Optional custom headers
+/// can be provided for authentication or other metadata.
 ///
 /// # Examples
 ///
@@ -226,13 +258,16 @@ pub struct HttpStreamReader {
    url: String,
    client: Client,
    cached_size: OnceLock<u64>,
+   read_window: Mutex<Option<ReadWindow>>,
+}
+
+struct ReadWindow {
+   offset: u64,
+   data: Vec<u8>,
 }
 
 impl HttpStreamReader {
    /// Creates a new `HttpStreamReader` for the given URL.
-   ///
-   /// Performs a HEAD request to obtain the content length. Returns an error
-   /// if the request fails or if `Content-Length` header is missing.
    pub async fn new(url: &str) -> Result<Self> {
       Self::build_with_headers(url, HeaderMap::new()).await
    }
@@ -256,32 +291,54 @@ impl HttpStreamReader {
 
    async fn build_with_headers(url: &str, headers: HeaderMap) -> Result<Self> {
       let client = Client::builder()
-         .default_headers(headers.clone())
+         .default_headers(headers)
          .timeout(Duration::from_secs(30))
          .build()
          .map_err(|e| MediaParserError::HttpRequest(format!("Failed to build client: {}", e)))?;
 
-      let resp = client
-         .head(url)
-         .send()
-         .await
-         .map_err(|e| MediaParserError::HttpRequest(format!("HEAD request failed: {}", e)))?;
-
-      let len = resp
-         .headers()
-         .get(CONTENT_LENGTH)
-         .and_then(|h| h.to_str().ok())
-         .and_then(|s| s.parse::<u64>().ok())
-         .ok_or(MediaParserError::ContentLengthMissing)?;
-
-      let cached_size = OnceLock::new();
-      let _ = cached_size.set(len);
-
       Ok(Self {
          url: url.to_string(),
          client,
-         cached_size,
+         cached_size: OnceLock::new(),
+         read_window: Mutex::new(None),
       })
+   }
+
+   fn cache_size(&self, size: u64) {
+      let _ = self.cached_size.set(size);
+   }
+
+   fn response_content_range(headers: &HeaderMap) -> Result<ContentRange> {
+      headers
+         .get(CONTENT_RANGE)
+         .and_then(|header| header.to_str().ok())
+         .and_then(parse_content_range)
+         .ok_or_else(|| {
+            MediaParserError::HttpRequest("missing or invalid Content-Range response".to_string())
+         })
+   }
+
+   fn copy_from_read_window(&self, offset: u64, buf: &mut [u8]) -> Option<usize> {
+      let window = self.read_window.lock().ok()?;
+      let window = window.as_ref()?;
+      let relative_offset = usize::try_from(offset.checked_sub(window.offset)?).ok()?;
+      let available = window.data.get(relative_offset..)?;
+      let window_end = window
+         .offset
+         .checked_add(u64::try_from(window.data.len()).ok()?);
+      let reaches_eof = window_end
+         .zip(self.cached_size.get().copied())
+         .is_some_and(|(end, size)| end == size);
+      if available.len() < buf.len() && !reaches_eof {
+         return None;
+      }
+      Some(copy_into(buf, available))
+   }
+
+   fn store_read_window(&self, offset: u64, data: Vec<u8>) {
+      if let Ok(mut window) = self.read_window.lock() {
+         *window = Some(ReadWindow { offset, data });
+      }
    }
 
    /// Performs an HTTP Range request and streams data into the buffer.
@@ -308,9 +365,68 @@ impl HttpStreamReader {
          .map_err(|e| MediaParserError::HttpRequest(format!("GET request failed: {}", e)))?;
 
       let status = resp.status();
-      if !status.is_success() && status.as_u16() != HTTP_PARTIAL_CONTENT {
-         return Err(MediaParserError::HttpStatus(status.as_u16()));
-      }
+      let expected_body_length = match status.as_u16() {
+         HTTP_PARTIAL_CONTENT => {
+            let ContentRange::Bytes {
+               start: actual_start,
+               end: actual_end,
+               total,
+            } = Self::response_content_range(resp.headers())?
+            else {
+               return Err(MediaParserError::HttpRequest(
+                  "invalid Content-Range for a partial response".to_string(),
+               ));
+            };
+            if actual_start != start || actual_end > end {
+               return Err(MediaParserError::HttpRequest(format!(
+                  "Content-Range bytes {actual_start}-{actual_end} does not match requested range {start}-{end}"
+               )));
+            }
+            if let Some(total) = total {
+               if actual_end >= total {
+                  return Err(MediaParserError::HttpRequest(
+                     "Content-Range exceeds the reported stream size".to_string(),
+                  ));
+               }
+               self.cache_size(total);
+            }
+            Some(usize::try_from(actual_end - actual_start + 1).map_err(|_| {
+               MediaParserError::HttpRequest(
+                  "partial response body length exceeds usize".to_string(),
+               )
+            })?)
+         }
+         HTTP_RANGE_NOT_SATISFIABLE => {
+            let ContentRange::Unsatisfied { total } = Self::response_content_range(resp.headers())?
+            else {
+               return Err(MediaParserError::HttpRequest(
+                  "invalid Content-Range for an unsatisfiable response".to_string(),
+               ));
+            };
+            self.cache_size(total);
+            if start >= total {
+               return Ok(0);
+            }
+            return Err(MediaParserError::HttpStatus(HTTP_RANGE_NOT_SATISFIABLE));
+         }
+         200 => {
+            if start != 0 {
+               return Err(MediaParserError::HttpRequest(format!(
+                  "server ignored the requested byte range {start}-{end}"
+               )));
+            }
+            if let Some(size) = resp
+               .headers()
+               .get(CONTENT_LENGTH)
+               .and_then(|header| header.to_str().ok())
+               .and_then(|value| value.parse().ok())
+            {
+               self.cache_size(size);
+            }
+            None
+         }
+         code => return Err(MediaParserError::HttpStatus(code)),
+      };
 
       // Stream data directly into buffer
       let mut stream = resp.bytes_stream();
@@ -329,6 +445,53 @@ impl HttpStreamReader {
          }
       }
 
+      if expected_body_length.is_some_and(|expected| total_read != expected) {
+         return Err(MediaParserError::HttpRequest(format!(
+            "partial response body length mismatch: expected {} bytes, received {total_read}",
+            expected_body_length.unwrap_or(0)
+         )));
+      }
+      Ok(total_read)
+   }
+
+   async fn read_at_uncached(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+      if self.cached_size.get().is_some_and(|size| offset >= *size) {
+         return Ok(0);
+      }
+
+      let mut total_read = 0usize;
+      let mut current_offset = offset;
+      while total_read < buf.len() {
+         let known_size = self.cached_size.get().copied();
+         if known_size.is_some_and(|size| current_offset >= size) {
+            break;
+         }
+         let remaining = buf.len() - total_read;
+         let to_read = known_size
+            .map(|size| remaining.min(usize::try_from(size - current_offset).unwrap_or(usize::MAX)))
+            .unwrap_or(remaining);
+         let start = current_offset;
+         let end = current_offset
+            .checked_add(
+               u64::try_from(to_read)
+                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
+            )
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| MediaParserError::Other("HTTP range overflow".into()))?;
+         let bytes_read = self
+            .fetch_range_stream(start, end, &mut buf[total_read..total_read + to_read])
+            .await?;
+         if bytes_read == 0 {
+            break;
+         }
+         total_read += bytes_read;
+         current_offset = current_offset
+            .checked_add(
+               u64::try_from(bytes_read)
+                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
+            )
+            .ok_or_else(|| MediaParserError::Other("HTTP read offset overflow".into()))?;
+      }
       Ok(total_read)
    }
 }
@@ -344,60 +507,53 @@ impl StreamReader for HttpStreamReader {
          return Ok(0);
       }
 
-      let size = self.size().await?;
-      if offset >= size {
-         return Ok(0);
-      }
-
-      let mut total_read = 0usize;
-      let mut current_offset = offset;
-
-      // Loop to handle short reads: if server returns less than requested,
-      // request the remaining bytes in subsequent requests
-      while total_read < buf.len() && current_offset < size {
-         let remaining = buf.len() - total_read;
-         let available = usize::try_from(size - current_offset).unwrap_or(usize::MAX);
-         let to_read = remaining.min(available);
-
-         // Calculate range for this request directly
-         let start = current_offset;
-         let end = current_offset
-            .checked_add(
-               u64::try_from(to_read)
-                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
-            )
-            .and_then(|end| end.checked_sub(1))
-            .ok_or_else(|| MediaParserError::Other("HTTP range overflow".into()))?;
-
-         // Read into the remaining portion of the buffer
-         let bytes_read = self
-            .fetch_range_stream(start, end, &mut buf[total_read..])
-            .await?;
-
-         if bytes_read == 0 {
-            // EOF or no more data available
-            break;
+      if buf.len() <= HTTP_READ_AHEAD_BYTES {
+         if let Some(read) = self.copy_from_read_window(offset, buf) {
+            return Ok(read);
          }
-
-         total_read += bytes_read;
-         current_offset = current_offset
-            .checked_add(
-               u64::try_from(bytes_read)
-                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
-            )
-            .ok_or_else(|| MediaParserError::Other("HTTP read offset overflow".into()))?;
+         let read_ahead = self
+            .cached_size
+            .get()
+            .copied()
+            .map(|size| {
+               usize::try_from(size.saturating_sub(offset))
+                  .unwrap_or(usize::MAX)
+                  .min(HTTP_READ_AHEAD_BYTES)
+            })
+            .unwrap_or(HTTP_READ_AHEAD_BYTES);
+         let mut window = vec![0; read_ahead];
+         let read = self.read_at_uncached(offset, &mut window).await?;
+         window.truncate(read);
+         let copied = copy_into(buf, &window);
+         if read != 0 {
+            self.store_read_window(offset, window);
+         }
+         return Ok(copied);
       }
-
-      Ok(total_read)
+      self.read_at_uncached(offset, buf).await
    }
 
    /// Returns the total size of the HTTP stream.
    async fn size(&self) -> Result<u64> {
-      self
-         .cached_size
-         .get()
-         .copied()
-         .ok_or(MediaParserError::ContentLengthUnavailable)
+      if let Some(size) = self.cached_size.get() {
+         return Ok(*size);
+      }
+
+      let response =
+         self.client.head(&self.url).send().await.map_err(|error| {
+            MediaParserError::HttpRequest(format!("HEAD request failed: {error}"))
+         })?;
+      if !response.status().is_success() {
+         return Err(MediaParserError::HttpStatus(response.status().as_u16()));
+      }
+      let size = response
+         .headers()
+         .get(CONTENT_LENGTH)
+         .and_then(|header| header.to_str().ok())
+         .and_then(|value| value.parse().ok())
+         .ok_or(MediaParserError::ContentLengthMissing)?;
+      self.cache_size(size);
+      Ok(self.cached_size.get().copied().unwrap_or(size))
    }
 }
 
@@ -410,12 +566,18 @@ mod tests {
    // Test content reused across tests
    const TEST_CONTENT: &[u8] =
       b"All things, therefore, that you want men to do to you, you also must do to them.";
+   const EXPECTED_HTTP_READ_AHEAD_BYTES: usize = 32 * 1024;
 
    fn create_test_file(content: &[u8]) -> NamedTempFile {
       let mut file = NamedTempFile::new().unwrap();
       file.write_all(content).unwrap();
       file.flush().unwrap();
       file
+   }
+
+   #[test]
+   fn test_content_range_rejects_an_invalid_total() {
+      assert_eq!(parse_content_range("bytes 0-3/not-a-size"), None);
    }
 
    #[tokio::test]
@@ -436,19 +598,10 @@ mod tests {
 
    #[tokio::test]
    async fn test_http_read_at_beginning() {
-      let content_len_str = TEST_CONTENT.len().to_string();
       let mock_server = MockServer::start().await;
 
-      // Mock HEAD request for Content-Length
-      Mock::given(method("HEAD"))
-         .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", content_len_str.as_str()),
-         )
-         .mount(&mock_server)
-         .await;
-
       // Mock GET request with Range header for reading from beginning
-      let range_header = format!("bytes=0-{}", TEST_CONTENT.len() - 1);
+      let range_header = format!("bytes=0-{}", EXPECTED_HTTP_READ_AHEAD_BYTES - 1);
       let range_resp_header = format!("bytes 0-{}/{}", TEST_CONTENT.len() - 1, TEST_CONTENT.len());
 
       Mock::given(method("GET"))
@@ -468,6 +621,7 @@ mod tests {
 
       assert_eq!(bytes_read, TEST_CONTENT.len());
       assert_eq!(&buffer[..bytes_read], TEST_CONTENT);
+      assert_eq!(reader.size().await.unwrap(), TEST_CONTENT.len() as u64);
    }
 
    #[tokio::test]
@@ -477,31 +631,23 @@ mod tests {
          String::from_utf8_lossy(TEST_CONTENT)
       );
       let html_bytes = html_body.as_bytes();
-      let content_len_str = html_bytes.len().to_string();
       let mock_server = MockServer::start().await;
-
-      // Mock HEAD request for Content-Length
-      Mock::given(method("HEAD"))
-         .respond_with(
-            ResponseTemplate::new(200).insert_header("Content-Length", content_len_str.as_str()),
-         )
-         .mount(&mock_server)
-         .await;
 
       let expected_str = "you also must do to them";
       let expected = expected_str.as_bytes();
       let range_start = html_body
          .find(expected_str)
          .expect("phrase should be present in HTML") as u64;
-      let range_end = range_start + expected.len() as u64 - 1;
-      let range_header = format!("bytes={}-{}", range_start, range_end);
+      let range_end = html_bytes.len() as u64 - 1;
+      let requested_end = range_start + EXPECTED_HTTP_READ_AHEAD_BYTES as u64 - 1;
+      let range_header = format!("bytes={}-{}", range_start, requested_end);
       let range_resp_header = format!("bytes {}-{}/{}", range_start, range_end, html_bytes.len());
 
       Mock::given(method("GET"))
          .and(header("Range", range_header.as_str()))
          .respond_with(
             ResponseTemplate::new(206)
-               .set_body_bytes(&html_bytes[range_start as usize..=range_end as usize])
+               .set_body_bytes(&html_bytes[range_start as usize..])
                .insert_header("Content-Range", range_resp_header.as_str()),
          )
          .mount(&mock_server)
@@ -517,18 +663,157 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_http_stream_reader_error_head_request_failed() {
-      // Use an invalid URL to trigger HTTP request error
+   async fn test_http_reuses_a_read_ahead_window_for_nearby_reads() {
+      let mock_server = MockServer::start().await;
+      let content_range = format!("bytes 0-{}/{}", TEST_CONTENT.len() - 1, TEST_CONTENT.len());
+      let requested_range = format!("bytes=0-{}", EXPECTED_HTTP_READ_AHEAD_BYTES - 1);
+      Mock::given(method("GET"))
+         .and(header("Range", requested_range.as_str()))
+         .respond_with(
+            ResponseTemplate::new(206)
+               .set_body_bytes(TEST_CONTENT)
+               .insert_header("Content-Range", content_range.as_str()),
+         )
+         .expect(1)
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let mut first = [0; 4];
+      let mut second = [0; 4];
+
+      assert_eq!(reader.read_at(0, &mut first).await.unwrap(), first.len());
+      assert_eq!(reader.read_at(4, &mut second).await.unwrap(), second.len());
+      assert_eq!(&first, &TEST_CONTENT[..4]);
+      assert_eq!(&second, &TEST_CONTENT[4..8]);
+   }
+
+   #[tokio::test]
+   async fn test_http_stream_reader_construction_is_lazy() {
       let invalid_url = "http://localhost:1/invalid";
-      let result = HttpStreamReader::new(invalid_url).await;
+      let reader = HttpStreamReader::new(invalid_url)
+         .await
+         .expect("construction must not perform a request");
 
-      assert!(result.is_err());
+      let mut buffer = [0; 16];
+      let result = reader.read_at(0, &mut buffer).await;
 
-      if let Err(MediaParserError::HttpRequest(_)) = result {
-         // Expected: HttpRequest error for failed HEAD request
-      } else {
-         panic!("Expected HttpRequest error for failed HEAD request");
-      }
+      assert!(matches!(result, Err(MediaParserError::HttpRequest(_))));
+   }
+
+   #[tokio::test]
+   async fn test_http_size_falls_back_to_head_before_the_first_read() {
+      let mock_server = MockServer::start().await;
+      let content_len = TEST_CONTENT.len().to_string();
+      Mock::given(method("HEAD"))
+         .respond_with(
+            ResponseTemplate::new(200).insert_header("Content-Length", content_len.as_str()),
+         )
+         .expect(1)
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+
+      assert_eq!(reader.size().await.unwrap(), TEST_CONTENT.len() as u64);
+      assert_eq!(reader.size().await.unwrap(), TEST_CONTENT.len() as u64);
+   }
+
+   #[tokio::test]
+   async fn test_http_range_not_satisfiable_reports_eof_and_learns_size() {
+      let mock_server = MockServer::start().await;
+      let content_range = format!("bytes */{}", TEST_CONTENT.len());
+      let offset = TEST_CONTENT.len() as u64 + 10;
+      let requested_range = format!(
+         "bytes={}-{}",
+         offset,
+         offset + EXPECTED_HTTP_READ_AHEAD_BYTES as u64 - 1
+      );
+      Mock::given(method("GET"))
+         .and(header("Range", requested_range.as_str()))
+         .respond_with(
+            ResponseTemplate::new(416).insert_header("Content-Range", content_range.as_str()),
+         )
+         .expect(1)
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let mut buffer = [0; 16];
+
+      assert_eq!(reader.read_at(offset, &mut buffer).await.unwrap(), 0);
+      assert_eq!(reader.size().await.unwrap(), TEST_CONTENT.len() as u64);
+   }
+
+   #[tokio::test]
+   async fn test_http_rejects_mismatched_content_range() {
+      let mock_server = MockServer::start().await;
+      Mock::given(method("GET"))
+         .and(header(
+            "Range",
+            format!("bytes=10-{}", 10 + EXPECTED_HTTP_READ_AHEAD_BYTES - 1).as_str(),
+         ))
+         .respond_with(
+            ResponseTemplate::new(206)
+               .set_body_bytes(b"data")
+               .insert_header("Content-Range", "bytes 0-3/100"),
+         )
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let mut buffer = [0; 4];
+      let error = reader.read_at(10, &mut buffer).await.unwrap_err();
+
+      assert!(
+         matches!(error, MediaParserError::HttpRequest(message) if message.contains("Content-Range"))
+      );
+   }
+
+   #[tokio::test]
+   async fn test_http_rejects_a_truncated_partial_response() {
+      let mock_server = MockServer::start().await;
+      Mock::given(method("GET"))
+         .and(header(
+            "Range",
+            format!("bytes=0-{}", EXPECTED_HTTP_READ_AHEAD_BYTES - 1).as_str(),
+         ))
+         .respond_with(
+            ResponseTemplate::new(206)
+               .set_body_bytes(b"ab")
+               .insert_header("Content-Range", "bytes 0-3/100"),
+         )
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let mut buffer = [0; 4];
+      let error = reader.read_at(0, &mut buffer).await.unwrap_err();
+
+      assert!(
+         matches!(error, MediaParserError::HttpRequest(message) if message.contains("body length"))
+      );
+   }
+
+   #[tokio::test]
+   async fn test_http_rejects_server_ignoring_nonzero_range() {
+      let mock_server = MockServer::start().await;
+      Mock::given(method("GET"))
+         .and(header(
+            "Range",
+            format!("bytes=10-{}", 10 + EXPECTED_HTTP_READ_AHEAD_BYTES - 1).as_str(),
+         ))
+         .respond_with(ResponseTemplate::new(200).set_body_bytes(TEST_CONTENT))
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let mut buffer = [0; 4];
+      let error = reader.read_at(10, &mut buffer).await.unwrap_err();
+
+      assert!(
+         matches!(error, MediaParserError::HttpRequest(message) if message.contains("ignored"))
+      );
    }
 
    #[tokio::test]

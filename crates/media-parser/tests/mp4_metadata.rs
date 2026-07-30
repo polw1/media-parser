@@ -1,8 +1,11 @@
 //! Integration tests for MP4 metadata extraction.
 
-use media_parser::{FileStreamReader, MediaParser, PixelFormat, TrackType};
+use media_parser::{
+   FileStreamReader, MediaParser, PixelFormat, StreamReader, TrackType, format::mp4::ThumbnailIndex,
+};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -18,6 +21,40 @@ fn fixtures_dir() -> PathBuf {
    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
       .join("tests")
       .join("fixtures")
+}
+
+struct CountingReader {
+   inner: FileStreamReader,
+   reads: AtomicUsize,
+}
+
+impl CountingReader {
+   fn new(path: &std::path::Path) -> Self {
+      Self {
+         inner: FileStreamReader::new(path).expect("open counted file"),
+         reads: AtomicUsize::new(0),
+      }
+   }
+
+   fn reset(&self) {
+      self.reads.store(0, Ordering::Relaxed);
+   }
+
+   fn read_count(&self) -> usize {
+      self.reads.load(Ordering::Relaxed)
+   }
+}
+
+#[async_trait::async_trait]
+impl StreamReader for CountingReader {
+   async fn read_at(&self, offset: u64, buf: &mut [u8]) -> media_parser::Result<usize> {
+      self.reads.fetch_add(1, Ordering::Relaxed);
+      self.inner.read_at(offset, buf).await
+   }
+
+   async fn size(&self) -> media_parser::Result<u64> {
+      self.inner.size().await
+   }
 }
 
 #[tokio::test]
@@ -117,6 +154,112 @@ async fn test_mp4_h264_thumbnails_follow_presentation_order() {
    );
    assert_ne!(frames[0].data, frames[1].data);
    assert_ne!(frames[1].data, frames[2].data);
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_index_can_be_reused_with_another_reader() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+   drop(reader);
+
+   let next_reader = FileStreamReader::new(&path).expect("reopen MP4 fixture");
+   let frames = index
+      .frames(&next_reader, &[Duration::from_millis(100)])
+      .await
+      .expect("extract frame with cached index");
+
+   assert_eq!(frames.len(), 1);
+   assert_eq!(frames[0].timestamp, Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn test_mp4_fast_thumbnail_reports_the_keyframe_pts() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+
+   let frames = index
+      .keyframes(&reader, &[Duration::from_millis(200)])
+      .await
+      .expect("extract keyframe");
+
+   assert_eq!(frames.len(), 1);
+   assert_eq!(frames[0].timestamp, Duration::ZERO);
+}
+
+#[tokio::test]
+async fn test_mp4_fast_thumbnails_read_each_keyframe_once() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = CountingReader::new(&path);
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+   reader.reset();
+
+   let frames = index
+      .keyframes(
+         &reader,
+         &[
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+         ],
+      )
+      .await
+      .expect("extract keyframes");
+
+   assert_eq!(frames.len(), 3);
+   assert_eq!(reader.read_count(), 1);
+}
+
+#[tokio::test]
+async fn test_mp4_exact_thumbnails_read_a_shared_gop_once() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = CountingReader::new(&path);
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+   reader.reset();
+
+   let frames = index
+      .frames(
+         &reader,
+         &[
+            Duration::ZERO,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+         ],
+      )
+      .await
+      .expect("extract exact frames");
+
+   assert_eq!(frames.len(), 3);
+   assert_eq!(reader.read_count(), 1);
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_batch_rejects_too_many_outputs() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+   let timestamps = vec![Duration::ZERO; 4_097];
+
+   let error = index
+      .keyframes(&reader, &timestamps)
+      .await
+      .expect_err("an unbounded output batch must be rejected");
+
+   assert!(matches!(
+      error,
+      media_parser::MediaParserError::InvalidFormat(_)
+   ));
 }
 
 #[tokio::test]

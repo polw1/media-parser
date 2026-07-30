@@ -22,14 +22,20 @@ pub struct DecodedImage {
    pub data: Vec<u8>,
 }
 
-/// Decodes MP4 H.264 samples and returns one picture by presentation order.
-pub fn decode_frame_to_jpeg(
+/// Decodes one GOP and encodes the selected presentation-order pictures.
+pub fn decode_frames_to_jpeg(
    config: &AvcConfig,
    samples: &[Vec<u8>],
-   output_index: usize,
-) -> Result<DecodedImage, String> {
+   output_indices: &[usize],
+) -> Result<Vec<DecodedImage>, String> {
    if samples.is_empty() {
       return Err("no H.264 samples to decode".to_string());
+   }
+   if output_indices
+      .iter()
+      .any(|output_index| *output_index >= samples.len())
+   {
+      return Err("requested H.264 output is outside the sample range".to_string());
    }
 
    let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
@@ -43,7 +49,7 @@ pub fn decode_frame_to_jpeg(
       return Err("OpenH264 emitted a frame for AVC parameter sets".to_string());
    }
    let mut decoded_count = 0usize;
-   let mut selected = None;
+   let mut selected = vec![None; output_indices.len()];
 
    for sample in samples {
       let annex_b = sample_to_annex_b(sample, config.length_size)?;
@@ -51,9 +57,7 @@ pub fn decode_frame_to_jpeg(
          .decode_with_options(&annex_b, no_flush.clone())
          .map_err(|error| error.to_string())?
       {
-         if decoded_count == output_index {
-            selected = Some(yuv_to_rgb(&yuv)?);
-         }
+         store_selected_frame(&yuv, decoded_count, output_indices, &mut selected)?;
          decoded_count = decoded_count
             .checked_add(1)
             .ok_or_else(|| "decoded frame count overflow".to_string())?;
@@ -64,9 +68,7 @@ pub fn decode_frame_to_jpeg(
       .flush_remaining()
       .map_err(|error| error.to_string())?
    {
-      if decoded_count == output_index {
-         selected = Some(yuv_to_rgb(&yuv)?);
-      }
+      store_selected_frame(&yuv, decoded_count, output_indices, &mut selected)?;
       decoded_count = decoded_count
          .checked_add(1)
          .ok_or_else(|| "decoded frame count overflow".to_string())?;
@@ -78,9 +80,43 @@ pub fn decode_frame_to_jpeg(
          samples.len()
       ));
    }
-   let (width, height, rgb) = selected.ok_or_else(|| {
-      format!("OpenH264 produced {decoded_count} frames, requested output {output_index}")
-   })?;
+   selected
+      .into_iter()
+      .enumerate()
+      .map(|(position, image)| {
+         image.ok_or_else(|| {
+            format!(
+               "OpenH264 produced {decoded_count} frames, requested output {}",
+               output_indices[position]
+            )
+         })
+      })
+      .collect()
+}
+
+fn store_selected_frame(
+   yuv: &DecodedYUV<'_>,
+   decoded_index: usize,
+   output_indices: &[usize],
+   selected: &mut [Option<DecodedImage>],
+) -> Result<(), String> {
+   let mut positions = output_indices
+      .iter()
+      .enumerate()
+      .filter_map(|(position, output_index)| (*output_index == decoded_index).then_some(position));
+   let Some(first_position) = positions.next() else {
+      return Ok(());
+   };
+   let image = yuv_to_jpeg(yuv)?;
+   selected[first_position] = Some(image.clone());
+   for position in positions {
+      selected[position] = Some(image.clone());
+   }
+   Ok(())
+}
+
+fn yuv_to_jpeg(yuv: &DecodedYUV<'_>) -> Result<DecodedImage, String> {
+   let (width, height, rgb) = yuv_to_rgb(yuv)?;
    let width_u16 =
       u16::try_from(width).map_err(|_| "frame width exceeds JPEG limits".to_string())?;
    let height_u16 =
