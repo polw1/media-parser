@@ -307,10 +307,22 @@
           "markdownDescription": "Denies the get_metadata command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`",
+          "description": "Enables the get_tracks command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-tracks",
+          "markdownDescription": "Enables the get_tracks command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_tracks command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-tracks",
+          "markdownDescription": "Denies the get_tracks command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`"
+          "markdownDescription": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`"
         }
       ]
     }

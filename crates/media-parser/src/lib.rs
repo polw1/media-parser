@@ -132,7 +132,7 @@ use std::time::Duration;
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{
-   detect_format, get_format_info, is_supported, parse_metadata, supported_formats,
+   detect_format, get_format_info, is_supported, parse_metadata, parse_tracks, supported_formats,
 };
 pub use stream::{FileStreamReader, HttpStreamReader, StreamReader};
 pub use types::{
@@ -158,8 +158,7 @@ impl<R: StreamReader> MediaParser<R> {
 
    // Extract all tracks from the media file.
    pub async fn tracks(&self) -> Result<Vec<TrackType>> {
-      // TODO: Implement actual track parsing
-      Ok(vec![])
+      format::registry::parse_tracks(&self.reader).await
    }
 
    /// Extract subtitle tracks from the media file.

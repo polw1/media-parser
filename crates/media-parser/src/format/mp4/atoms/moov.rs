@@ -4,9 +4,8 @@
 //! and track information. This module provides functions to efficiently locate
 //! the `moov` box in both local and remote files using partial reads.
 
-use super::read::read_box_header;
-use crate::errors::Result;
-use crate::helpers::{read_u32_be, read_u64_be};
+use super::read::{read_box, read_box_header};
+use crate::errors::{MediaParserError, Result};
 use crate::stream::StreamReader;
 
 const HEAD_SIZE: usize = 8 * 1024;
@@ -14,12 +13,20 @@ const TAIL_SIZE: usize = 512 * 1024;
 /// Maximum accepted moov box size (100 MiB) to avoid unbounded allocations.
 const MAX_MOOV_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Parses a complete `moov` box and returns its payload.
+pub(crate) fn parse_moov_payload(data: &[u8]) -> Result<&[u8]> {
+   read_box(data, 0)
+      .filter(|box_read| box_read.fourcc == *b"moov")
+      .map(|box_read| box_read.payload)
+      .ok_or_else(|| MediaParserError::InvalidFormat("invalid moov box".to_string()))
+}
+
 /// Valid child boxes that can appear inside moov.
-const MOOV_CHILD_FOURCCS: &[&[u8; 4]] = &[
-   b"mvhd", // Movie Header (required, usually first)
-   b"trak", // Track (required, 1+)
-   b"udta", // User Data
-   b"meta", // Metadata
+const MOOV_CHILD_FOURCCS: &[[u8; 4]] = &[
+   *b"mvhd", // Movie Header (required, usually first)
+   *b"trak", // Track (required, 1+)
+   *b"udta", // User Data
+   *b"meta", // Metadata
 ];
 
 /// Locates and reads the entire `moov` box from an MP4 file.
@@ -48,7 +55,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    let file_size = reader.size().await?;
 
    // Strategy 1: Head - iterate aligned boxes
-   let head_len = HEAD_SIZE.min(file_size as usize);
+   let head_len = HEAD_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
    let mut head_buf = vec![0u8; head_len];
    let _ = reader.read_at(0, &mut head_buf).await?;
 
@@ -57,7 +64,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    }
 
    // Strategy 2: Tail - pattern search for "moov" fourcc
-   let tail_len = TAIL_SIZE.min(file_size as usize);
+   let tail_len = TAIL_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
    let tail_offset = file_size.saturating_sub(tail_len as u64);
    let mut tail_buf = vec![0u8; tail_len];
    let _ = reader.read_at(tail_offset, &mut tail_buf).await?;
@@ -117,45 +124,46 @@ fn find_moov_aligned(buf: &[u8], base_offset: u64) -> Option<(u64, u64)> {
    let mut offset = 0usize;
    while let Some(h) = read_box_header(buf, offset) {
       if &h.fourcc == b"moov" {
-         return Some((base_offset + offset as u64, h.total_size as u64));
+         return Some((base_offset.checked_add(offset as u64)?, h.total_size as u64));
       }
-      offset += h.total_size;
+      offset = offset.checked_add(h.total_size)?;
    }
    None
 }
 
 /// Check if first child box has a valid moov child fourcc.
-fn has_valid_moov_child(buf: &[u8], payload_start: usize) -> bool {
-   // Need at least 8 bytes: 4 for child size + 4 for child fourcc
-   if payload_start + 8 > buf.len() {
+fn has_valid_moov_child(buf: &[u8], payload_start: usize, payload_size: usize) -> bool {
+   let Some(child_header) = read_box_header(buf, payload_start) else {
       return false;
-   }
-   let child_fourcc = &buf[payload_start + 4..payload_start + 8];
-   MOOV_CHILD_FOURCCS
-      .iter()
-      .any(|&valid| valid == child_fourcc)
+   };
+   child_header.total_size <= payload_size && MOOV_CHILD_FOURCCS.contains(&child_header.fourcc)
 }
 
 /// Find moov by pattern search (for tail/unaligned buffers).
 fn find_moov_pattern(buf: &[u8], base_offset: u64, file_size: u64) -> Option<(u64, u64)> {
    for i in 4..buf.len().saturating_sub(4) {
       if &buf[i..i + 4] == b"moov" {
-         let Some(size32) = read_u32_be(buf, i - 4) else {
+         let Some(box_offset) = i.checked_sub(4) else {
             continue;
          };
-         let size32 = size32 as u64;
-         let (box_start, box_size) = if size32 == 1 && i >= 12 && i + 12 <= buf.len() {
-            // Extended size
-            let ext_size = read_u64_be(buf, i + 4)?;
-            (base_offset + i as u64 - 4, ext_size)
-         } else if size32 >= 8 {
-            (base_offset + i as u64 - 4, size32)
-         } else {
+         let Some(header) = read_box_header(buf, box_offset) else {
             continue;
          };
+         let Some(box_start) = base_offset.checked_add(box_offset as u64) else {
+            continue;
+         };
+         let box_size = header.total_size as u64;
+         let Some(payload_start) = box_offset.checked_add(header.header_len) else {
+            continue;
+         };
+         let payload_size = header.total_size - header.header_len;
 
          // Validate: box fits in file AND has valid first child
-         if box_start + box_size <= file_size && has_valid_moov_child(buf, i + 4) {
+         if box_start
+            .checked_add(box_size)
+            .is_some_and(|box_end| box_end <= file_size)
+            && has_valid_moov_child(buf, payload_start, payload_size)
+         {
             return Some((box_start, box_size));
          }
       }
@@ -187,6 +195,18 @@ mod tests {
       buf
    }
 
+   /// Create an extended-size moov box with a valid mvhd child inside.
+   fn make_extended_moov_with_mvhd() -> Vec<u8> {
+      let mvhd = make_box(b"mvhd", 100);
+      let total = 16 + mvhd.len();
+      let mut buf = Vec::with_capacity(total);
+      buf.extend_from_slice(&1u32.to_be_bytes());
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(&(total as u64).to_be_bytes());
+      buf.extend(mvhd);
+      buf
+   }
+
    #[test]
    fn test_find_moov_aligned_at_start() {
       let buf = make_box(b"moov", 16);
@@ -200,6 +220,16 @@ mod tests {
       buf.extend(make_box(b"moov", 16));
       let result = find_moov_aligned(&buf, 0);
       assert_eq!(result, Some((16, 24)));
+   }
+
+   #[test]
+   fn test_find_moov_aligned_rejects_overflowing_box_offset() {
+      let mut buf = make_box(b"free", 0);
+      buf.extend_from_slice(&1u32.to_be_bytes());
+      buf.extend_from_slice(b"skip");
+      buf.extend_from_slice(&u64::MAX.to_be_bytes());
+
+      assert_eq!(find_moov_aligned(&buf, 0), None);
    }
 
    #[test]
@@ -220,6 +250,51 @@ mod tests {
    }
 
    #[test]
+   fn test_find_moov_pattern_accepts_partial_moov_with_child_header() {
+      let mut buf = make_moov_with_mvhd();
+      let moov_size = buf.len();
+      buf.truncate(16);
+      let base_offset = 10_000u64;
+      let file_size = base_offset + u64::try_from(moov_size).unwrap();
+
+      assert_eq!(
+         find_moov_pattern(&buf, base_offset, file_size),
+         Some((base_offset, u64::try_from(moov_size).unwrap()))
+      );
+   }
+
+   #[test]
+   fn test_find_extended_moov_pattern_unaligned() {
+      let mut buf = vec![0u8; 100];
+      let moov = make_extended_moov_with_mvhd();
+      let moov_size = moov.len();
+      buf.extend(moov);
+      let file_size = 10_000u64;
+      let base_offset = file_size - buf.len() as u64;
+
+      let result = find_moov_pattern(&buf, base_offset, file_size);
+
+      assert_eq!(
+         result,
+         Some((base_offset + 100, u64::try_from(moov_size).unwrap()))
+      );
+   }
+
+   #[test]
+   fn test_find_extended_moov_pattern_at_buffer_start() {
+      let buf = make_extended_moov_with_mvhd();
+      let base_offset = 10_000u64;
+      let file_size = base_offset + u64::try_from(buf.len()).unwrap();
+
+      let result = find_moov_pattern(&buf, base_offset, file_size);
+
+      assert_eq!(
+         result,
+         Some((base_offset, u64::try_from(buf.len()).unwrap()))
+      );
+   }
+
+   #[test]
    fn test_find_moov_pattern_rejects_fake_moov() {
       // moov without valid child should be rejected
       let mut buf = vec![0u8; 100];
@@ -229,6 +304,36 @@ mod tests {
 
       let result = find_moov_pattern(&buf, base_offset, file_size);
       assert!(result.is_none()); // Should reject fake moov
+   }
+
+   #[test]
+   fn test_find_moov_pattern_rejects_undersized_child_box() {
+      let mut buf = 16u32.to_be_bytes().to_vec();
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(&4u32.to_be_bytes());
+      buf.extend_from_slice(b"mvhd");
+
+      assert_eq!(find_moov_pattern(&buf, 0, buf.len() as u64), None);
+   }
+
+   #[test]
+   fn test_find_moov_pattern_rejects_child_larger_than_moov() {
+      let mut buf = 16u32.to_be_bytes().to_vec();
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(&32u32.to_be_bytes());
+      buf.extend_from_slice(b"mvhd");
+
+      assert_eq!(find_moov_pattern(&buf, 0, buf.len() as u64), None);
+   }
+
+   #[test]
+   fn test_find_moov_pattern_rejects_overflowing_file_end() {
+      let mut buf = Vec::new();
+      buf.extend_from_slice(&8u32.to_be_bytes());
+      buf.extend_from_slice(b"moov");
+      buf.extend_from_slice(b"mvhd");
+
+      assert_eq!(find_moov_pattern(&buf, u64::MAX - 1, u64::MAX), None);
    }
 
    #[test]

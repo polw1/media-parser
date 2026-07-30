@@ -63,8 +63,6 @@ pub struct VideoTrackMeta {
    pub base: BaseTrackMeta,
    pub width: u32,
    pub height: u32,
-   /// Optional. Per-sample durations for variable frame rate (VFR).
-   pub sample_durations: Option<Vec<u32>>,
 }
 
 /// Audio track metadata.
@@ -73,8 +71,6 @@ pub struct AudioTrackMeta {
    pub base: BaseTrackMeta,
    pub channels: u16,
    pub sample_rate: u32,
-   /// Optional. Size (bytes) of each sample for variable bit rate (VBR).
-   pub sample_sizes: Option<Vec<u32>>,
 }
 
 /// Subtitle track metadata.

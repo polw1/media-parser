@@ -5,7 +5,8 @@
 /// Returns `None` if `offset + 2 > buf.len()`.
 #[inline]
 pub fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
-   let bytes: [u8; 2] = buf.get(offset..offset + 2)?.try_into().ok()?;
+   let end = offset.checked_add(2)?;
+   let bytes: [u8; 2] = buf.get(offset..end)?.try_into().ok()?;
    Some(u16::from_be_bytes(bytes))
 }
 
@@ -14,7 +15,8 @@ pub fn read_u16_be(buf: &[u8], offset: usize) -> Option<u16> {
 /// Returns `None` if `offset + 2 > buf.len()`.
 #[inline]
 pub fn read_u16_le(buf: &[u8], offset: usize) -> Option<u16> {
-   let bytes: [u8; 2] = buf.get(offset..offset + 2)?.try_into().ok()?;
+   let end = offset.checked_add(2)?;
+   let bytes: [u8; 2] = buf.get(offset..end)?.try_into().ok()?;
    Some(u16::from_le_bytes(bytes))
 }
 
@@ -23,7 +25,8 @@ pub fn read_u16_le(buf: &[u8], offset: usize) -> Option<u16> {
 /// Returns `None` if `offset + 4 > buf.len()`.
 #[inline]
 pub fn read_u32_be(buf: &[u8], offset: usize) -> Option<u32> {
-   let bytes: [u8; 4] = buf.get(offset..offset + 4)?.try_into().ok()?;
+   let end = offset.checked_add(4)?;
+   let bytes: [u8; 4] = buf.get(offset..end)?.try_into().ok()?;
    Some(u32::from_be_bytes(bytes))
 }
 
@@ -32,7 +35,8 @@ pub fn read_u32_be(buf: &[u8], offset: usize) -> Option<u32> {
 /// Returns `None` if `offset + 8 > buf.len()`.
 #[inline]
 pub fn read_u64_be(buf: &[u8], offset: usize) -> Option<u64> {
-   let bytes: [u8; 8] = buf.get(offset..offset + 8)?.try_into().ok()?;
+   let end = offset.checked_add(8)?;
+   let bytes: [u8; 8] = buf.get(offset..end)?.try_into().ok()?;
    Some(u64::from_be_bytes(bytes))
 }
 
@@ -76,6 +80,16 @@ mod tests {
       assert_eq!(read_u16_be(&buf, 1), None);
       assert_eq!(read_u32_be(&buf, 0), None);
       assert_eq!(read_u64_be(&buf, 0), None);
+   }
+
+   #[test]
+   fn test_read_with_overflowing_offset_returns_none() {
+      let buf = [0u8; 8];
+
+      assert_eq!(read_u16_be(&buf, usize::MAX), None);
+      assert_eq!(read_u16_le(&buf, usize::MAX), None);
+      assert_eq!(read_u32_be(&buf, usize::MAX), None);
+      assert_eq!(read_u64_be(&buf, usize::MAX), None);
    }
 
    #[test]

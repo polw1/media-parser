@@ -111,8 +111,14 @@ impl FileStreamReader {
    fn sync_read_into(file: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
       let mut read_total = 0usize;
       while read_total < buf.len() {
+         let read_offset = offset
+            .checked_add(
+               u64::try_from(read_total)
+                  .map_err(|_| MediaParserError::Other("file read offset exceeds u64".into()))?,
+            )
+            .ok_or_else(|| MediaParserError::Other("file read offset overflow".into()))?;
          let n = file
-            .read_at_offset(&mut buf[read_total..], offset + read_total as u64)
+            .read_at_offset(&mut buf[read_total..], read_offset)
             .map_err(MediaParserError::Io)?;
          if n == 0 {
             break;
@@ -350,12 +356,18 @@ impl StreamReader for HttpStreamReader {
       // request the remaining bytes in subsequent requests
       while total_read < buf.len() && current_offset < size {
          let remaining = buf.len() - total_read;
-         let available = (size - current_offset) as usize;
+         let available = usize::try_from(size - current_offset).unwrap_or(usize::MAX);
          let to_read = remaining.min(available);
 
          // Calculate range for this request directly
          let start = current_offset;
-         let end = current_offset + to_read as u64 - 1;
+         let end = current_offset
+            .checked_add(
+               u64::try_from(to_read)
+                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
+            )
+            .and_then(|end| end.checked_sub(1))
+            .ok_or_else(|| MediaParserError::Other("HTTP range overflow".into()))?;
 
          // Read into the remaining portion of the buffer
          let bytes_read = self
@@ -368,7 +380,12 @@ impl StreamReader for HttpStreamReader {
          }
 
          total_read += bytes_read;
-         current_offset += bytes_read as u64;
+         current_offset = current_offset
+            .checked_add(
+               u64::try_from(bytes_read)
+                  .map_err(|_| MediaParserError::Other("HTTP read length exceeds u64".into()))?,
+            )
+            .ok_or_else(|| MediaParserError::Other("HTTP read offset overflow".into()))?;
       }
 
       Ok(total_read)

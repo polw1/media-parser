@@ -44,9 +44,10 @@ pub mod tables;
 pub mod tags;
 
 use crate::Result;
-use crate::format::{AsyncParser, Format};
+use crate::format::{AsyncParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::Metadata;
+use crate::types::{AudioTrackMeta, BaseTrackMeta, Metadata, TrackType};
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -58,12 +59,55 @@ fn parse(reader: &dyn StreamReader) -> Pin<Box<dyn Future<Output = Result<Metada
    Box::pin(parse_mp3(reader))
 }
 
+fn parse_tracks(
+   reader: &dyn StreamReader,
+) -> Pin<Box<dyn Future<Output = Result<Vec<TrackType>>> + Send + '_>> {
+   Box::pin(read_tracks(reader))
+}
+
 /// MP3 format definition registered in the global table.
-pub static FORMAT: Format = Format::new(SIGNATURE, parse as AsyncParser);
+pub static FORMAT: Format = Format::new(
+   SIGNATURE,
+   parse as AsyncParser,
+   parse_tracks as AsyncTrackParser,
+);
 
 /// Main parsing function.
 async fn parse_mp3(reader: &dyn StreamReader) -> Result<Metadata> {
    metadata::read_metadata(reader).await
+}
+
+async fn read_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
+   let id3_end = metadata::read_id3_end(reader).await?;
+   let (header, offset) =
+      match frame::find_first_frame(reader, id3_end, frame::MAX_SYNC_SEARCH).await? {
+         frame::FrameParseResult::Found { header, offset } => (header, offset),
+         frame::FrameParseResult::NotFound | frame::FrameParseResult::EndOfData => {
+            return Ok(Vec::new());
+         }
+      };
+
+   let duration = duration::calculate_duration_from_frame(reader, &header, offset).await?;
+   let mut properties = HashMap::new();
+   properties.insert("offset".to_string(), offset.to_string());
+   properties.insert("bitrate_kbps".to_string(), header.bitrate_kbps.to_string());
+   properties.insert("mpeg_version".to_string(), header.version.to_string());
+   properties.insert("mpeg_layer".to_string(), header.layer.to_string());
+   properties.insert("channel_mode".to_string(), header.channel_mode.to_string());
+   properties.insert("duration_method".to_string(), duration.method.to_string());
+
+   Ok(vec![TrackType::Audio(AudioTrackMeta {
+      base: BaseTrackMeta {
+         id: 1,
+         codec: "mp3".to_string(),
+         language: None,
+         timescale: 1000,
+         duration: duration.millis,
+         properties,
+      },
+      channels: if header.channel_mode == 3 { 1 } else { 2 },
+      sample_rate: header.sample_rate_hz,
+   })])
 }
 
 // Re-export public types
@@ -75,3 +119,128 @@ pub use frame::{FrameHeader, FrameParseResult, MAX_SYNC_SEARCH, find_first_frame
 pub use metadata::read_metadata;
 pub use tables::{MpegLayer, MpegVersion};
 pub use tags::{frame_id_to_key, frame_name};
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use async_trait::async_trait;
+
+   struct BytesReader(Vec<u8>);
+
+   struct FailingReader;
+
+   #[async_trait]
+   impl StreamReader for BytesReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> crate::Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
+
+   #[async_trait]
+   impl StreamReader for FailingReader {
+      async fn read_at(&self, _: u64, _: &mut [u8]) -> crate::Result<usize> {
+         Err(crate::errors::MediaParserError::Other(
+            "read failure".into(),
+         ))
+      }
+
+      async fn size(&self) -> crate::Result<u64> {
+         Ok(0)
+      }
+   }
+
+   fn mp3_with_id3(tag_size: usize, frame_count: usize) -> Vec<u8> {
+      const FRAME_SIZE: usize = 417;
+      let audio_start = 10 + tag_size;
+      let mut data = vec![0; audio_start + FRAME_SIZE * frame_count];
+      let syncsafe_size = tag_size as u32;
+
+      data[..10].copy_from_slice(&[
+         b'I',
+         b'D',
+         b'3',
+         4,
+         0,
+         0,
+         ((syncsafe_size >> 21) & 0x7f) as u8,
+         ((syncsafe_size >> 14) & 0x7f) as u8,
+         ((syncsafe_size >> 7) & 0x7f) as u8,
+         (syncsafe_size & 0x7f) as u8,
+      ]);
+
+      for index in 0..frame_count {
+         let offset = audio_start + FRAME_SIZE * index;
+         data[offset..offset + 4].copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+      }
+
+      data
+   }
+
+   #[tokio::test]
+   async fn read_tracks_returns_empty_for_end_of_data() {
+      assert!(
+         read_tracks(&BytesReader(Vec::new()))
+            .await
+            .unwrap()
+            .is_empty()
+      );
+   }
+
+   #[tokio::test]
+   async fn read_tracks_returns_empty_when_no_frame_is_found() {
+      let data = vec![0; frame::MAX_SYNC_SEARCH as usize];
+
+      assert!(read_tracks(&BytesReader(data)).await.unwrap().is_empty());
+   }
+
+   #[tokio::test]
+   async fn read_tracks_skips_large_id3v2_tag() {
+      let tag_size = frame::MAX_SYNC_SEARCH as usize + 1;
+      let audio_start = 10 + tag_size;
+
+      let tracks = read_tracks(&BytesReader(mp3_with_id3(tag_size, 2)))
+         .await
+         .unwrap();
+
+      assert_eq!(tracks.len(), 1);
+      let TrackType::Audio(track) = &tracks[0] else {
+         panic!("expected an audio track");
+      };
+      assert_eq!(
+         track.base.properties.get("offset"),
+         Some(&audio_start.to_string())
+      );
+      assert_eq!(track.base.duration, 52);
+      assert_eq!(track.channels, 2);
+      assert_eq!(track.sample_rate, 44_100);
+   }
+
+   #[tokio::test]
+   async fn read_tracks_and_metadata_reject_single_unconfirmed_frame_after_id3v2_tag() {
+      let tag_size = 2 * 1024;
+      let reader = BytesReader(mp3_with_id3(tag_size, 1));
+
+      let tracks = read_tracks(&reader).await.unwrap();
+      let metadata = metadata::read_metadata(&reader).await.unwrap();
+
+      assert!(tracks.is_empty());
+      assert_eq!(metadata.duration, 0);
+   }
+
+   #[tokio::test]
+   async fn read_tracks_propagates_reader_errors() {
+      assert!(matches!(
+         read_tracks(&FailingReader).await,
+         Err(crate::errors::MediaParserError::Other(message)) if message == "read failure"
+      ));
+   }
+}

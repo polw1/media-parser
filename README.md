@@ -20,8 +20,8 @@ tauri-plugin-media-parser/
 │       ├── src/
 │       │   ├── format/
 │       │   │   ├── mp3/       # MP3 parsing (frames, duration, ID3 tags)
-│       │   │   ├── mp4/       # MP4 parsing (atoms, moov, metadata)
-│       │   │   │   └── atoms/ # Box/atom reading, iteration, navigation
+│       │   │   ├── mp4/       # MP4 parsing (atoms, moov, metadata, tracks)
+│       │   │   │   └── atoms/ # Box/atom reading, iteration, navigation, media atom parsing
 │       │   │   ├── registry.rs # Format detection and parser dispatch
 │       │   │   └── signatures.rs # Markers and extension mappings
 │       │   ├── helpers/       # Byte reading, text decoding utilities
@@ -144,6 +144,7 @@ Use the plugin from JavaScript/TypeScript:
 ```typescript
 import {
    getMetadata,
+   getTracks,
    getDurationInSeconds,
    getMetadataValue,
 } from '@silvermine/tauri-plugin-media-parser';
@@ -164,6 +165,20 @@ console.log(`Duration: ${duration}s`);
 const title = getMetadataValue(metadata, 'Title');
 const artist = getMetadataValue(metadata, 'Artist');
 console.log(`Title: ${title}, Artist: ${artist}`);
+
+// Extract track details
+const tracks = await getTracks('/path/to/video.mp4');
+for (const track of tracks) {
+   console.log(`${track.kind} track ${track.id}: ${track.codec}`);
+
+   if (track.kind === 'video') {
+      console.log(`Resolution: ${track.width}x${track.height}`);
+   }
+
+   if (track.kind === 'audio') {
+      console.log(`Audio: ${track.channels} channels at ${track.sampleRate}Hz`);
+   }
+}
 ```
 
 ## Development Standards
@@ -191,4 +206,3 @@ MIT
 
 Contributions are welcome! Please follow the established coding standards and commit
 message conventions.
-

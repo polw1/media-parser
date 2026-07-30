@@ -14,6 +14,16 @@ pub enum MpegVersion {
    V25,
 }
 
+impl std::fmt::Display for MpegVersion {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str(match self {
+         Self::V1 => "V1",
+         Self::V2 => "V2",
+         Self::V25 => "V25",
+      })
+   }
+}
+
 /// MPEG audio layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MpegLayer {
@@ -23,6 +33,16 @@ pub enum MpegLayer {
    Layer2,
    /// Layer III
    Layer3,
+}
+
+impl std::fmt::Display for MpegLayer {
+   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+      f.write_str(match self {
+         Self::Layer1 => "Layer1",
+         Self::Layer2 => "Layer2",
+         Self::Layer3 => "Layer3",
+      })
+   }
 }
 
 /// Bitrate table for MPEG1 Layer 1 (kbps).

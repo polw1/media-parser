@@ -82,7 +82,7 @@ pub fn decode_utf16_le(data: &[u8]) -> Option<String> {
 
 /// Internal: decodes UTF-16 bytes with specified endianness.
 fn decode_utf16_bytes(data: &[u8], little_endian: bool) -> Option<String> {
-   if data.is_empty() || data.len() % 2 != 0 {
+   if data.is_empty() || !data.len().is_multiple_of(2) {
       return None;
    }
 

@@ -36,11 +36,12 @@ pub mod atoms;
 pub mod metadata;
 pub mod subtitles;
 pub mod thumbnails;
+pub mod tracks;
 
 use crate::Result;
-use crate::format::{AsyncParser, Format};
+use crate::format::{AsyncParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::Metadata;
+use crate::types::{Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -52,8 +53,18 @@ fn parse(reader: &dyn StreamReader) -> Pin<Box<dyn Future<Output = Result<Metada
    Box::pin(parse_mp4(reader))
 }
 
+fn parse_tracks(
+   reader: &dyn StreamReader,
+) -> Pin<Box<dyn Future<Output = Result<Vec<TrackType>>> + Send + '_>> {
+   Box::pin(tracks::read_tracks(reader))
+}
+
 /// MP4 format definition registered in the global table.
-pub static FORMAT: Format = Format::new(SIGNATURE, parse as AsyncParser);
+pub static FORMAT: Format = Format::new(
+   SIGNATURE,
+   parse as AsyncParser,
+   parse_tracks as AsyncTrackParser,
+);
 
 /// Main parsing function.
 async fn parse_mp4(reader: &dyn StreamReader) -> Result<Metadata> {
@@ -62,3 +73,4 @@ async fn parse_mp4(reader: &dyn StreamReader) -> Result<Metadata> {
 
 // Re-export for direct access
 pub use metadata::read_metadata;
+pub use tracks::read_tracks;

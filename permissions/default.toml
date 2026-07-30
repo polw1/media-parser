@@ -4,5 +4,5 @@
 description = "Default permissions for the media-parser plugin"
 permissions = [
    "allow-get-metadata",
+   "allow-get-tracks",
 ]
-

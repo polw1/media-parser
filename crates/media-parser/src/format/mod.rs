@@ -65,7 +65,7 @@ pub mod signatures;
 
 use crate::Result;
 use crate::stream::StreamReader;
-use crate::types::Metadata;
+use crate::types::{Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -74,6 +74,12 @@ use std::pin::Pin;
 /// A function that reads from a stream and returns parsed metadata.
 pub type AsyncParser =
    for<'a> fn(&'a dyn StreamReader) -> Pin<Box<dyn Future<Output = Result<Metadata>> + Send + 'a>>;
+
+/// Async track parser function type.
+pub type AsyncTrackParser =
+   for<'a> fn(
+      &'a dyn StreamReader,
+   ) -> Pin<Box<dyn Future<Output = Result<Vec<TrackType>>> + Send + 'a>>;
 
 /// Format signature for identification.
 ///
@@ -97,11 +103,20 @@ pub struct FormatSignature {
 pub struct Format {
    pub signature: FormatSignature,
    pub parser: AsyncParser,
+   pub track_parser: AsyncTrackParser,
 }
 
 impl Format {
-   pub const fn new(signature: FormatSignature, parser: AsyncParser) -> Self {
-      Self { signature, parser }
+   pub const fn new(
+      signature: FormatSignature,
+      parser: AsyncParser,
+      track_parser: AsyncTrackParser,
+   ) -> Self {
+      Self {
+         signature,
+         parser,
+         track_parser,
+      }
    }
 
    /// Check if this format matches the given header bytes.

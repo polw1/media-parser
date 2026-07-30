@@ -17,6 +17,7 @@
 //! ```
 
 mod iter;
+mod media;
 mod moov;
 mod nav;
 mod read;
@@ -26,7 +27,14 @@ mod types;
 // Re-export public items
 pub use iter::{Mp4BoxIter, iter_boxes};
 pub use moov::find_and_read_moov_box;
+pub(super) use moov::parse_moov_payload;
 pub use nav::{Mp4Nav, find_box_ref};
 pub use read::{BoxRead, read_box};
 pub use tags::{fourcc_to_key, tag_name};
 pub use types::Mp4Box;
+
+// Track parsing helpers are internal to the MP4 module.
+pub(super) use media::{
+   audio_params, fourcc_string, parse_hdlr, parse_mdhd, parse_stsd, parse_tkhd, stts_sample_count,
+   visual_dimensions,
+};

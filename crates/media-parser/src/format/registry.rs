@@ -17,7 +17,7 @@ use super::{Format, FormatSignature};
 use crate::Result;
 use crate::errors::MediaParserError;
 use crate::stream::StreamReader;
-use crate::types::Metadata;
+use crate::types::{Metadata, TrackType};
 use std::sync::LazyLock;
 
 /// Global registry of supported formats.
@@ -52,6 +52,18 @@ pub async fn parse_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
 
    // Dispatch to the appropriate parser
    (format.parser)(reader).await
+}
+
+/// Parses track metadata by detecting format and dispatching to the appropriate parser.
+pub async fn parse_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
+   let mut header = [0u8; 32];
+   reader.read_at(0, &mut header).await?;
+
+   let format = detect_format(&header).ok_or_else(|| {
+      MediaParserError::InvalidFormat("Could not detect format from file header".to_string())
+   })?;
+
+   (format.track_parser)(reader).await
 }
 
 /// Returns an iterator over all supported format signatures.
