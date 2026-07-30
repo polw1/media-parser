@@ -124,6 +124,87 @@ impl From<TrackType> for TrackInfo {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use media_parser::{AudioTrackMeta, SubtitleTrackMeta, UnknownTrackMeta, VideoTrackMeta};
+
+   fn base_track(id: u32, codec: &str) -> BaseTrackMeta {
+      BaseTrackMeta {
+         id,
+         codec: codec.to_string(),
+         language: None,
+         timescale: 1_000,
+         duration: 2_000,
+         properties: HashMap::new(),
+      }
+   }
+
+   #[test]
+   fn serializes_track_type_contract() {
+      let tracks = [
+         TrackType::Video(VideoTrackMeta {
+            base: base_track(1, "avc1"),
+            width: 1_920,
+            height: 1_080,
+         }),
+         TrackType::Audio(AudioTrackMeta {
+            base: base_track(2, "mp4a"),
+            channels: 2,
+            sample_rate: 48_000,
+         }),
+         TrackType::Subtitle(SubtitleTrackMeta {
+            base: base_track(3, "tx3g"),
+         }),
+         TrackType::Unknown(UnknownTrackMeta {
+            base: base_track(4, "meta"),
+         }),
+      ];
+
+      let serialized = tracks
+         .into_iter()
+         .map(|track| serde_json::to_value(TrackInfo::from(track)).expect("track should serialize"))
+         .collect::<Vec<_>>();
+
+      assert_eq!(
+         serialized,
+         vec![
+            serde_json::json!({
+               "kind": "video",
+               "id": 1,
+               "codec": "avc1",
+               "timescale": 1_000,
+               "duration": 2_000,
+               "properties": {},
+               "width": 1_920,
+               "height": 1_080,
+            }),
+            serde_json::json!({
+               "kind": "audio",
+               "id": 2,
+               "codec": "mp4a",
+               "timescale": 1_000,
+               "duration": 2_000,
+               "properties": {},
+               "channels": 2,
+               "sampleRate": 48_000,
+            }),
+            serde_json::json!({
+               "kind": "subtitle",
+               "id": 3,
+               "codec": "tx3g",
+               "timescale": 1_000,
+               "duration": 2_000,
+               "properties": {},
+            }),
+            serde_json::json!({
+               "kind": "unknown",
+               "id": 4,
+               "codec": "meta",
+               "timescale": 1_000,
+               "duration": 2_000,
+               "properties": {},
+            }),
+         ]
+      );
+   }
 
    #[test]
    fn serializes_track_info_optional_fields_as_omitted() {
