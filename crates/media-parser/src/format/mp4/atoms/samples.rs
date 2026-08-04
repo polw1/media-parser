@@ -2,6 +2,7 @@
 
 use super::{Mp4Nav, iter_boxes};
 use crate::decoders::h264::AvcConfig;
+#[cfg(test)]
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
 use std::time::Duration;
@@ -32,7 +33,129 @@ pub struct SampleSelection {
    pub presentation_tick: u64,
 }
 
+#[cfg(test)]
 const MAX_SAMPLES_PER_RANGE: usize = 16_384;
+const MAX_PRESENTATION_TIMELINE_BYTES: usize = 128 * 1024 * 1024;
+
+fn presentation_timeline_sample_count_fits(sample_count: usize) -> bool {
+   let Some(bytes_per_sample) = std::mem::size_of::<i128>().checked_add(std::mem::size_of::<u32>())
+   else {
+      return false;
+   };
+   sample_count != 0
+      && sample_count
+         .checked_mul(bytes_per_sample)
+         .is_some_and(|bytes| bytes <= MAX_PRESENTATION_TIMELINE_BYTES)
+}
+
+/// Reusable presentation timestamps for a validated MP4 video sample table.
+#[derive(Debug)]
+pub struct PresentationTimeline {
+   /// Signed presentation ticks in one-based MP4 sample order.
+   ticks_by_sample: Vec<i128>,
+   /// One-based sample indices ordered by `(presentation_tick, sample_index)`.
+   samples_by_time: Vec<u32>,
+}
+
+impl PresentationTimeline {
+   pub fn new(
+      stts: &[u8],
+      composition_offsets: Option<&[CompositionOffset]>,
+      presentation_offset: i64,
+      sample_count: u32,
+   ) -> Option<Self> {
+      let sample_count = usize::try_from(sample_count).ok()?;
+      if !presentation_timeline_sample_count_fits(sample_count)
+         || composition_offsets
+            .is_some_and(|offsets| offsets.iter().any(|entry| entry.sample_count == 0))
+      {
+         return None;
+      }
+
+      let mut ticks_by_sample = Vec::new();
+      ticks_by_sample.try_reserve_exact(sample_count).ok()?;
+      let mut samples_by_time = Vec::new();
+      samples_by_time.try_reserve_exact(sample_count).ok()?;
+      let mut walker = TimingWalker::new(stts, composition_offsets)?;
+
+      loop {
+         match walker.next_segment() {
+            TimingStep::Segment(segment) => {
+               for position in 0..segment.sample_count {
+                  if ticks_by_sample.len() == sample_count {
+                     return None;
+                  }
+                  let sample_index = segment.first_sample.checked_add(position)?;
+                  let decode_tick = segment
+                     .decode_tick
+                     .checked_add(u64::from(position).checked_mul(segment.sample_delta)?)?;
+                  let presentation_tick = i128::from(decode_tick)
+                     .checked_add(i128::from(segment.composition_offset))?
+                     .checked_sub(i128::from(presentation_offset))?;
+                  ticks_by_sample.push(presentation_tick);
+                  if u64::try_from(presentation_tick).is_ok() {
+                     samples_by_time.push(sample_index);
+                  } else if presentation_tick >= 0 {
+                     return None;
+                  }
+               }
+            }
+            TimingStep::Exhausted => break,
+            TimingStep::Invalid => return None,
+         }
+      }
+
+      if walker.has_unconsumed_ctts() || ticks_by_sample.len() != sample_count {
+         return None;
+      }
+      samples_by_time.sort_unstable_by_key(|sample_index| {
+         let index = usize::try_from(*sample_index).expect("u32 fits usize") - 1;
+         (ticks_by_sample[index], *sample_index)
+      });
+      Some(Self {
+         ticks_by_sample,
+         samples_by_time,
+      })
+   }
+
+   pub fn select(&self, target_tick: u64) -> Option<SampleSelection> {
+      let target = (i128::from(target_tick), u32::MAX);
+      let upper = self.samples_by_time.partition_point(|sample_index| {
+         let index = usize::try_from(*sample_index).expect("u32 fits usize") - 1;
+         (self.ticks_by_sample[index], *sample_index) <= target
+      });
+      let sample_index = if upper == 0 {
+         *self.samples_by_time.first()?
+      } else {
+         self.samples_by_time[upper - 1]
+      };
+      Some(SampleSelection {
+         sample_index,
+         presentation_tick: u64::try_from(self.tick(sample_index)?).ok()?,
+      })
+   }
+
+   pub fn tick(&self, sample_index: u32) -> Option<i128> {
+      let index = usize::try_from(sample_index).ok()?.checked_sub(1)?;
+      self.ticks_by_sample.get(index).copied()
+   }
+
+   pub fn ticks_for_range(&self, start_sample: u32, end_sample: u32) -> Option<Vec<(u32, i128)>> {
+      if start_sample > end_sample {
+         return None;
+      }
+      let start = usize::try_from(start_sample).ok()?.checked_sub(1)?;
+      let end = usize::try_from(end_sample).ok()?;
+      let ticks = self.ticks_by_sample.get(start..end)?;
+      let mut result = Vec::new();
+      result.try_reserve_exact(ticks.len()).ok()?;
+      for (offset, tick) in ticks.iter().copied().enumerate() {
+         let sample_index = start_sample.checked_add(u32::try_from(offset).ok()?)?;
+         result.push((sample_index, tick));
+      }
+      Some(result)
+   }
+}
 
 /// Reads the entry count of a full-box table (8-byte header of version/flags
 /// plus entry count) and validates that `entry_size`-byte entries fit in the
@@ -313,6 +436,7 @@ impl<'a> TimingWalker<'a> {
    }
 
    /// 1-based index of the next sample the walker will describe.
+   #[cfg(test)]
    fn sample_index(&self) -> u32 {
       self.sample_index
    }
@@ -326,6 +450,7 @@ impl<'a> TimingWalker<'a> {
    }
 }
 
+#[cfg(test)]
 pub fn select_sample_by_time(
    stts: &[u8],
    composition_offsets: Option<&[CompositionOffset]>,
@@ -368,6 +493,7 @@ pub fn select_sample_by_time(
 ///
 /// The caller must guarantee `sample_delta` is non-zero (the stts/ctts walker
 /// rejects zero deltas while producing segments).
+#[cfg(test)]
 fn consider_presentation_segment(
    before: &mut Option<SampleSelection>,
    after: &mut Option<SampleSelection>,
@@ -729,6 +855,7 @@ pub fn sample_size(sample_index: u32, sizes: &SampleSizes) -> Option<u32> {
    }
 }
 
+#[cfg(test)]
 pub fn validate_sample_range(
    start_sample: u32,
    end_sample: u32,
@@ -806,6 +933,7 @@ pub fn validate_sample_tables(
    Some(())
 }
 
+#[cfg(test)]
 pub fn presentation_ticks_for_range(
    stts: &[u8],
    composition_offsets: Option<&[CompositionOffset]>,
@@ -935,6 +1063,127 @@ mod tests {
 
       assert_eq!(selection.sample_index, 3);
       assert_eq!(selection.presentation_tick, 1_000);
+   }
+
+   #[test]
+   fn presentation_timeline_matches_full_walker_for_reordered_and_equal_ticks() {
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stts.extend_from_slice(&5u32.to_be_bytes());
+      stts.extend_from_slice(&1_000u32.to_be_bytes());
+      let composition_offsets = vec![
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: 2_000,
+         },
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: 0,
+         },
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: -2_000,
+         },
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: 0,
+         },
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: -1_000,
+         },
+      ];
+      let timeline =
+         PresentationTimeline::new(&stts, Some(&composition_offsets), 1_000, 5).unwrap();
+
+      for target in [0, 500, 1_000, 1_500, 2_000, 2_500, 10_000] {
+         assert_eq!(
+            timeline.select(target),
+            select_sample_by_time(&stts, Some(&composition_offsets), 1_000, target),
+            "target {target}"
+         );
+      }
+
+      let shifted = PresentationTimeline::new(&stts, None, -1_000, 5).unwrap();
+      assert_eq!(
+         shifted.select(0),
+         select_sample_by_time(&stts, None, -1_000, 0)
+      );
+   }
+
+   #[test]
+   fn presentation_timeline_preserves_signed_ticks_in_decode_order_ranges() {
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stts.extend_from_slice(&3u32.to_be_bytes());
+      stts.extend_from_slice(&1_000u32.to_be_bytes());
+      let timeline = PresentationTimeline::new(&stts, None, 1_500, 3).unwrap();
+
+      assert_eq!(
+         timeline.ticks_for_range(1, 3),
+         Some(vec![(1, -1_500), (2, -500), (3, 500)])
+      );
+      assert_eq!(
+         timeline.ticks_for_range(1, 3),
+         presentation_ticks_for_range(&stts, None, 1_500, 1, 3)
+      );
+      assert_eq!(timeline.tick(2), Some(-500));
+      assert_eq!(timeline.ticks_for_range(0, 1), None);
+      assert_eq!(timeline.ticks_for_range(2, 1), None);
+      assert_eq!(timeline.ticks_for_range(1, 4), None);
+   }
+
+   #[test]
+   fn presentation_timeline_rejects_malformed_timing_tables() {
+      fn stts(count: u32, delta: u32) -> Vec<u8> {
+         let mut bytes = vec![0; 8];
+         bytes[4..8].copy_from_slice(&1u32.to_be_bytes());
+         bytes.extend_from_slice(&count.to_be_bytes());
+         bytes.extend_from_slice(&delta.to_be_bytes());
+         bytes
+      }
+
+      assert!(PresentationTimeline::new(&stts(0, 1), None, 0, 1).is_none());
+      assert!(PresentationTimeline::new(&[], None, 0, 0).is_none());
+      assert!(PresentationTimeline::new(&[], None, 0, 1).is_none());
+      assert!(PresentationTimeline::new(&stts(1, 0), None, 0, 1).is_none());
+      assert!(
+         PresentationTimeline::new(
+            &stts(2, 1),
+            Some(&[CompositionOffset {
+               sample_count: 1,
+               sample_offset: 0,
+            }]),
+            0,
+            2,
+         )
+         .is_none()
+      );
+      assert!(
+         PresentationTimeline::new(
+            &stts(1, 1),
+            Some(&[CompositionOffset {
+               sample_count: 2,
+               sample_offset: 0,
+            }]),
+            0,
+            1,
+         )
+         .is_none()
+      );
+      assert!(PresentationTimeline::new(&stts(1, 1), None, 0, 2).is_none());
+      assert!(PresentationTimeline::new(&stts(2, u32::MAX), None, 0, 2).is_some());
+      assert!(PresentationTimeline::new(&stts(u32::MAX, u32::MAX), None, 0, u32::MAX).is_none());
+   }
+
+   #[test]
+   fn presentation_timeline_pins_the_storage_budget_boundary() {
+      let bytes_per_sample = std::mem::size_of::<i128>() + std::mem::size_of::<u32>();
+      let max_samples = MAX_PRESENTATION_TIMELINE_BYTES / bytes_per_sample;
+
+      assert!(!presentation_timeline_sample_count_fits(0));
+      assert!(presentation_timeline_sample_count_fits(max_samples));
+      assert!(!presentation_timeline_sample_count_fits(max_samples + 1));
    }
 
    #[test]

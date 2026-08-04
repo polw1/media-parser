@@ -499,4 +499,15 @@ mod tests {
       assert_eq!(decode_id3_text(&[]), None);
       assert_eq!(decode_id3_text(&[0]), None); // Only encoding byte, no text
    }
+
+   #[test]
+   fn test_decode_syncsafe_ignores_high_bits() {
+      assert_eq!(decode_syncsafe([0xff, 0x81, 0x82, 0x83]), 0x0fe0_4103);
+   }
+
+   #[test]
+   fn test_deunsynchronize_removes_inserted_zeroes_and_preserves_final_byte() {
+      let decoded = deunsynchronize(&[0xff, 0, 0xff, 0, 0x12, 0xff]).expect("decode");
+      assert_eq!(decoded, [0xff, 0xff, 0x12, 0xff]);
+   }
 }

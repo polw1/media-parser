@@ -1,12 +1,11 @@
 //! MP4 thumbnail extraction from H.264 video tracks.
 
 use super::atoms::{
-   CompositionOffset, Mp4Nav, SampleSizes, StscEntry, duration_to_ticks, find_and_read_moov_box,
-   iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config, parse_chunk_offsets,
-   parse_ctts, parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes, parse_stsc,
-   parse_stss, parse_tkhd, presentation_ticks_for_range, range_uses_description_index,
-   sample_description_index, select_sample_by_time, stts_duration_ticks, table_entries,
-   ticks_to_duration, validate_sample_tables,
+   CompositionOffset, Mp4Nav, PresentationTimeline, SampleSizes, StscEntry, duration_to_ticks,
+   find_and_read_moov_box, iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config,
+   parse_chunk_offsets, parse_ctts, parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes,
+   parse_stsc, parse_stss, parse_tkhd, range_uses_description_index, sample_description_index,
+   stts_duration_ticks, table_entries, ticks_to_duration, validate_sample_tables,
 };
 use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
 use crate::decoders::h264::{AvcConfig, DecodedImage, decode_frames_to_jpeg};
@@ -45,6 +44,7 @@ struct VideoSampleTables {
 pub struct ThumbnailIndex {
    track: VideoTrack,
    tables: VideoSampleTables,
+   timeline: PresentationTimeline,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -87,7 +87,20 @@ impl ThumbnailIndex {
       let (track, tables) = find_video_track(moov_payload, track_id)?.ok_or(
          MediaParserError::TrackNotFound(if track_id == 0 { 1 } else { track_id }),
       )?;
-      Ok(Self { track, tables })
+      let timeline = PresentationTimeline::new(
+         &tables.stts,
+         tables.composition_offsets.as_deref(),
+         track.presentation_offset,
+         tables.sizes.sample_count,
+      )
+      .ok_or_else(|| {
+         MediaParserError::InvalidFormat("invalid video presentation timeline".to_string())
+      })?;
+      Ok(Self {
+         track,
+         tables,
+         timeline,
+      })
    }
 
    /// Extracts exact frames while reusing the parsed index.
@@ -100,7 +113,7 @@ impl ThumbnailIndex {
       let mut targets = timestamps
          .iter()
          .copied()
-         .map(|timestamp| exact_target(&self.track, &self.tables, timestamp))
+         .map(|timestamp| exact_target(&self.track, &self.tables, &self.timeline, timestamp))
          .collect::<Result<Vec<_>>>()?;
       let mut targets_by_gop = BTreeMap::<Gop, Vec<usize>>::new();
       for (index, target) in targets.iter().enumerate() {
@@ -113,8 +126,7 @@ impl ThumbnailIndex {
          .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail GOPs".to_string()))?;
       for (gop, target_indices) in &targets_by_gop {
          plans.push(plan_gop_job(
-            &self.track,
-            &self.tables,
+            &self.timeline,
             *gop,
             target_indices,
             &mut targets,
@@ -178,7 +190,7 @@ impl ThumbnailIndex {
       let targets = timestamps
          .iter()
          .copied()
-         .map(|timestamp| keyframe_target(&self.track, &self.tables, timestamp))
+         .map(|timestamp| keyframe_target(&self.track, &self.tables, &self.timeline, timestamp))
          .collect::<Result<Vec<_>>>()?;
       let mut unique_samples = targets
          .iter()
@@ -465,16 +477,13 @@ fn parse_video_sample_tables(stbl: &[u8]) -> Result<VideoSampleTables> {
 fn exact_target(
    track: &VideoTrack,
    tables: &VideoSampleTables,
+   timeline: &PresentationTimeline,
    timestamp: Duration,
 ) -> Result<ExactTarget> {
    let target_tick = duration_to_ticks(timestamp, track.timescale);
-   let selection = select_sample_by_time(
-      &tables.stts,
-      tables.composition_offsets.as_deref(),
-      track.presentation_offset,
-      target_tick,
-   )
-   .ok_or_else(|| MediaParserError::InvalidFormat("could not select video sample".to_string()))?;
+   let selection = timeline.select(target_tick).ok_or_else(|| {
+      MediaParserError::InvalidFormat("could not select video sample".to_string())
+   })?;
    let sync_sample = nearest_sync_sample(selection.sample_index, tables.sync_samples.as_deref());
    let end_sample = next_sync_sample(
       sync_sample,
@@ -503,8 +512,7 @@ fn exact_target(
 /// computed over the truncated range: trailing B-frames can present before
 /// earlier samples, so positions differ from the full-GOP order.
 fn plan_gop_job(
-   track: &VideoTrack,
-   tables: &VideoSampleTables,
+   timeline: &PresentationTimeline,
    gop: Gop,
    target_indices: &[usize],
    targets: &mut [ExactTarget],
@@ -518,14 +526,9 @@ fn plan_gop_job(
       start_sample: gop.start_sample,
       end_sample,
    };
-   let mut presentation_order = presentation_ticks_for_range(
-      &tables.stts,
-      tables.composition_offsets.as_deref(),
-      track.presentation_offset,
-      truncated.start_sample,
-      truncated.end_sample,
-   )
-   .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
+   let mut presentation_order = timeline
+      .ticks_for_range(truncated.start_sample, truncated.end_sample)
+      .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
    presentation_order.sort_unstable_by_key(|(sample_index, tick)| (*tick, *sample_index));
 
    let mut output_indices = Vec::new();
@@ -555,27 +558,18 @@ fn plan_gop_job(
 fn keyframe_target(
    track: &VideoTrack,
    tables: &VideoSampleTables,
+   timeline: &PresentationTimeline,
    timestamp: Duration,
 ) -> Result<ExactTarget> {
    let target_tick = duration_to_ticks(timestamp, track.timescale);
-   let selection = select_sample_by_time(
-      &tables.stts,
-      tables.composition_offsets.as_deref(),
-      track.presentation_offset,
-      target_tick,
-   )
-   .ok_or_else(|| MediaParserError::InvalidFormat("could not select video sample".to_string()))?;
+   let selection = timeline.select(target_tick).ok_or_else(|| {
+      MediaParserError::InvalidFormat("could not select video sample".to_string())
+   })?;
    let sync_sample = nearest_sync_sample(selection.sample_index, tables.sync_samples.as_deref());
-   let presentation_tick = presentation_ticks_for_range(
-      &tables.stts,
-      tables.composition_offsets.as_deref(),
-      track.presentation_offset,
-      sync_sample,
-      sync_sample,
-   )
-   .and_then(|timings| timings.into_iter().next())
-   .and_then(|(_, tick)| u64::try_from(tick).ok())
-   .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
+   let presentation_tick = timeline
+      .tick(sync_sample)
+      .and_then(|tick| u64::try_from(tick).ok())
+      .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
    Ok(ExactTarget {
       gop: Gop {
          start_sample: sync_sample,
@@ -658,7 +652,8 @@ fn avc_config_for_range(
 }
 
 fn parse_avc_descriptions(stsd: &[u8]) -> Option<Vec<Option<AvcConfig>>> {
-   let entry_count = usize::try_from(read_u32_be(stsd, 4)?).ok()?;
+   // Each sample description is a box, so an 8-byte minimum header bounds the count.
+   let entry_count = table_entries(stsd, 8)?;
    if entry_count == 0 {
       return None;
    }

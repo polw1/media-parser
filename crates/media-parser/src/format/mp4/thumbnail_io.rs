@@ -198,3 +198,181 @@ fn plan_read_batches(
    }
    Ok(batches)
 }
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+   use async_trait::async_trait;
+
+   fn fixed_samples(sample_count: u32, fixed_size: u32) -> SampleSizes {
+      SampleSizes {
+         fixed_size,
+         sizes: Vec::new(),
+         sample_count,
+      }
+   }
+
+   fn one_sample_per_chunk() -> [StscEntry; 1] {
+      [StscEntry {
+         first_chunk: 1,
+         samples_per_chunk: 1,
+         sample_description_index: 1,
+      }]
+   }
+
+   #[test]
+   fn coalesces_samples_within_the_gap_limit() {
+      let sizes = fixed_samples(2, 4);
+      let second_offset = 100 + 4 + READ_COALESCE_GAP_BYTES;
+      let batches = plan_read_batches(
+         &[1, 2],
+         &sizes,
+         &one_sample_per_chunk(),
+         &[100, second_offset],
+      )
+      .expect("plan should coalesce a sample at the gap limit");
+
+      assert_eq!(batches.len(), 1);
+      assert_eq!(batches[0].offset, 100);
+      assert_eq!(batches[0].size, 8 + READ_COALESCE_GAP_BYTES as usize);
+      assert_eq!(batches[0].samples.len(), 2);
+      assert_eq!(
+         batches[0].samples[1].offset,
+         4 + READ_COALESCE_GAP_BYTES as usize
+      );
+   }
+
+   #[test]
+   fn splits_samples_beyond_the_gap_limit() {
+      let sizes = fixed_samples(2, 4);
+      let second_offset = 4 + READ_COALESCE_GAP_BYTES + 1;
+      let batches = plan_read_batches(
+         &[1, 2],
+         &sizes,
+         &one_sample_per_chunk(),
+         &[0, second_offset],
+      )
+      .expect("plan should split distant samples");
+
+      assert_eq!(batches.len(), 2);
+      assert_eq!(batches[0].size, 4);
+      assert_eq!(batches[1].offset, second_offset);
+   }
+
+   #[test]
+   fn rejects_overlapping_samples() {
+      let sizes = fixed_samples(2, 4);
+      let error = plan_read_batches(&[1, 2], &sizes, &one_sample_per_chunk(), &[0, 3])
+         .expect_err("overlapping samples must be rejected");
+
+      assert!(matches!(
+         error,
+         MediaParserError::InvalidFormat(message) if message == "overlapping video samples"
+      ));
+   }
+
+   #[test]
+   fn rejects_a_sample_larger_than_the_frame_limit() {
+      let sizes = fixed_samples(1, u32::try_from(MAX_FRAME_BYTES + 1).unwrap());
+      let error = plan_read_batches(&[1], &sizes, &one_sample_per_chunk(), &[0])
+         .expect_err("oversized sample must be rejected");
+
+      assert!(matches!(
+         error,
+         MediaParserError::InvalidFormat(message) if message.contains("invalid thumbnail sample size")
+      ));
+   }
+
+   #[test]
+   fn rejects_total_sample_bytes_over_the_batch_limit() {
+      let sizes = fixed_samples(3, u32::try_from(MAX_FRAME_BYTES).unwrap());
+      let error = plan_read_batches(
+         &[1, 2, 3],
+         &sizes,
+         &one_sample_per_chunk(),
+         &[0, MAX_FRAME_BYTES as u64, (MAX_FRAME_BYTES * 2) as u64],
+      )
+      .expect_err("sample byte total must be bounded");
+
+      assert!(matches!(
+         error,
+         MediaParserError::InvalidFormat(message) if message.contains("thumbnail sample batch is too large")
+      ));
+   }
+
+   #[test]
+   fn splits_a_nearby_read_that_would_exceed_the_coalesced_limit() {
+      let sizes = SampleSizes {
+         fixed_size: 0,
+         sizes: vec![MAX_COALESCED_READ_BYTES as u32, 1],
+         sample_count: 2,
+      };
+      let batches = plan_read_batches(
+         &[1, 2],
+         &sizes,
+         &one_sample_per_chunk(),
+         &[0, MAX_COALESCED_READ_BYTES as u64 + 1],
+      )
+      .expect("the oversized merged read should split instead of failing");
+
+      assert_eq!(batches.len(), 2);
+      assert_eq!(batches[0].size, MAX_COALESCED_READ_BYTES);
+      assert_eq!(batches[1].size, 1);
+   }
+
+   #[test]
+   fn rejects_coalesced_reads_over_the_batch_limit() {
+      let sample_count = 4_101u32;
+      let group_size = 1_367u32;
+      let mut offsets = Vec::with_capacity(sample_count as usize);
+      let mut group_start = 0u64;
+      for index in 0..sample_count {
+         let position = index % group_size;
+         if position == 0 && index != 0 {
+            group_start = offsets.last().copied().unwrap() + READ_COALESCE_GAP_BYTES + 2;
+         }
+         offsets.push(group_start + u64::from(position) * (READ_COALESCE_GAP_BYTES + 1));
+      }
+      let sizes = fixed_samples(sample_count, 1);
+      let sample_indices: Vec<u32> = (1..=sample_count).collect();
+      let error = plan_read_batches(&sample_indices, &sizes, &one_sample_per_chunk(), &offsets)
+         .expect_err("coalesced read total must be bounded");
+
+      assert!(matches!(
+         error,
+         MediaParserError::InvalidFormat(message) if message == "coalesced thumbnail reads are too large"
+      ));
+   }
+
+   struct TruncatedReader(Vec<u8>);
+
+   #[async_trait]
+   impl StreamReader for TruncatedReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
+
+   #[tokio::test]
+   async fn rejects_a_truncated_coalesced_read() {
+      let reader = TruncatedReader(vec![1, 2, 3]);
+      let sizes = fixed_samples(1, 4);
+      let error = read_samples_coalesced(&reader, &[1], &sizes, &one_sample_per_chunk(), &[0])
+         .await
+         .expect_err("short reads must not produce partial samples");
+
+      assert!(matches!(
+         error,
+         MediaParserError::InvalidFormat(message) if message.contains("truncated sample batch")
+      ));
+   }
+}
