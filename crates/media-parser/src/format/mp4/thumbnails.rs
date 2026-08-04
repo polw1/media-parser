@@ -4,9 +4,9 @@ use super::atoms::{
    CompositionOffset, Mp4Nav, SampleSizes, StscEntry, duration_to_ticks, find_and_read_moov_box,
    iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config, parse_chunk_offsets,
    parse_ctts, parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes, parse_stsc,
-   parse_stss, parse_tkhd, presentation_ticks_for_range, sample_description_index,
-   select_sample_by_time, stts_duration_ticks, table_entries, ticks_to_duration,
-   validate_sample_tables,
+   parse_stss, parse_tkhd, presentation_ticks_for_range, range_uses_description_index,
+   sample_description_index, select_sample_by_time, stts_duration_ticks, table_entries,
+   ticks_to_duration, validate_sample_tables,
 };
 use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
 use crate::decoders::h264::{AvcConfig, DecodedImage, decode_frames_to_jpeg};
@@ -71,6 +71,14 @@ struct DecodeJob {
    output_indices: Vec<usize>,
 }
 
+/// A planned decode job: the truncated GOP plus the presentation-order
+/// positions of its targets within that range.
+#[derive(Debug)]
+struct JobPlan {
+   gop: Gop,
+   output_indices: Vec<usize>,
+}
+
 impl ThumbnailIndex {
    /// Reads and parses the selected video track's sample index.
    pub async fn read(reader: &dyn StreamReader, track_id: u32) -> Result<Self> {
@@ -89,17 +97,31 @@ impl ThumbnailIndex {
       timestamps: &[Duration],
    ) -> Result<Vec<Frame>> {
       self.validate_timestamps(timestamps)?;
-      let targets = timestamps
+      let mut targets = timestamps
          .iter()
          .copied()
          .map(|timestamp| exact_target(&self.track, &self.tables, timestamp))
          .collect::<Result<Vec<_>>>()?;
-      let mut targets_by_gop = BTreeMap::<Gop, Vec<ExactTarget>>::new();
-      for target in targets.iter().copied() {
-         targets_by_gop.entry(target.gop).or_default().push(target);
+      let mut targets_by_gop = BTreeMap::<Gop, Vec<usize>>::new();
+      for (index, target) in targets.iter().enumerate() {
+         targets_by_gop.entry(target.gop).or_default().push(index);
       }
 
-      let wanted_samples = samples_for_gops(targets_by_gop.keys().copied())?;
+      let mut plans = Vec::new();
+      plans
+         .try_reserve(targets_by_gop.len())
+         .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail GOPs".to_string()))?;
+      for (gop, target_indices) in &targets_by_gop {
+         plans.push(plan_gop_job(
+            &self.track,
+            &self.tables,
+            *gop,
+            target_indices,
+            &mut targets,
+         )?);
+      }
+
+      let wanted_samples = samples_for_gops(plans.iter().map(|plan| plan.gop))?;
       let mut samples = read_samples_coalesced(
          reader,
          &wanted_samples,
@@ -111,14 +133,15 @@ impl ThumbnailIndex {
 
       let mut jobs = Vec::new();
       jobs
-         .try_reserve(targets_by_gop.len())
+         .try_reserve(plans.len())
          .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail GOPs".to_string()))?;
-      for (gop, gop_targets) in &targets_by_gop {
+      for plan in plans {
          let avc_config =
-            avc_config_for_range(&self.tables, gop.start_sample, gop.end_sample)?.clone();
-         let gop_len = gop
+            avc_config_for_range(&self.tables, plan.gop.start_sample, plan.gop.end_sample)?.clone();
+         let gop_len = plan
+            .gop
             .end_sample
-            .checked_sub(gop.start_sample)
+            .checked_sub(plan.gop.start_sample)
             .and_then(|count| count.checked_add(1))
             .and_then(|count| usize::try_from(count).ok())
             .ok_or_else(|| {
@@ -128,22 +151,16 @@ impl ThumbnailIndex {
          gop_samples.try_reserve(gop_len).map_err(|_| {
             MediaParserError::InvalidFormat("thumbnail GOP is too large".to_string())
          })?;
-         for sample_index in gop.start_sample..=gop.end_sample {
+         for sample_index in plan.gop.start_sample..=plan.gop.end_sample {
             gop_samples.push(samples.remove(&sample_index).ok_or_else(|| {
                MediaParserError::InvalidFormat(format!("missing thumbnail sample {sample_index}"))
             })?);
          }
-         let mut output_indices = gop_targets
-            .iter()
-            .map(|target| target.output_index)
-            .collect::<Vec<_>>();
-         output_indices.sort_unstable();
-         output_indices.dedup();
          jobs.push(DecodeJob {
-            gop: *gop,
+            gop: plan.gop,
             avc_config,
             samples: gop_samples,
-            output_indices,
+            output_indices: plan.output_indices,
          });
       }
 
@@ -466,22 +483,6 @@ fn exact_target(
    )
    .and_then(|sample| sample.checked_sub(1))
    .unwrap_or(tables.sizes.sample_count);
-   let presentation_order = presentation_ticks_for_range(
-      &tables.stts,
-      tables.composition_offsets.as_deref(),
-      track.presentation_offset,
-      sync_sample,
-      end_sample,
-   )
-   .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
-   let mut presentation_order = presentation_order;
-   presentation_order.sort_unstable_by_key(|(sample_index, tick)| (*tick, *sample_index));
-   let output_index = presentation_order
-      .iter()
-      .position(|(sample_index, _)| *sample_index == selection.sample_index)
-      .ok_or_else(|| {
-         MediaParserError::InvalidFormat("selected sample is outside its GOP".to_string())
-      })?;
    Ok(ExactTarget {
       gop: Gop {
          start_sample: sync_sample,
@@ -489,7 +490,65 @@ fn exact_target(
       },
       sample_index: selection.sample_index,
       presentation_tick: selection.presentation_tick,
-      output_index,
+      // Assigned by plan_gop_job once the GOP is truncated to its targets.
+      output_index: 0,
+   })
+}
+
+/// Truncates a GOP at its last targeted sample and assigns each target its
+/// presentation-order position within the truncated range.
+///
+/// Decoding is causal in decode order, so samples past the last target are
+/// not needed to reconstruct any target. The presentation positions must be
+/// computed over the truncated range: trailing B-frames can present before
+/// earlier samples, so positions differ from the full-GOP order.
+fn plan_gop_job(
+   track: &VideoTrack,
+   tables: &VideoSampleTables,
+   gop: Gop,
+   target_indices: &[usize],
+   targets: &mut [ExactTarget],
+) -> Result<JobPlan> {
+   let end_sample = target_indices
+      .iter()
+      .map(|index| targets[*index].sample_index)
+      .max()
+      .ok_or_else(|| MediaParserError::InvalidFormat("thumbnail GOP has no targets".to_string()))?;
+   let truncated = Gop {
+      start_sample: gop.start_sample,
+      end_sample,
+   };
+   let mut presentation_order = presentation_ticks_for_range(
+      &tables.stts,
+      tables.composition_offsets.as_deref(),
+      track.presentation_offset,
+      truncated.start_sample,
+      truncated.end_sample,
+   )
+   .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
+   presentation_order.sort_unstable_by_key(|(sample_index, tick)| (*tick, *sample_index));
+
+   let mut output_indices = Vec::new();
+   output_indices
+      .try_reserve(target_indices.len())
+      .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail targets".to_string()))?;
+   for index in target_indices {
+      let target = &mut targets[*index];
+      let output_index = presentation_order
+         .iter()
+         .position(|(sample_index, _)| *sample_index == target.sample_index)
+         .ok_or_else(|| {
+            MediaParserError::InvalidFormat("selected sample is outside its GOP".to_string())
+         })?;
+      target.gop = truncated;
+      target.output_index = output_index;
+      output_indices.push(output_index);
+   }
+   output_indices.sort_unstable();
+   output_indices.dedup();
+   Ok(JobPlan {
+      gop: truncated,
+      output_indices,
    })
 }
 
@@ -576,18 +635,19 @@ fn avc_config_for_range(
    .ok_or_else(|| {
       MediaParserError::InvalidFormat("could not resolve sample description".to_string())
    })?;
-   for sample_index in start_sample..=end_sample {
-      if sample_description_index(
-         sample_index,
-         &tables.sizes,
-         &tables.stsc,
-         &tables.chunk_offsets,
-      ) != Some(description_index)
-      {
-         return Err(MediaParserError::UnsupportedCodec(
-            "a thumbnail GOP uses multiple sample descriptions".to_string(),
-         ));
-      }
+   // Stsc runs tile the sample space contiguously, so the whole range shares
+   // the description index iff the runs overlapping it do — one O(stsc) walk
+   // instead of one sample lookup per sample in the range.
+   if !range_uses_description_index(
+      start_sample,
+      end_sample,
+      description_index,
+      &tables.stsc,
+      &tables.chunk_offsets,
+   ) {
+      return Err(MediaParserError::UnsupportedCodec(
+         "a thumbnail GOP uses multiple sample descriptions".to_string(),
+      ));
    }
    usize::try_from(description_index)
       .ok()

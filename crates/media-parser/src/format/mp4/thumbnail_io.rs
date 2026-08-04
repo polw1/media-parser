@@ -1,6 +1,6 @@
 //! Bounded, coalesced sample reads for MP4 thumbnail extraction.
 
-use super::atoms::{SampleSizes, StscEntry, sample_file_offset, sample_size};
+use super::atoms::{SampleLocator, SampleSizes, StscEntry, sample_size};
 use crate::errors::{MediaParserError, Result};
 use crate::stream::StreamReader;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -107,12 +107,15 @@ fn plan_read_batches(
    reads
       .try_reserve(unique_samples.len())
       .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail samples".to_string()))?;
+   // unique_samples is sorted, so a single forward cursor locates every
+   // sample in O(samples + stsc entries) instead of one stsc walk per sample.
+   let mut locator = SampleLocator::new(sizes, stsc, chunk_offsets)
+      .ok_or_else(|| MediaParserError::InvalidFormat("could not locate samples".to_string()))?;
    let mut total_sample_bytes = 0usize;
    for sample_index in unique_samples {
-      let offset =
-         sample_file_offset(sample_index, sizes, stsc, chunk_offsets).ok_or_else(|| {
-            MediaParserError::InvalidFormat(format!("could not locate sample {sample_index}"))
-         })?;
+      let offset = locator.file_offset(sample_index).ok_or_else(|| {
+         MediaParserError::InvalidFormat(format!("could not locate sample {sample_index}"))
+      })?;
       let size = usize::try_from(sample_size(sample_index, sizes).ok_or_else(|| {
          MediaParserError::InvalidFormat(format!("could not read sample {sample_index} size"))
       })?)

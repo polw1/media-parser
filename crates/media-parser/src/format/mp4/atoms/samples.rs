@@ -450,7 +450,8 @@ pub fn next_sync_sample(
    }
 }
 
-pub fn sample_file_offset(
+#[cfg(test)]
+fn sample_file_offset(
    sample_index: u32,
    sizes: &SampleSizes,
    stsc: &[StscEntry],
@@ -471,6 +472,7 @@ pub fn sample_description_index(
 
 #[derive(Debug, Clone, Copy)]
 struct SampleLocation {
+   #[cfg(test)]
    file_offset: u64,
    sample_description_index: u32,
 }
@@ -561,6 +563,118 @@ impl Iterator for StscRuns<'_> {
    }
 }
 
+/// Checks whether every sample in `start_sample..=end_sample` (1-based) uses
+/// `description_index`, walking the stsc runs once — O(stsc entries) instead
+/// of one `sample_location` walk per sample.
+pub fn range_uses_description_index(
+   start_sample: u32,
+   end_sample: u32,
+   description_index: u32,
+   stsc: &[StscEntry],
+   chunk_offsets: &[u64],
+) -> bool {
+   if start_sample == 0 || end_sample < start_sample {
+      return false;
+   }
+   let first = start_sample - 1;
+   let last = end_sample - 1;
+   let Some(mut runs) = StscRuns::new(stsc, chunk_offsets.len()) else {
+      return false;
+   };
+   // Runs are contiguous, so the range is covered iff every run overlapping
+   // [first, last] starts where the previous one ended and uses the index.
+   let mut expected = first;
+   for run in &mut runs {
+      let run_end = run.first_sample_index + run.sample_count;
+      if run_end <= first {
+         continue;
+      }
+      if run.first_sample_index > expected {
+         break;
+      }
+      if run.sample_description_index != description_index {
+         return false;
+      }
+      expected = expected.max(run_end);
+      if expected > last {
+         return true;
+      }
+   }
+   !runs.failed() && expected > last
+}
+
+/// Locates samples by file offset, amortizing the stsc and sample-size walks
+/// across calls. Queries must be made in non-decreasing sample-index order;
+/// out-of-order queries return `None`.
+pub struct SampleLocator<'a> {
+   sizes: &'a SampleSizes,
+   chunk_offsets: &'a [u64],
+   runs: StscRuns<'a>,
+   run: StscRun,
+   chunk_number: u32,
+   next_sample: u32,
+   next_offset: u64,
+   samples_left_in_chunk: u32,
+}
+
+impl<'a> SampleLocator<'a> {
+   pub fn new(
+      sizes: &'a SampleSizes,
+      stsc: &'a [StscEntry],
+      chunk_offsets: &'a [u64],
+   ) -> Option<Self> {
+      if stsc.first()?.first_chunk != 1 || chunk_offsets.is_empty() {
+         return None;
+      }
+      let mut runs = StscRuns::new(stsc, chunk_offsets.len())?;
+      let run = runs.next()?;
+      Some(Self {
+         sizes,
+         chunk_offsets,
+         runs,
+         run,
+         chunk_number: run.first_chunk,
+         next_sample: 1,
+         next_offset: *chunk_offsets.first()?,
+         samples_left_in_chunk: run.samples_per_chunk,
+      })
+   }
+
+   /// File offset of `sample_index` (1-based).
+   pub fn file_offset(&mut self, sample_index: u32) -> Option<u64> {
+      if sample_index == 0
+         || sample_index > self.sizes.sample_count
+         || sample_index < self.next_sample
+      {
+         return None;
+      }
+      while self.next_sample < sample_index {
+         let size = sample_size(self.next_sample, self.sizes)?;
+         self.next_offset = self.next_offset.checked_add(u64::from(size))?;
+         self.next_sample = self.next_sample.checked_add(1)?;
+         self.samples_left_in_chunk -= 1;
+         if self.samples_left_in_chunk == 0 && self.next_sample <= sample_index {
+            self.move_to_next_chunk()?;
+         }
+      }
+      Some(self.next_offset)
+   }
+
+   fn move_to_next_chunk(&mut self) -> Option<()> {
+      self.chunk_number = self.chunk_number.checked_add(1)?;
+      let run_chunks = self.run.sample_count / self.run.samples_per_chunk;
+      if self.chunk_number >= self.run.first_chunk.checked_add(run_chunks)? {
+         self.run = self.runs.next()?;
+         self.chunk_number = self.run.first_chunk;
+      }
+      self.next_offset = *self
+         .chunk_offsets
+         .get(usize::try_from(self.chunk_number.checked_sub(1)?).ok()?)?;
+      self.samples_left_in_chunk = self.run.samples_per_chunk;
+      Some(())
+   }
+}
+
 fn sample_location(
    sample_index: u32,
    sizes: &SampleSizes,
@@ -587,11 +701,12 @@ fn sample_location(
             .first_sample_index
             .checked_add(chunk_in_run.checked_mul(run.samples_per_chunk)?)?;
          let prior_bytes = sum_sample_sizes(first_sample_in_chunk, within_chunk, sizes)?;
-         let file_offset = chunk_offsets
+         let _file_offset = chunk_offsets
             .get(usize::try_from(chunk_number.checked_sub(1)?).ok()?)?
             .checked_add(prior_bytes)?;
          return Some(SampleLocation {
-            file_offset,
+            #[cfg(test)]
+            file_offset: _file_offset,
             sample_description_index: run.sample_description_index,
          });
       }
@@ -830,6 +945,90 @@ mod tests {
       stts.extend_from_slice(&0u32.to_be_bytes());
 
       assert!(select_sample_by_time(&stts, None, 0, 1_000).is_none());
+   }
+
+   fn two_run_tables() -> (SampleSizes, Vec<StscEntry>, Vec<u64>) {
+      // chunks 1-2 use description 1 (2 samples each), chunks 3-4 use
+      // description 2 (1 sample each); sample sizes vary per sample.
+      let sizes = SampleSizes {
+         fixed_size: 0,
+         sizes: vec![10, 20, 30, 40, 50, 60],
+         sample_count: 6,
+      };
+      let stsc = vec![
+         StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 2,
+            sample_description_index: 1,
+         },
+         StscEntry {
+            first_chunk: 3,
+            samples_per_chunk: 1,
+            sample_description_index: 2,
+         },
+      ];
+      let chunk_offsets = vec![100, 200, 300, 400];
+      (sizes, stsc, chunk_offsets)
+   }
+
+   #[test]
+   fn range_description_index_covers_whole_range_in_one_walk() {
+      let (sizes, stsc, chunk_offsets) = two_run_tables();
+
+      assert!(range_uses_description_index(1, 4, 1, &stsc, &chunk_offsets));
+      assert!(range_uses_description_index(5, 6, 2, &stsc, &chunk_offsets));
+      assert!(!range_uses_description_index(
+         1,
+         6,
+         1,
+         &stsc,
+         &chunk_offsets
+      ));
+      assert!(!range_uses_description_index(
+         4,
+         5,
+         1,
+         &stsc,
+         &chunk_offsets
+      ));
+      assert!(!range_uses_description_index(
+         6,
+         7,
+         2,
+         &stsc,
+         &chunk_offsets
+      ));
+      assert!(!range_uses_description_index(
+         0,
+         4,
+         1,
+         &stsc,
+         &chunk_offsets
+      ));
+      let _ = sizes;
+   }
+
+   #[test]
+   fn sample_locator_matches_sample_file_offset_in_order() {
+      let (sizes, stsc, chunk_offsets) = two_run_tables();
+      let mut locator = SampleLocator::new(&sizes, &stsc, &chunk_offsets).unwrap();
+
+      for sample_index in 1..=6 {
+         assert_eq!(
+            locator.file_offset(sample_index),
+            sample_file_offset(sample_index, &sizes, &stsc, &chunk_offsets),
+            "sample {sample_index}"
+         );
+      }
+   }
+
+   #[test]
+   fn sample_locator_rejects_out_of_order_queries() {
+      let (sizes, stsc, chunk_offsets) = two_run_tables();
+      let mut locator = SampleLocator::new(&sizes, &stsc, &chunk_offsets).unwrap();
+
+      assert_eq!(locator.file_offset(3), Some(200));
+      assert_eq!(locator.file_offset(2), None);
    }
 
    #[test]

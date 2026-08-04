@@ -40,6 +40,7 @@ fn fnv1a(data: &[u8]) -> u64 {
 struct CountingReader {
    inner: FileStreamReader,
    reads: AtomicUsize,
+   bytes: AtomicUsize,
 }
 
 impl CountingReader {
@@ -47,15 +48,21 @@ impl CountingReader {
       Self {
          inner: FileStreamReader::new(path).expect("open counted file"),
          reads: AtomicUsize::new(0),
+         bytes: AtomicUsize::new(0),
       }
    }
 
    fn reset(&self) {
       self.reads.store(0, Ordering::Relaxed);
+      self.bytes.store(0, Ordering::Relaxed);
    }
 
    fn read_count(&self) -> usize {
       self.reads.load(Ordering::Relaxed)
+   }
+
+   fn read_bytes(&self) -> usize {
+      self.bytes.load(Ordering::Relaxed)
    }
 }
 
@@ -63,7 +70,9 @@ impl CountingReader {
 impl StreamReader for CountingReader {
    async fn read_at(&self, offset: u64, buf: &mut [u8]) -> media_parser::Result<usize> {
       self.reads.fetch_add(1, Ordering::Relaxed);
-      self.inner.read_at(offset, buf).await
+      let read = self.inner.read_at(offset, buf).await?;
+      self.bytes.fetch_add(read, Ordering::Relaxed);
+      Ok(read)
    }
 
    async fn size(&self) -> media_parser::Result<u64> {
@@ -302,6 +311,50 @@ async fn test_mp4_exact_thumbnails_read_a_shared_gop_once() {
 
    assert_eq!(frames.len(), 3);
    assert_eq!(reader.read_count(), 1);
+}
+
+#[tokio::test]
+async fn test_mp4_exact_thumbnails_truncate_the_gop_at_the_last_target() {
+   let path = fixtures_dir().join("bframes_video.mp4");
+   let reader = CountingReader::new(&path);
+   let index = ThumbnailIndex::read(&reader, 0)
+      .await
+      .expect("build thumbnail index");
+
+   // The fixture is a single 9-frame GOP with deep B-frame reordering.
+   // Asking only for the first two presentation timestamps must not decode
+   // (or read) the whole GOP.
+   reader.reset();
+   let partial = index
+      .frames(&reader, &[Duration::ZERO, Duration::from_millis(100)])
+      .await
+      .expect("extract early frames");
+   let partial_bytes = reader.read_bytes();
+
+   reader.reset();
+   let full_timestamps = (0..9)
+      .map(|index| Duration::from_millis(index * 100))
+      .collect::<Vec<_>>();
+   let full = index
+      .frames(&reader, &full_timestamps)
+      .await
+      .expect("extract all frames");
+   let full_bytes = reader.read_bytes();
+
+   // Truncation must not change the decoded bytes: these are the first two
+   // hashes pinned by the deep-B-frame presentation-order test above.
+   assert_eq!(
+      partial
+         .iter()
+         .map(|frame| fnv1a(&frame.data))
+         .collect::<Vec<_>>(),
+      [0x9190_4ea4_16ce_2814, 0xbf83_13c4_8b71_3e3b]
+   );
+   assert_eq!(full.len(), 9);
+   assert!(
+      partial_bytes < full_bytes,
+      "expected the truncated GOP to read fewer bytes: {partial_bytes} vs {full_bytes}"
+   );
 }
 
 #[tokio::test]
