@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::{State, command};
 use url::Url;
@@ -14,6 +14,7 @@ use crate::Result;
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
 const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
+const LOCAL_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(60);
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 type EnvelopeMeta = serde_json::Map<String, serde_json::Value>;
@@ -61,7 +62,7 @@ impl<K: PartialEq, V: Clone> SessionCache<K, V> {
    }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct ThumbnailSessionKey {
    source: String,
    headers: Vec<(String, String)>,
@@ -69,7 +70,7 @@ struct ThumbnailSessionKey {
    local_version: Option<LocalSourceVersion>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct LocalSourceVersion {
    length: u64,
    modified_nanos: Option<u128>,
@@ -82,13 +83,32 @@ struct ThumbnailSession {
 
 pub(crate) struct ThumbnailSessions {
    cache: Mutex<SessionCache<ThumbnailSessionKey, Arc<ThumbnailSession>>>,
+   build_locks: Mutex<HashMap<ThumbnailSessionKey, Weak<tauri::async_runtime::Mutex<()>>>>,
 }
 
 impl Default for ThumbnailSessions {
    fn default() -> Self {
       Self {
          cache: Mutex::new(SessionCache::new(MAX_THUMBNAIL_SESSIONS)),
+         build_locks: Mutex::new(HashMap::new()),
       }
+   }
+}
+
+impl ThumbnailSessions {
+   /// Returns the per-key lock used to serialize index construction,
+   /// creating it if this is the first waiter for `key`.
+   fn build_lock(&self, key: &ThumbnailSessionKey) -> Result<Arc<tauri::async_runtime::Mutex<()>>> {
+      let mut locks = self.build_locks.lock().map_err(|_| {
+         crate::Error::Custom("thumbnail session lock table is unavailable".to_string())
+      })?;
+      locks.retain(|_, lock| lock.strong_count() > 0);
+      if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+         return Ok(lock);
+      }
+      let lock = Arc::new(tauri::async_runtime::Mutex::new(()));
+      locks.insert(key.clone(), Arc::downgrade(&lock));
+      Ok(lock)
    }
 }
 
@@ -157,9 +177,12 @@ async fn thumbnail_session_key(
 }
 
 fn thumbnail_session_expiration(is_remote: bool, now: Instant) -> Option<Instant> {
-   is_remote
-      .then(|| now.checked_add(REMOTE_THUMBNAIL_SESSION_TTL))
-      .flatten()
+   let ttl = if is_remote {
+      REMOTE_THUMBNAIL_SESSION_TTL
+   } else {
+      LOCAL_THUMBNAIL_SESSION_TTL
+   };
+   now.checked_add(ttl)
 }
 
 async fn thumbnail_session(
@@ -170,12 +193,25 @@ async fn thumbnail_session(
 ) -> Result<Arc<ThumbnailSession>> {
    let is_remote = is_http_source(source);
    let key = thumbnail_session_key(source, headers, track_id, is_remote).await;
-   let now = Instant::now();
    if let Some(session) = sessions
       .cache
       .lock()
       .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
-      .get(&key, now)
+      .get(&key, Instant::now())
+   {
+      return Ok(session);
+   }
+
+   // Serialize index construction per key so concurrent requests for the
+   // same cold source share one build instead of racing N index builds.
+   let build_lock = sessions.build_lock(&key)?;
+   let _build_guard = build_lock.lock().await;
+
+   if let Some(session) = sessions
+      .cache
+      .lock()
+      .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
+      .get(&key, Instant::now())
    {
       return Ok(session);
    }
@@ -183,7 +219,7 @@ async fn thumbnail_session(
    let reader = open_reader(source, headers, is_remote).await?;
    let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
    let session = Arc::new(ThumbnailSession { reader, index });
-   let expires_at = thumbnail_session_expiration(is_remote, now);
+   let expires_at = thumbnail_session_expiration(is_remote, Instant::now());
    sessions
       .cache
       .lock()
@@ -671,7 +707,7 @@ mod tests {
 
    #[test]
    fn session_cache_evicts_the_least_recently_used_entry() {
-      let now = std::time::Instant::now();
+      let now = Instant::now();
       let mut cache = SessionCache::new(2);
       cache.insert("first".to_string(), 1, None);
       cache.insert("second".to_string(), 2, None);
@@ -757,14 +793,17 @@ mod tests {
    }
 
    #[test]
-   fn only_remote_thumbnail_sessions_receive_an_expiration_deadline() {
+   fn remote_and_local_thumbnail_sessions_both_receive_an_expiration_deadline() {
       let now = Instant::now();
 
       assert_eq!(
          thumbnail_session_expiration(true, now),
          now.checked_add(REMOTE_THUMBNAIL_SESSION_TTL)
       );
-      assert_eq!(thumbnail_session_expiration(false, now), None);
+      assert_eq!(
+         thumbnail_session_expiration(false, now),
+         now.checked_add(LOCAL_THUMBNAIL_SESSION_TTL)
+      );
    }
 
    #[tokio::test]
@@ -818,6 +857,95 @@ mod tests {
          .expect("second session should reuse the cache");
 
       assert!(Arc::ptr_eq(&first, &second));
+   }
+
+   #[tokio::test]
+   async fn concurrent_requests_for_a_cold_source_build_a_single_session() {
+      let sessions = Arc::new(ThumbnailSessions::default());
+      let source = video_fixture_source();
+      let key = thumbnail_session_key(&source, None, 0, false).await;
+      let key_lock = sessions
+         .build_lock(&key)
+         .expect("build lock should be available");
+      let guard = key_lock.lock().await;
+
+      let first_sessions = Arc::clone(&sessions);
+      let first_source = source.clone();
+      let first =
+         tokio::spawn(
+            async move { thumbnail_session(&first_sessions, &first_source, None, 0).await },
+         );
+      let second_sessions = Arc::clone(&sessions);
+      let second_source = source.clone();
+      let second =
+         tokio::spawn(
+            async move { thumbnail_session(&second_sessions, &second_source, None, 0).await },
+         );
+      let third_sessions = Arc::clone(&sessions);
+      let third =
+         tokio::spawn(async move { thumbnail_session(&third_sessions, &source, None, 0).await });
+
+      // This test and the three requests hold four strong references. Reaching
+      // four proves every request observed the cold cache and joined this lock.
+      tokio::time::timeout(Duration::from_secs(10), async {
+         loop {
+            if Arc::strong_count(&key_lock) >= 4 {
+               break;
+            }
+            tokio::task::yield_now().await;
+         }
+      })
+      .await
+      .expect("all requests should reference the pre-acquired per-key lock");
+      drop(guard);
+      drop(key_lock);
+
+      let (first, second, third) = tokio::time::timeout(Duration::from_secs(10), async {
+         tokio::join!(first, second, third)
+      })
+      .await
+      .expect("concurrent thumbnail requests should not hang");
+      let first = first
+         .expect("first task should complete")
+         .expect("first concurrent session should build");
+      let second = second
+         .expect("second task should complete")
+         .expect("second concurrent session should reuse the build");
+      let third = third
+         .expect("third task should complete")
+         .expect("third concurrent session should reuse the build");
+
+      assert!(Arc::ptr_eq(&first, &second));
+      assert!(Arc::ptr_eq(&first, &third));
+      assert!(
+         sessions
+            .build_locks
+            .lock()
+            .expect("lock table should be reachable")
+            .values()
+            .all(|lock| lock.strong_count() == 0),
+         "completed builds must not retain strong lock references"
+      );
+   }
+
+   #[tokio::test]
+   async fn failed_thumbnail_session_build_does_not_retain_its_build_lock() {
+      let sessions = ThumbnailSessions::default();
+
+      assert!(
+         thumbnail_session(&sessions, "/file/that/does/not/exist.mp4", None, 0)
+            .await
+            .is_err()
+      );
+      assert!(
+         sessions
+            .build_locks
+            .lock()
+            .expect("lock table should be reachable")
+            .values()
+            .all(|lock| lock.strong_count() == 0),
+         "failed session builds must not retain strong lock references"
+      );
    }
 
    #[tokio::test]
