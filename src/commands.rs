@@ -7,7 +7,7 @@ use url::Url;
 use media_parser::{
    BaseTrackMeta, FileStreamReader, Frame, HttpStreamReader, JpegQuality, MediaParser, Metadata,
    StreamReader, TrackType,
-   format::mp4::{ThumbnailIndex, ThumbnailOptions},
+   format::mp4::{MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions},
 };
 
 use crate::Result;
@@ -17,7 +17,6 @@ use crate::session_cache::SessionCache;
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
 const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(60);
-const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -297,15 +296,20 @@ pub(crate) async fn get_thumbnails(
 /// Validates the caller-supplied JPEG quality, if any, against the encoder's
 /// 1-100 range. `None` keeps the thumbnail-grade default.
 fn thumbnail_options(quality: Option<u8>) -> Result<ThumbnailOptions> {
-   let Some(quality) = quality else {
-      return Ok(ThumbnailOptions::default());
-   };
-   let quality = JpegQuality::new(quality).ok_or_else(|| {
-      crate::Error::Custom(format!(
-         "thumbnail quality must be between 1 and 100, got {quality}"
-      ))
-   })?;
-   Ok(ThumbnailOptions { quality })
+   let quality = quality
+      .map(|quality| {
+         JpegQuality::new(quality).ok_or_else(|| {
+            crate::Error::Custom(format!(
+               "thumbnail quality must be between 1 and 100, got {quality}"
+            ))
+         })
+      })
+      .transpose()?
+      .unwrap_or_default();
+   Ok(ThumbnailOptions {
+      quality,
+      max_output_bytes: Some(MAX_THUMBNAIL_OUTPUT_BYTES),
+   })
 }
 
 fn thumbnail_durations(timestamps_ms: &[u64]) -> Vec<Duration> {
@@ -433,10 +437,10 @@ mod tests {
 
    #[test]
    fn omitted_thumbnail_quality_keeps_the_default() {
-      assert_eq!(
-         thumbnail_options(None).expect("no quality is valid"),
-         ThumbnailOptions::default()
-      );
+      let options = thumbnail_options(None).expect("no quality is valid");
+
+      assert_eq!(options.quality, JpegQuality::DEFAULT);
+      assert_eq!(options.max_output_bytes, Some(MAX_THUMBNAIL_OUTPUT_BYTES));
    }
 
    #[test]
@@ -478,10 +482,7 @@ mod tests {
       let (timestamps, order) = prepare_thumbnail_timestamps(&[0, 250, 0])
          .expect("three thumbnail outputs are within the limit");
 
-      assert_eq!(
-         timestamps,
-         vec![Duration::ZERO, Duration::from_millis(250)]
-      );
+      assert_eq!(timestamps, vec![Duration::ZERO, Duration::from_millis(250)]);
       assert_eq!(order, vec![0, 1, 0]);
    }
 

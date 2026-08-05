@@ -2,6 +2,10 @@
 
 use openh264::decoder::{DecodeOptions, DecodedYUV, Decoder, Flush};
 use openh264::formats::YUVSource;
+use std::sync::{
+   Arc,
+   atomic::{AtomicUsize, Ordering},
+};
 
 const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -52,15 +56,72 @@ pub struct DecodedImage {
    pub data: Vec<u8>,
 }
 
+/// Request-scoped accounting shared by concurrent decode jobs.
+#[derive(Debug, Clone)]
+pub(crate) struct OutputBudget {
+   max_bytes: Option<usize>,
+   used_bytes: Arc<AtomicUsize>,
+}
+
+impl OutputBudget {
+   pub(crate) fn new(max_bytes: Option<usize>) -> Self {
+      Self {
+         max_bytes,
+         used_bytes: Arc::new(AtomicUsize::new(0)),
+      }
+   }
+
+   fn reserve(&self, image_bytes: usize, output_count: usize) -> Result<(), String> {
+      let Some(max_bytes) = self.max_bytes else {
+         return Ok(());
+      };
+      let additional = image_bytes
+         .checked_mul(output_count)
+         .ok_or_else(|| "thumbnail payload is too large".to_string())?;
+      let mut used = self.used_bytes.load(Ordering::Relaxed);
+      loop {
+         let total = used
+            .checked_add(additional)
+            .filter(|total| *total <= max_bytes)
+            .ok_or_else(|| "thumbnail payload is too large".to_string())?;
+         match self.used_bytes.compare_exchange_weak(
+            used,
+            total,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+         ) {
+            Ok(_) => return Ok(()),
+            Err(current) => used = current,
+         }
+      }
+   }
+
+   #[cfg(test)]
+   fn used(&self) -> usize {
+      self.used_bytes.load(Ordering::Relaxed)
+   }
+}
+
+struct OutputSelection<'a> {
+   indices: &'a [usize],
+   counts: &'a [usize],
+   budget: &'a OutputBudget,
+}
+
 /// Decodes one GOP and encodes the selected presentation-order pictures.
 pub fn decode_frames_to_jpeg(
    config: &AvcConfig,
    samples: &[Vec<u8>],
    output_indices: &[usize],
+   output_counts: &[usize],
    quality: JpegQuality,
+   output_budget: &OutputBudget,
 ) -> Result<Vec<DecodedImage>, String> {
    if samples.is_empty() {
       return Err("no H.264 samples to decode".to_string());
+   }
+   if output_indices.len() != output_counts.len() || output_counts.contains(&0) {
+      return Err("invalid H.264 output multiplicities".to_string());
    }
    if output_indices
       .iter()
@@ -68,6 +129,11 @@ pub fn decode_frames_to_jpeg(
    {
       return Err("requested H.264 output is outside the sample range".to_string());
    }
+   let output_selection = OutputSelection {
+      indices: output_indices,
+      counts: output_counts,
+      budget: output_budget,
+   };
 
    let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
    let no_flush = DecodeOptions::new().flush_after_decode(Flush::NoFlush);
@@ -96,7 +162,7 @@ pub fn decode_frames_to_jpeg(
          store_selected_frame(
             &yuv,
             decoded_count,
-            output_indices,
+            &output_selection,
             &mut selected,
             &mut rgb,
             quality,
@@ -114,7 +180,7 @@ pub fn decode_frames_to_jpeg(
       store_selected_frame(
          &yuv,
          decoded_count,
-         output_indices,
+         &output_selection,
          &mut selected,
          &mut rgb,
          quality,
@@ -147,12 +213,13 @@ pub fn decode_frames_to_jpeg(
 fn store_selected_frame(
    yuv: &DecodedYUV<'_>,
    decoded_index: usize,
-   output_indices: &[usize],
+   output_selection: &OutputSelection<'_>,
    selected: &mut [Option<DecodedImage>],
    rgb: &mut Vec<u8>,
    quality: JpegQuality,
 ) -> Result<(), String> {
-   let positions = output_indices
+   let positions = output_selection
+      .indices
       .iter()
       .enumerate()
       .filter_map(|(position, output_index)| (*output_index == decoded_index).then_some(position))
@@ -163,6 +230,13 @@ fn store_selected_frame(
       return Ok(());
    };
    let image = yuv_to_jpeg(yuv, rgb, quality)?;
+   let output_count = positions.iter().try_fold(0usize, |total, position| {
+      total.checked_add(output_selection.counts[*position])
+   });
+   output_selection.budget.reserve(
+      image.data.len(),
+      output_count.ok_or_else(|| "thumbnail output count overflow".to_string())?,
+   )?;
    for position in earlier_positions {
       selected[*position] = Some(image.clone());
    }
@@ -311,6 +385,29 @@ mod tests {
    fn defaults_to_thumbnail_grade_quality() {
       assert_eq!(JpegQuality::default(), JpegQuality::DEFAULT);
       assert_eq!(JpegQuality::default().get(), 60);
+   }
+
+   #[test]
+   fn output_budget_accepts_the_exact_weighted_limit() {
+      let budget = OutputBudget::new(Some(12));
+
+      budget
+         .reserve(4, 3)
+         .expect("three four-byte outputs fit exactly");
+
+      assert_eq!(budget.used(), 12);
+   }
+
+   #[test]
+   fn output_budget_rejects_without_consuming_the_failed_reservation() {
+      let budget = OutputBudget::new(Some(11));
+
+      let error = budget
+         .reserve(4, 3)
+         .expect_err("weighted output exceeds the byte budget");
+
+      assert!(error.contains("thumbnail payload is too large"));
+      assert_eq!(budget.used(), 0);
    }
 
    #[test]

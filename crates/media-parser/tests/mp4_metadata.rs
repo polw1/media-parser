@@ -2,7 +2,7 @@
 
 use media_parser::{
    FileStreamReader, JpegQuality, MediaParser, PixelFormat, StreamReader, TrackType,
-   format::mp4::{ThumbnailIndex, ThumbnailOptions, read_frames},
+   format::mp4::{ThumbnailIndex, ThumbnailOptions, read_frames, read_keyframes},
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -156,9 +156,11 @@ async fn test_mp4_thumbnail_quality_reaches_the_jpeg_encoder() {
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
    let low = ThumbnailOptions {
       quality: JpegQuality::new(10).expect("10 is in range"),
+      ..ThumbnailOptions::default()
    };
    let high = ThumbnailOptions {
       quality: JpegQuality::new(95).expect("95 is in range"),
+      ..ThumbnailOptions::default()
    };
 
    let low_frames = read_frames(&reader, 0, &[Duration::ZERO], low)
@@ -177,6 +179,31 @@ async fn test_mp4_thumbnail_quality_reaches_the_jpeg_encoder() {
    assert_eq!(low_frames[0].format, PixelFormat::Jpeg);
    assert_eq!(high_frames[0].format, PixelFormat::Jpeg);
    assert_eq!(low_frames[0].width, high_frames[0].width);
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_budget_counts_each_requested_output() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let one_frame = read_keyframes(&reader, 0, &[Duration::ZERO], ThumbnailOptions::default())
+      .await
+      .expect("extract one keyframe");
+   let image_bytes = one_frame[0].data.len();
+   let timestamps = [Duration::ZERO, Duration::from_millis(100)];
+
+   let error = read_keyframes(
+      &reader,
+      0,
+      &timestamps,
+      ThumbnailOptions {
+         max_output_bytes: Some(image_bytes),
+         ..ThumbnailOptions::default()
+      },
+   )
+   .await
+   .expect_err("two outputs sharing one keyframe still consume two output payloads");
+
+   assert!(error.to_string().contains("thumbnail payload is too large"));
 }
 
 #[tokio::test]

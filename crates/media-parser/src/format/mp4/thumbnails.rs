@@ -8,7 +8,9 @@ use super::atoms::{
    stts_duration_ticks, table_entries, ticks_to_duration, validate_sample_tables,
 };
 use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
-use crate::decoders::h264::{AvcConfig, DecodedImage, JpegQuality, decode_frames_to_jpeg};
+use crate::decoders::h264::{
+   AvcConfig, DecodedImage, JpegQuality, OutputBudget, decode_frames_to_jpeg,
+};
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u32_be, read_u64_be};
 use crate::stream::StreamReader;
@@ -17,7 +19,7 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
-const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
+pub const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
 
 /// Encoding options for extracted thumbnails.
@@ -29,6 +31,9 @@ const MAX_CONCURRENT_DECODES: usize = 4;
 pub struct ThumbnailOptions {
    /// JPEG quality of the encoded frames. Defaults to [`JpegQuality::DEFAULT`].
    pub quality: JpegQuality,
+   /// Maximum total bytes represented by returned JPEG payloads. `None`
+   /// preserves the unbounded behavior for direct crate callers.
+   pub max_output_bytes: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -80,6 +85,7 @@ struct DecodeJob {
    avc_config: AvcConfig,
    samples: Vec<Vec<u8>>,
    output_indices: Vec<usize>,
+   output_counts: Vec<usize>,
 }
 
 /// A planned decode job: the truncated GOP plus the presentation-order
@@ -88,6 +94,7 @@ struct DecodeJob {
 struct JobPlan {
    gop: Gop,
    output_indices: Vec<usize>,
+   output_counts: Vec<usize>,
 }
 
 impl ThumbnailIndex {
@@ -185,10 +192,11 @@ impl ThumbnailIndex {
             avc_config,
             samples: gop_samples,
             output_indices: plan.output_indices,
+            output_counts: plan.output_counts,
          });
       }
 
-      let images = run_decode_jobs(jobs, options.quality).await?;
+      let images = run_decode_jobs(jobs, options.quality, options.max_output_bytes).await?;
       assemble_frames(&self.track, targets, images)
    }
 
@@ -211,6 +219,12 @@ impl ThumbnailIndex {
          .collect::<Vec<_>>();
       unique_samples.sort_unstable();
       unique_samples.dedup();
+      let mut output_count_by_sample = HashMap::new();
+      for target in &targets {
+         *output_count_by_sample
+            .entry(target.sample_index)
+            .or_insert(0) += 1usize;
+      }
       let mut samples = read_samples_coalesced(
          reader,
          &unique_samples,
@@ -237,10 +251,11 @@ impl ThumbnailIndex {
             avc_config,
             samples: vec![sample],
             output_indices: vec![0],
+            output_counts: vec![output_count_by_sample[&sample_index]],
          });
       }
 
-      let images = run_decode_jobs(jobs, options.quality).await?;
+      let images = run_decode_jobs(jobs, options.quality, options.max_output_bytes).await?;
       assemble_frames(&self.track, targets, images)
    }
 
@@ -269,26 +284,39 @@ impl ThumbnailIndex {
 async fn run_decode_jobs(
    jobs: Vec<DecodeJob>,
    quality: JpegQuality,
+   max_output_bytes: Option<usize>,
 ) -> Result<HashMap<(Gop, usize), DecodedImage>> {
-   let decoded = stream::iter(jobs.into_iter().map(|job| async move {
-      let DecodeJob {
-         gop,
-         avc_config,
-         samples,
-         output_indices,
-      } = job;
-      let decoded = tokio::task::spawn_blocking(move || {
-         decode_frames_to_jpeg(&avc_config, &samples, &output_indices, quality)
+   let output_budget = OutputBudget::new(max_output_bytes);
+   let decoded = stream::iter(jobs.into_iter().map(|job| {
+      let output_budget = output_budget.clone();
+      async move {
+         let DecodeJob {
+            gop,
+            avc_config,
+            samples,
+            output_indices,
+            output_counts,
+         } = job;
+         let decoded = tokio::task::spawn_blocking(move || {
+            decode_frames_to_jpeg(
+               &avc_config,
+               &samples,
+               &output_indices,
+               &output_counts,
+               quality,
+               &output_budget,
+            )
             .map(|images| (output_indices, images))
-      })
-      .await
-      .map_err(|error| {
-         MediaParserError::BlockingTask(format!("thumbnail decode task failed: {error}"))
-      })?
-      .map_err(|error| {
-         MediaParserError::UnsupportedCodec(format!("H.264 decode failed: {error}"))
-      })?;
-      Ok::<_, MediaParserError>((gop, decoded))
+         })
+         .await
+         .map_err(|error| {
+            MediaParserError::BlockingTask(format!("thumbnail decode task failed: {error}"))
+         })?
+         .map_err(|error| {
+            MediaParserError::UnsupportedCodec(format!("H.264 decode failed: {error}"))
+         })?;
+         Ok::<_, MediaParserError>((gop, decoded))
+      }
    }))
    .buffer_unordered(MAX_CONCURRENT_DECODES)
    .try_collect::<Vec<_>>()
@@ -581,10 +609,22 @@ fn plan_gop_job(
       output_indices.push(output_index);
    }
    output_indices.sort_unstable();
-   output_indices.dedup();
+   let mut unique_output_indices = Vec::new();
+   let mut output_counts = Vec::new();
+   for output_index in output_indices {
+      if unique_output_indices.last() == Some(&output_index) {
+         *output_counts
+            .last_mut()
+            .expect("an output index has a count") += 1;
+      } else {
+         unique_output_indices.push(output_index);
+         output_counts.push(1);
+      }
+   }
    Ok(JobPlan {
       gop: truncated,
-      output_indices,
+      output_indices: unique_output_indices,
+      output_counts,
    })
 }
 

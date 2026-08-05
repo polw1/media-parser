@@ -49,7 +49,7 @@ struct ThumbnailEnvelopeEntry {
 
 pub(crate) fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
    let Some(cover) = cover else {
-      return encode_binary_envelope(Vec::<CoverEnvelopeEntry>::new(), &[]);
+      return encode_binary_envelope(Vec::<CoverEnvelopeEntry>::new(), &[], usize::MAX);
    };
    let entry = CoverEnvelopeEntry {
       format: cover.format.label(),
@@ -58,7 +58,7 @@ pub(crate) fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
       length: cover.data.len(),
    };
    let payloads = [cover.data.as_slice()];
-   encode_binary_envelope(vec![entry], &payloads)
+   encode_binary_envelope(vec![entry], &payloads, usize::MAX)
 }
 
 fn thumbnail_envelope_entry(frame: &Frame, offset: usize) -> ThumbnailEnvelopeEntry {
@@ -109,10 +109,14 @@ pub(crate) fn encode_thumbnail_envelope(
       .iter()
       .map(|frame| frame.data.as_slice())
       .collect::<Vec<_>>();
-   encode_binary_envelope(entries, &payloads)
+   encode_binary_envelope(entries, &payloads, max_output_bytes)
 }
 
-fn encode_binary_envelope<T: Serialize>(entries: Vec<T>, payloads: &[&[u8]]) -> Result<Vec<u8>> {
+fn encode_binary_envelope<T: Serialize>(
+   entries: Vec<T>,
+   payloads: &[&[u8]],
+   max_output_bytes: usize,
+) -> Result<Vec<u8>> {
    let payload_len = payloads
       .iter()
       .try_fold(0usize, |total, payload| total.checked_add(payload.len()))
@@ -128,6 +132,7 @@ fn encode_binary_envelope<T: Serialize>(entries: Vec<T>, payloads: &[&[u8]]) -> 
    let envelope_len = 4usize
       .checked_add(header.len())
       .and_then(|length| length.checked_add(payload_len))
+      .filter(|length| *length <= max_output_bytes)
       .ok_or_else(|| crate::Error::Custom("envelope is too large".to_string()))?;
    let mut envelope = Vec::new();
    envelope
@@ -269,5 +274,25 @@ mod tests {
       let result = encode_thumbnail_envelope(&test_frames(), &[0, 1], 4);
 
       assert!(result.is_err());
+   }
+
+   #[test]
+   fn thumbnail_envelope_counts_header_bytes_toward_the_output_cap() {
+      let payload_len = test_frames().iter().map(|frame| frame.data.len()).sum();
+
+      let result = encode_thumbnail_envelope(&test_frames(), &[0, 1], payload_len);
+
+      assert!(result.is_err());
+   }
+
+   #[test]
+   fn thumbnail_envelope_accepts_its_exact_total_size() {
+      let uncapped = encode_thumbnail_envelope(&test_frames(), &[0, 1], usize::MAX)
+         .expect("test envelope should encode");
+
+      let capped = encode_thumbnail_envelope(&test_frames(), &[0, 1], uncapped.len())
+         .expect("the exact complete-envelope limit should be accepted");
+
+      assert_eq!(capped, uncapped);
    }
 }

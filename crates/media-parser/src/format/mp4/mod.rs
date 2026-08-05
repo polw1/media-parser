@@ -87,5 +87,7 @@ pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
 
 // Re-export for direct access
 pub use metadata::read_metadata;
-pub use thumbnails::{ThumbnailIndex, ThumbnailOptions, read_frame, read_frames, read_keyframes};
+pub use thumbnails::{
+   MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions, read_frame, read_frames, read_keyframes,
+};
 pub use tracks::read_tracks;
