@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 
+import { decodeEnvelope } from './envelope';
 import type {
    CoverInfo,
    Metadata,
@@ -166,25 +167,6 @@ function validateQuality(quality: number | undefined): void {
 
 function decodeThumbnailEnvelope(raw: ArrayBuffer | Uint8Array): ThumbnailInfo[] {
    return decodeEnvelope<Omit<ThumbnailInfo, 'data'>>(raw);
-}
-
-function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
-   const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
-   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-   const headerLength = view.getUint32(0, true);
-   const headerEnd = 4 + headerLength;
-   const header = buffer.subarray(4, headerEnd);
-
-   interface EnvelopeEntry {
-      offset: number;
-      length: number;
-   }
-
-   const entries: (T & EnvelopeEntry)[] = JSON.parse(new TextDecoder().decode(header));
-   return entries.map(({ offset, length, ...info }) => ({
-      ...info,
-      data: buffer.subarray(headerEnd + offset, headerEnd + offset + length),
-   })) as (T & { data: Uint8Array })[];
 }
 
 // ============================================================================

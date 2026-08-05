@@ -2,42 +2,76 @@
 //!
 //! Layout:
 //! - 4 little-endian bytes containing the JSON header length.
-//! - A JSON array of metadata entries.
+//! - A JSON header object `{ "version": <u32>, "entries": [...] }`.
 //! - Concatenated binary payloads.
 //!
 //! Entry `offset` values are relative to the beginning of the payload region,
-//! immediately after the JSON header.
+//! immediately after the JSON header. `version` identifies the shape of the
+//! entries so decoders can reject a header they don't understand instead of
+//! misreading it; bump it whenever an entry's fields change shape.
 
 use media_parser::{CoverArt, Frame};
+use serde::Serialize;
 
 use crate::Result;
 
-type EnvelopeMeta = serde_json::Map<String, serde_json::Value>;
+/// Current envelope format version. Decoders should reject any header whose
+/// `version` they don't recognize rather than guessing at its shape.
+const ENVELOPE_VERSION: u32 = 1;
+
+#[derive(Serialize)]
+struct EnvelopeHeader<T> {
+   version: u32,
+   entries: Vec<T>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverEnvelopeEntry {
+   format: &'static str,
+   mime_type: String,
+   offset: usize,
+   length: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailEnvelopeEntry {
+   track_id: u32,
+   width: u32,
+   height: u32,
+   timestamp_sec: f64,
+   format: &'static str,
+   mime_type: &'static str,
+   offset: usize,
+   length: usize,
+}
 
 pub(crate) fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
    let Some(cover) = cover else {
-      return encode_binary_envelope(Vec::new(), &[]);
+      return encode_binary_envelope(Vec::<CoverEnvelopeEntry>::new(), &[]);
    };
-   let mut meta = EnvelopeMeta::new();
-   meta.insert("format".into(), cover.format.label().into());
-   meta.insert("mimeType".into(), cover.mime_type.into());
-   meta.insert("offset".into(), 0.into());
-   meta.insert("length".into(), cover.data.len().into());
+   let entry = CoverEnvelopeEntry {
+      format: cover.format.label(),
+      mime_type: cover.mime_type,
+      offset: 0,
+      length: cover.data.len(),
+   };
    let payloads = [cover.data.as_slice()];
-   encode_binary_envelope(vec![meta], &payloads)
+   encode_binary_envelope(vec![entry], &payloads)
 }
 
-fn thumbnail_envelope_entry(frame: &Frame, offset: usize) -> EnvelopeMeta {
-   let mut meta = EnvelopeMeta::new();
-   meta.insert("trackId".into(), frame.track_id.into());
-   meta.insert("width".into(), frame.width.into());
-   meta.insert("height".into(), frame.height.into());
-   meta.insert("timestampSec".into(), frame.timestamp.as_secs_f64().into());
-   meta.insert("format".into(), frame.format.label().into());
-   meta.insert("mimeType".into(), frame.format.mime_type().into());
-   meta.insert("offset".into(), offset.into());
-   meta.insert("length".into(), frame.data.len().into());
-   meta
+fn thumbnail_envelope_entry(frame: &Frame, offset: usize) -> ThumbnailEnvelopeEntry {
+   ThumbnailEnvelopeEntry {
+      track_id: frame.track_id,
+      width: frame.width,
+      height: frame.height,
+      timestamp_sec: frame.timestamp.as_secs_f64(),
+      format: frame.format.label(),
+      mime_type: frame.format.mime_type(),
+      offset,
+      length: frame.data.len(),
+   }
 }
 
 /// Encodes one metadata entry per requested timestamp into the binary
@@ -78,12 +112,16 @@ pub(crate) fn encode_thumbnail_envelope(
    encode_binary_envelope(entries, &payloads)
 }
 
-fn encode_binary_envelope(entries: Vec<EnvelopeMeta>, payloads: &[&[u8]]) -> Result<Vec<u8>> {
+fn encode_binary_envelope<T: Serialize>(entries: Vec<T>, payloads: &[&[u8]]) -> Result<Vec<u8>> {
    let payload_len = payloads
       .iter()
       .try_fold(0usize, |total, payload| total.checked_add(payload.len()))
       .ok_or_else(|| crate::Error::Custom("envelope payload is too large".to_string()))?;
-   let header = serde_json::to_vec(&entries)
+   let header = EnvelopeHeader {
+      version: ENVELOPE_VERSION,
+      entries,
+   };
+   let header = serde_json::to_vec(&header)
       .map_err(|error| crate::Error::Custom(format!("could not encode envelope: {error}")))?;
    let header_len = u32::try_from(header.len())
       .map_err(|_| crate::Error::Custom("envelope header is too large".to_string()))?;
@@ -151,12 +189,15 @@ mod tests {
 
       assert_eq!(
          header,
-         serde_json::json!([{
-            "format": "jpeg",
-            "mimeType": "image/jpeg",
-            "offset": 0,
-            "length": 3,
-         }])
+         serde_json::json!({
+            "version": 1,
+            "entries": [{
+               "format": "jpeg",
+               "mimeType": "image/jpeg",
+               "offset": 0,
+               "length": 3,
+            }],
+         })
       );
       assert_eq!(payload, &[1, 2, 3]);
    }
@@ -166,7 +207,7 @@ mod tests {
       let envelope = cover_envelope(None).expect("empty cover should encode");
       let (header, payload) = envelope_parts(&envelope);
 
-      assert_eq!(header, serde_json::json!([]));
+      assert_eq!(header, serde_json::json!({ "version": 1, "entries": [] }));
       assert!(payload.is_empty());
    }
 
@@ -178,28 +219,31 @@ mod tests {
 
       assert_eq!(
          header,
-         serde_json::json!([
-            {
-               "trackId": 3,
-               "width": 320,
-               "height": 180,
-               "timestampSec": 0.25,
-               "format": "jpeg",
-               "mimeType": "image/jpeg",
-               "offset": 0,
-               "length": 3,
-            },
-            {
-               "trackId": 3,
-               "width": 640,
-               "height": 360,
-               "timestampSec": 1.0,
-               "format": "png",
-               "mimeType": "image/png",
-               "offset": 3,
-               "length": 2,
-            },
-         ])
+         serde_json::json!({
+            "version": 1,
+            "entries": [
+               {
+                  "trackId": 3,
+                  "width": 320,
+                  "height": 180,
+                  "timestampSec": 0.25,
+                  "format": "jpeg",
+                  "mimeType": "image/jpeg",
+                  "offset": 0,
+                  "length": 3,
+               },
+               {
+                  "trackId": 3,
+                  "width": 640,
+                  "height": 360,
+                  "timestampSec": 1.0,
+                  "format": "png",
+                  "mimeType": "image/png",
+                  "offset": 3,
+                  "length": 2,
+               },
+            ],
+         })
       );
       assert_eq!(payload, &[1, 2, 3, 4, 5]);
    }
@@ -210,7 +254,9 @@ mod tests {
          .expect("envelope should encode");
       let (header, payload) = envelope_parts(&envelope);
 
-      let entries = header.as_array().expect("header should be an array");
+      let entries = header["entries"]
+         .as_array()
+         .expect("header should carry an entries array");
       assert_eq!(entries.len(), 3);
       assert_eq!(entries[0]["offset"], entries[2]["offset"]);
       assert_eq!(entries[0]["length"], entries[2]["length"]);
