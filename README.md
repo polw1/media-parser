@@ -181,6 +181,50 @@ for (const track of tracks) {
 }
 ```
 
+### Video thumbnails
+
+`getThumbnails` extracts JPEG previews from H.264/AVC video tracks in
+MP4/M4V/MOV containers. Other video codecs and audio-only formats such as MP3
+do not have a thumbnail path.
+
+```typescript
+import { getThumbnails } from '@silvermine/tauri-plugin-media-parser';
+
+const thumbnails = await getThumbnails('/path/to/video.mp4', {
+   // Input timestamps are milliseconds.
+   timestamps: [0, 5_000, 10_000],
+   quality: 60,
+});
+
+for (const thumbnail of thumbnails) {
+   // Output timestamps are the returned frames' presentation times in seconds.
+   console.log(thumbnail.timestampSec, thumbnail.width, thumbnail.height);
+}
+```
+
+Fast mode is the default (`accurate: false`). It returns the preceding
+keyframe, so `timestampSec` can be earlier than the requested timestamp. Set
+`accurate: true` to decode the exact requested frame. Timestamps must be
+non-negative safe integers, and one request may contain at most 4,096 entries.
+
+All `data` fields returned by one call are subarray views into a shared binary
+IPC buffer. Retaining one thumbnail retains the complete response. Copy a view
+with `new Uint8Array(thumbnail.data)` when it must outlive the rest of the
+batch.
+
+The plugin caches up to eight parsed thumbnail sessions. Remote sessions expire
+after five minutes and local sessions after one minute; concurrent requests for
+the same cold source share one index build.
+
+H.264 decoding and JPEG encoding are prohibitively slow when their dependencies
+use Cargo's unoptimized development profile. Add this to the Tauri
+application's `src-tauri/Cargo.toml` for usable development performance:
+
+```toml
+[profile.dev.package."*"]
+opt-level = 2
+```
+
 ## Development Standards
 
 This project follows the

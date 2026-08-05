@@ -16,8 +16,18 @@ interface EnvelopeEntry {
 
 export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
    const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
+
+   if (buffer.byteLength < 4) {
+      throw new TypeError('Media envelope is missing the 4-byte header length.');
+   }
+
    const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
    const headerLength = view.getUint32(0, true);
+
+   if (headerLength > buffer.byteLength - 4) {
+      throw new TypeError('Media envelope JSON header is truncated.');
+   }
+
    const headerEnd = 4 + headerLength;
    const header = buffer.subarray(4, headerEnd);
 
@@ -28,10 +38,45 @@ export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: U
       throw new TypeError(`Unsupported media envelope version: ${String(version)}.`);
    }
 
-   return entries.map(({ offset, length, ...info }) => ({
-      ...info,
-      data: buffer.subarray(headerEnd + offset, headerEnd + offset + length),
-   })) as (T & { data: Uint8Array })[];
+   const payloadLength = buffer.byteLength - headerEnd;
+
+   return entries.map((entry) => decodeEnvelopeEntry(entry, buffer, headerEnd, payloadLength));
+}
+
+function decodeEnvelopeEntry<T>(
+   entry: T & EnvelopeEntry,
+   buffer: Uint8Array,
+   payloadStart: number,
+   payloadLength: number,
+): T & { data: Uint8Array } {
+   if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new TypeError('Media envelope entry must be an object.');
+   }
+
+   const offset = entry.offset;
+   const length = entry.length;
+
+   if (!Number.isSafeInteger(offset) || offset < 0 ||
+       !Number.isSafeInteger(length) || length < 0) {
+      throw new TypeError('Media envelope offset and length must be non-negative safe integers.');
+   }
+   if (offset > payloadLength || length > payloadLength - offset) {
+      throw new TypeError('Media envelope payload range is outside the envelope.');
+   }
+
+   const decoded: Record<string, unknown> = {};
+
+   Object.keys(entry).forEach((key) => {
+      if (key !== 'offset' && key !== 'length') {
+         decoded[key] = (entry as Record<string, unknown>)[key];
+      }
+   });
+   decoded.data = buffer.subarray(
+      payloadStart + offset,
+      payloadStart + offset + length,
+   );
+
+   return decoded as T & { data: Uint8Array };
 }
 
 function normalizeEnvelopeHeader<T>(

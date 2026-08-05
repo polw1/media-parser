@@ -75,3 +75,41 @@ test('rejects a version 1 header with a non-numeric version', () => {
 
    assert.throws(() => decodeEnvelope(envelope), /missing a numeric "version"/);
 });
+
+test('rejects an envelope shorter than its length prefix', () => {
+   assert.throws(
+      () => decodeEnvelope(new Uint8Array([1, 2, 3])),
+      /missing the 4-byte header length/,
+   );
+});
+
+test('rejects a truncated JSON header', () => {
+   const envelope = new Uint8Array(6);
+
+   new DataView(envelope.buffer).setUint32(0, 10, true);
+
+   assert.throws(() => decodeEnvelope(envelope), /JSON header is truncated/);
+});
+
+test('rejects a payload range outside the envelope', () => {
+   const envelope = buildEnvelope(
+      { version: 1, entries: [{ label: 'a', offset: 1, length: 3 }] },
+      [1, 2],
+   );
+
+   assert.throws(() => decodeEnvelope(envelope), /payload range is outside the envelope/);
+});
+
+test('rejects non-integer and negative payload ranges', () => {
+   const fractional = buildEnvelope(
+      { version: 1, entries: [{ label: 'a', offset: 0.5, length: 1 }] },
+      [1, 2],
+   );
+   const negative = buildEnvelope(
+      { version: 1, entries: [{ label: 'a', offset: 0, length: -1 }] },
+      [1, 2],
+   );
+
+   assert.throws(() => decodeEnvelope(fractional), /non-negative safe integers/);
+   assert.throws(() => decodeEnvelope(negative), /non-negative safe integers/);
+});

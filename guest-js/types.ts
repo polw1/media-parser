@@ -42,7 +42,10 @@ export interface MetadataOptions {
 export interface CoverInfo {
    format: 'jpeg' | 'png';
    mimeType: 'image/jpeg' | 'image/png';
-   /** Image bytes backed by the binary IPC response. */
+   /**
+    * Image bytes backed by the shared binary IPC response. Retaining this view
+    * retains the whole response; copy it with `new Uint8Array(data)` to detach.
+    */
    data: Uint8Array;
 }
 
@@ -58,7 +61,10 @@ export interface ThumbnailInfo {
    /** Always JPEG: decoded frames are encoded as JPEG by the Rust side. */
    format: 'jpeg';
    mimeType: 'image/jpeg';
-   /** Image bytes backed by the binary IPC response. */
+   /**
+    * Image bytes backed by the batch's shared binary IPC response. Retaining
+    * this view retains the whole batch; copy it to detach the thumbnail.
+    */
    data: Uint8Array;
 }
 
@@ -75,7 +81,10 @@ export interface ThumbnailsOptions extends MetadataOptions {
    timestamps: number[];
    /** Track id to extract from. Defaults to the first video track. */
    trackId?: number;
-   /** Decode the exact requested frames instead of preceding keyframes. */
+   /**
+    * Decode exact requested frames. Defaults to `false`, which returns the
+    * preceding keyframe and its actual presentation time.
+    */
    accurate?: boolean;
    /**
     * JPEG quality of the returned frames, from 1 to 100. Defaults to 60.

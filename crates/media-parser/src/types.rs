@@ -120,7 +120,7 @@ pub struct SubtitleTrack {
 }
 
 /// Supported frame payload formats.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PixelFormat {
    Yuv420p,
    Yuv422p,
@@ -158,7 +158,7 @@ impl PixelFormat {
 }
 
 /// Embedded cover artwork.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CoverArt {
    pub format: PixelFormat,
    pub mime_type: String,
@@ -167,7 +167,7 @@ pub struct CoverArt {
 }
 
 /// Preview image (Frame) extracted at a timestamp.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
    pub track_id: u32,
    pub width: u32,

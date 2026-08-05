@@ -24,6 +24,45 @@
 //! }
 //! ```
 //!
+//! ### Extract MP4/H.264 thumbnails
+//!
+//! [`ThumbnailIndex`](format::mp4::ThumbnailIndex) parses an MP4 video index
+//! once and can reuse it for multiple exact-frame or keyframe requests. Input
+//! timestamps are [`Duration`](std::time::Duration) values; each returned
+//! [`Frame`] reports the actual presentation time of the decoded frame.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use media_parser::{FileStreamReader, format::mp4::{ThumbnailIndex, ThumbnailOptions}};
+//!
+//! #[tokio::main]
+//! async fn main() -> media_parser::Result<()> {
+//!     let reader = FileStreamReader::new("video.mp4")?;
+//!     let index = ThumbnailIndex::read(&reader, 0).await?;
+//!     let timestamps = [Duration::ZERO, Duration::from_secs(5)];
+//!     let frames = index
+//!         .keyframes(&reader, &timestamps, ThumbnailOptions::default())
+//!         .await?;
+//!
+//!     for frame in frames {
+//!         println!("JPEG at {:?}: {} bytes", frame.timestamp, frame.data.len());
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Thumbnail extraction supports H.264/AVC video tracks in MP4-family
+//! containers. [`ThumbnailIndex::keyframes`](format::mp4::ThumbnailIndex::keyframes)
+//! returns preceding keyframes; use
+//! [`ThumbnailIndex::frames`](format::mp4::ThumbnailIndex::frames) for exact
+//! requested frames. For practical development performance, enable optimized
+//! dependencies in the consuming application's `Cargo.toml`:
+//!
+//! ```toml
+//! [profile.dev.package."*"]
+//! opt-level = 2
+//! ```
+//!
 //! ### Parse a remote file via HTTP
 //!
 //! ```no_run
@@ -51,6 +90,7 @@
 //! | [`MediaParser`] | High-level parser handle wrapping a stream reader |
 //! | [`FileStreamReader`] | Read from local filesystem |
 //! | [`HttpStreamReader`] | Read from HTTP/HTTPS URLs with range requests |
+//! | [`ThumbnailIndex`](format::mp4::ThumbnailIndex) | Reusable MP4/H.264 thumbnail index |
 //!
 //! ### Core Types
 //!

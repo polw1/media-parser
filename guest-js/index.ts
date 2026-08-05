@@ -99,12 +99,23 @@ export async function getCover(
 /**
  * Extract thumbnails for specific millisecond timestamps.
  *
- * Fast keyframe extraction is used by default. Set `accurate` to decode the
- * exact requested frames.
+ * Only MP4/M4V/MOV video tracks encoded as H.264/AVC are supported. MP3 files
+ * and video tracks using another codec are rejected by the backend.
+ *
+ * Fast keyframe extraction is used by default. It returns the preceding
+ * keyframe and reports that frame's actual presentation time in
+ * `timestampSec`, which may be earlier than the requested millisecond value.
+ * Set `accurate` to decode the exact requested frames.
+ *
+ * Every returned `data` value is a subarray of the same binary IPC response.
+ * Retaining one thumbnail therefore retains the complete response buffer; use
+ * `new Uint8Array(thumbnail.data)` when a small image must be retained alone.
+ * Parsed thumbnail sessions are cached with an eight-entry LRU: remote
+ * sessions expire after five minutes and local sessions after one minute.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Timestamps, optional track, accuracy, quality, and URL headers
- * @returns Thumbnails in the same order as the requested timestamps
+ * @returns Thumbnails in request order, with actual frame times in seconds
  * @throws TypeError if `timestamps` has more than 4,096 entries, is not an
  *    array of non-negative safe integers, or if `quality` is outside 1-100
  */
