@@ -17,6 +17,7 @@ use crate::session_cache::SessionCache;
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
 const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(60);
+const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -274,21 +275,8 @@ pub(crate) async fn get_thumbnails(
    headers: Option<HashMap<String, String>>,
    sessions: State<'_, ThumbnailSessions>,
 ) -> Result<tauri::ipc::Response> {
+   let (unique_timestamps, order) = prepare_thumbnail_timestamps(&timestamps)?;
    let options = thumbnail_options(quality)?;
-   let timestamps = thumbnail_durations(&timestamps);
-   // Extraction is deterministic per timestamp: dedup repeats so each unique
-   // frame is decoded and transferred only once.
-   let mut unique_timestamps = Vec::new();
-   let mut index_by_timestamp = HashMap::new();
-   let mut order = Vec::new();
-   for timestamp in timestamps {
-      let next_index = unique_timestamps.len();
-      let index = *index_by_timestamp.entry(timestamp).or_insert(next_index);
-      if index == next_index {
-         unique_timestamps.push(timestamp);
-      }
-      order.push(index);
-   }
    let frames = thumbnail_frames(
       &sessions,
       &source,
@@ -326,6 +314,40 @@ fn thumbnail_durations(timestamps_ms: &[u64]) -> Vec<Duration> {
       .copied()
       .map(Duration::from_millis)
       .collect()
+}
+
+/// Validates the requested output count before allocating converted or
+/// deduplicated collections, then preserves first-seen timestamp order.
+fn prepare_thumbnail_timestamps(timestamps_ms: &[u64]) -> Result<(Vec<Duration>, Vec<usize>)> {
+   if timestamps_ms.len() > MAX_THUMBNAIL_OUTPUTS {
+      return Err(crate::Error::Custom(format!(
+         "too many thumbnail timestamps: {}",
+         timestamps_ms.len()
+      )));
+   }
+
+   let mut unique_timestamps = Vec::new();
+   let mut index_by_timestamp = HashMap::new();
+   let mut order = Vec::new();
+   unique_timestamps
+      .try_reserve_exact(timestamps_ms.len())
+      .map_err(|_| crate::Error::Custom("too many thumbnail timestamps".to_string()))?;
+   index_by_timestamp
+      .try_reserve(timestamps_ms.len())
+      .map_err(|_| crate::Error::Custom("too many thumbnail timestamps".to_string()))?;
+   order
+      .try_reserve_exact(timestamps_ms.len())
+      .map_err(|_| crate::Error::Custom("too many thumbnail timestamps".to_string()))?;
+
+   for timestamp in thumbnail_durations(timestamps_ms) {
+      let next_index = unique_timestamps.len();
+      let index = *index_by_timestamp.entry(timestamp).or_insert(next_index);
+      if index == next_index {
+         unique_timestamps.push(timestamp);
+      }
+      order.push(index);
+   }
+   Ok((unique_timestamps, order))
 }
 
 #[derive(serde::Serialize, Clone, Debug)]
@@ -449,6 +471,38 @@ mod tests {
             std::time::Duration::from_secs(1),
          ]
       );
+   }
+
+   #[test]
+   fn prepares_unique_thumbnail_timestamps_and_request_order() {
+      let (timestamps, order) = prepare_thumbnail_timestamps(&[0, 250, 0])
+         .expect("three thumbnail outputs are within the limit");
+
+      assert_eq!(
+         timestamps,
+         vec![Duration::ZERO, Duration::from_millis(250)]
+      );
+      assert_eq!(order, vec![0, 1, 0]);
+   }
+
+   #[test]
+   fn thumbnail_request_count_is_checked_before_deduplication() {
+      let timestamps = vec![0; MAX_THUMBNAIL_OUTPUTS + 1];
+
+      let error = prepare_thumbnail_timestamps(&timestamps)
+         .expect_err("repeated timestamps still represent distinct outputs")
+         .to_string();
+
+      assert!(error.contains("too many thumbnail timestamps"));
+   }
+
+   #[test]
+   fn thumbnail_request_accepts_the_output_count_boundary() {
+      let timestamps = vec![0; MAX_THUMBNAIL_OUTPUTS];
+      let (_, order) = prepare_thumbnail_timestamps(&timestamps)
+         .expect("the documented output boundary should be accepted");
+
+      assert_eq!(order.len(), MAX_THUMBNAIL_OUTPUTS);
    }
 
    #[tokio::test]

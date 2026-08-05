@@ -68,8 +68,9 @@ export interface ThumbnailInfo {
 export interface ThumbnailsOptions extends MetadataOptions {
    /**
     * Timestamps to extract, in milliseconds. Each must be a non-negative
-    * safe integer; {@link getThumbnails} rejects anything else before the
-    * call reaches the backend.
+    * safe integer, and at most 4,096 entries may be requested at once;
+    * {@link getThumbnails} rejects anything else before the call reaches the
+    * backend.
     */
    timestamps: number[];
    /** Track id to extract from. Defaults to the first video track. */

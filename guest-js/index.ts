@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { decodeEnvelope } from './envelope';
+import { validateTimestamps } from './thumbnail-options';
 import type {
    CoverInfo,
    Metadata,
@@ -104,8 +105,8 @@ export async function getCover(
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Timestamps, optional track, accuracy, quality, and URL headers
  * @returns Thumbnails in the same order as the requested timestamps
- * @throws TypeError if `timestamps` is not an array of non-negative safe
- *    integers, or if `quality` is outside 1-100
+ * @throws TypeError if `timestamps` has more than 4,096 entries, is not an
+ *    array of non-negative safe integers, or if `quality` is outside 1-100
  */
 export async function getThumbnails(
    source: string,
@@ -124,27 +125,6 @@ export async function getThumbnails(
    });
 
    return decodeThumbnailEnvelope(raw);
-}
-
-/**
- * Rejects timestamps the backend cannot represent. They are deserialized into
- * a Rust `Vec<u64>`, so a negative, fractional, or non-finite value fails deep
- * inside the IPC layer with an opaque message; a value above
- * `Number.MAX_SAFE_INTEGER` would silently lose precision on the way there.
- */
-function validateTimestamps(timestamps: number[]): void {
-   if (!Array.isArray(timestamps)) {
-      throw new TypeError('Thumbnail timestamps must be an array of numbers.');
-   }
-
-   for (const timestamp of timestamps) {
-      if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
-         throw new TypeError(
-            `Invalid thumbnail timestamp: ${String(timestamp)}. ` +
-               'Timestamps must be non-negative integers, in milliseconds.',
-         );
-      }
-   }
 }
 
 /**
