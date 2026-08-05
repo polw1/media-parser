@@ -129,6 +129,7 @@ pub mod stream;
 pub mod types;
 
 // Public API
+pub use decoders::h264::JpegQuality;
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{

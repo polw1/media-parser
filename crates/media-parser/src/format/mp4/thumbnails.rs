@@ -8,7 +8,7 @@ use super::atoms::{
    stts_duration_ticks, table_entries, ticks_to_duration, validate_sample_tables,
 };
 use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
-use crate::decoders::h264::{AvcConfig, DecodedImage, decode_frames_to_jpeg};
+use crate::decoders::h264::{AvcConfig, DecodedImage, JpegQuality, decode_frames_to_jpeg};
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u32_be, read_u64_be};
 use crate::stream::StreamReader;
@@ -19,6 +19,17 @@ use std::time::Duration;
 
 const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
+
+/// Encoding options for extracted thumbnails.
+///
+/// A struct rather than positional parameters because more knobs are expected
+/// here (a target size, above all), and each one would otherwise have to be
+/// threaded through five public entry points.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ThumbnailOptions {
+   /// JPEG quality of the encoded frames. Defaults to [`JpegQuality::DEFAULT`].
+   pub quality: JpegQuality,
+}
 
 #[derive(Debug)]
 struct VideoTrack {
@@ -108,6 +119,7 @@ impl ThumbnailIndex {
       &self,
       reader: &dyn StreamReader,
       timestamps: &[Duration],
+      options: ThumbnailOptions,
    ) -> Result<Vec<Frame>> {
       self.validate_timestamps(timestamps)?;
       let mut targets = timestamps
@@ -176,8 +188,8 @@ impl ThumbnailIndex {
          });
       }
 
-      let images = run_decode_jobs(jobs).await?;
-      assemble_frames(&self.track, targets, &images)
+      let images = run_decode_jobs(jobs, options.quality).await?;
+      assemble_frames(&self.track, targets, images)
    }
 
    /// Extracts the nearest preceding keyframe for each timestamp.
@@ -185,6 +197,7 @@ impl ThumbnailIndex {
       &self,
       reader: &dyn StreamReader,
       timestamps: &[Duration],
+      options: ThumbnailOptions,
    ) -> Result<Vec<Frame>> {
       self.validate_timestamps(timestamps)?;
       let targets = timestamps
@@ -227,8 +240,8 @@ impl ThumbnailIndex {
          });
       }
 
-      let images = run_decode_jobs(jobs).await?;
-      assemble_frames(&self.track, targets, &images)
+      let images = run_decode_jobs(jobs, options.quality).await?;
+      assemble_frames(&self.track, targets, images)
    }
 
    fn validate_timestamps(&self, timestamps: &[Duration]) -> Result<()> {
@@ -253,7 +266,10 @@ impl ThumbnailIndex {
 
 /// Decodes every job with bounded concurrency, returning the selected images
 /// keyed by GOP and presentation-order position.
-async fn run_decode_jobs(jobs: Vec<DecodeJob>) -> Result<HashMap<(Gop, usize), DecodedImage>> {
+async fn run_decode_jobs(
+   jobs: Vec<DecodeJob>,
+   quality: JpegQuality,
+) -> Result<HashMap<(Gop, usize), DecodedImage>> {
    let decoded = stream::iter(jobs.into_iter().map(|job| async move {
       let DecodeJob {
          gop,
@@ -262,7 +278,7 @@ async fn run_decode_jobs(jobs: Vec<DecodeJob>) -> Result<HashMap<(Gop, usize), D
          output_indices,
       } = job;
       let decoded = tokio::task::spawn_blocking(move || {
-         decode_frames_to_jpeg(&avc_config, &samples, &output_indices)
+         decode_frames_to_jpeg(&avc_config, &samples, &output_indices, quality)
             .map(|images| (output_indices, images))
       })
       .await
@@ -288,29 +304,43 @@ async fn run_decode_jobs(jobs: Vec<DecodeJob>) -> Result<HashMap<(Gop, usize), D
 }
 
 /// Maps each target to its decoded image, preserving the request order.
+///
+/// Consumes `images`: JPEG payloads are megabytes each, so an image is cloned
+/// only while another target still needs it and moved out on its last use.
 fn assemble_frames(
    track: &VideoTrack,
    targets: Vec<ExactTarget>,
-   images: &HashMap<(Gop, usize), DecodedImage>,
+   mut images: HashMap<(Gop, usize), DecodedImage>,
 ) -> Result<Vec<Frame>> {
+   let mut pending = HashMap::new();
+   for target in &targets {
+      *pending
+         .entry((target.gop, target.output_index))
+         .or_insert(0) += 1usize;
+   }
+
    let mut frames = Vec::new();
    frames
       .try_reserve(targets.len())
       .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail timestamps".to_string()))?;
    for target in targets {
-      let image = images
-         .get(&(target.gop, target.output_index))
-         .ok_or_else(|| {
-            MediaParserError::InvalidFormat(format!(
-               "missing decoded thumbnail sample {}",
-               target.sample_index
-            ))
-         })?;
-      frames.push(frame_from_image(
-         track,
-         target.presentation_tick,
-         image.clone(),
-      ));
+      let key = (target.gop, target.output_index);
+      let remaining = pending.get_mut(&key).map_or(0, |count| {
+         *count -= 1;
+         *count
+      });
+      let image = if remaining == 0 {
+         images.remove(&key)
+      } else {
+         images.get(&key).cloned()
+      };
+      let image = image.ok_or_else(|| {
+         MediaParserError::InvalidFormat(format!(
+            "missing decoded thumbnail sample {}",
+            target.sample_index
+         ))
+      })?;
+      frames.push(frame_from_image(track, target.presentation_tick, image));
    }
    Ok(frames)
 }
@@ -319,8 +349,9 @@ pub async fn read_frame(
    reader: &dyn StreamReader,
    track_id: u32,
    timestamp: Duration,
+   options: ThumbnailOptions,
 ) -> Result<Frame> {
-   read_frames(reader, track_id, &[timestamp])
+   read_frames(reader, track_id, &[timestamp], options)
       .await?
       .into_iter()
       .next()
@@ -332,6 +363,7 @@ pub async fn read_frames(
    reader: &dyn StreamReader,
    track_id: u32,
    timestamps: &[Duration],
+   options: ThumbnailOptions,
 ) -> Result<Vec<Frame>> {
    if timestamps.is_empty() {
       return Ok(Vec::new());
@@ -339,7 +371,7 @@ pub async fn read_frames(
 
    ThumbnailIndex::read(reader, track_id)
       .await?
-      .frames(reader, timestamps)
+      .frames(reader, timestamps, options)
       .await
 }
 
@@ -348,13 +380,14 @@ pub async fn read_keyframes(
    reader: &dyn StreamReader,
    track_id: u32,
    timestamps: &[Duration],
+   options: ThumbnailOptions,
 ) -> Result<Vec<Frame>> {
    if timestamps.is_empty() {
       return Ok(Vec::new());
    }
    ThumbnailIndex::read(reader, track_id)
       .await?
-      .keyframes(reader, timestamps)
+      .keyframes(reader, timestamps, options)
       .await
 }
 
@@ -709,6 +742,90 @@ fn parse_elst_media_time(elst: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   fn test_track() -> VideoTrack {
+      VideoTrack {
+         id: 1,
+         timescale: 1_000,
+         duration: 10_000,
+         presentation_offset: 0,
+      }
+   }
+
+   fn test_image(byte: u8) -> DecodedImage {
+      DecodedImage {
+         width: 2,
+         height: 2,
+         data: vec![byte; 4],
+      }
+   }
+
+   fn test_target(gop_start: u32, output_index: usize, presentation_tick: u64) -> ExactTarget {
+      ExactTarget {
+         gop: Gop {
+            start_sample: gop_start,
+            end_sample: gop_start,
+         },
+         sample_index: gop_start,
+         presentation_tick,
+         output_index,
+      }
+   }
+
+   #[test]
+   fn assembles_one_frame_per_target_in_request_order() {
+      let targets = vec![test_target(5, 0, 200), test_target(0, 1, 100)];
+      let images = HashMap::from([
+         ((targets[0].gop, 0), test_image(0xaa)),
+         ((targets[1].gop, 1), test_image(0xbb)),
+      ]);
+
+      let frames = assemble_frames(&test_track(), targets, images).unwrap();
+
+      assert_eq!(frames.len(), 2);
+      assert_eq!(frames[0].data, vec![0xaa; 4]);
+      assert_eq!(frames[0].timestamp, Duration::from_millis(200));
+      assert_eq!(frames[1].data, vec![0xbb; 4]);
+      assert_eq!(frames[1].timestamp, Duration::from_millis(100));
+   }
+
+   #[test]
+   fn shares_one_image_across_targets_that_resolve_to_the_same_frame() {
+      // Distinct timestamps can land on the same decoded frame: every target
+      // still gets its own payload, and only the last use moves the image.
+      let targets = vec![
+         test_target(0, 0, 100),
+         test_target(0, 0, 140),
+         test_target(0, 0, 180),
+      ];
+      let images = HashMap::from([((targets[0].gop, 0), test_image(0xcc))]);
+
+      let frames = assemble_frames(&test_track(), targets, images).unwrap();
+
+      assert_eq!(frames.len(), 3);
+      assert!(frames.iter().all(|frame| frame.data == vec![0xcc; 4]));
+      assert_eq!(
+         frames
+            .iter()
+            .map(|frame| frame.timestamp)
+            .collect::<Vec<_>>(),
+         vec![
+            Duration::from_millis(100),
+            Duration::from_millis(140),
+            Duration::from_millis(180),
+         ]
+      );
+   }
+
+   #[test]
+   fn errors_when_a_target_has_no_decoded_image() {
+      let targets = vec![test_target(7, 0, 100)];
+
+      let error = assemble_frames(&test_track(), targets, HashMap::new())
+         .expect_err("a target without a decoded image must not be silently dropped");
+
+      assert!(matches!(error, MediaParserError::InvalidFormat(_)));
+   }
 
    #[test]
    fn uses_the_stsc_selected_sample_description() {

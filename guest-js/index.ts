@@ -101,22 +101,67 @@ export async function getCover(
  * exact requested frames.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
- * @param options - Timestamps, optional track, accuracy, and URL headers
+ * @param options - Timestamps, optional track, accuracy, quality, and URL headers
  * @returns Thumbnails in the same order as the requested timestamps
+ * @throws TypeError if `timestamps` is not an array of non-negative safe
+ *    integers, or if `quality` is outside 1-100
  */
 export async function getThumbnails(
    source: string,
    options: ThumbnailsOptions,
 ): Promise<ThumbnailInfo[]> {
+   validateTimestamps(options.timestamps);
+   validateQuality(options.quality);
+
    const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_thumbnails', {
       source,
       timestamps: options.timestamps,
       trackId: options.trackId,
       accurate: options.accurate,
+      quality: options.quality,
       headers: options.headers,
    });
 
    return decodeThumbnailEnvelope(raw);
+}
+
+/**
+ * Rejects timestamps the backend cannot represent. They are deserialized into
+ * a Rust `Vec<u64>`, so a negative, fractional, or non-finite value fails deep
+ * inside the IPC layer with an opaque message; a value above
+ * `Number.MAX_SAFE_INTEGER` would silently lose precision on the way there.
+ */
+function validateTimestamps(timestamps: number[]): void {
+   if (!Array.isArray(timestamps)) {
+      throw new TypeError('Thumbnail timestamps must be an array of numbers.');
+   }
+
+   for (const timestamp of timestamps) {
+      if (!Number.isSafeInteger(timestamp) || timestamp < 0) {
+         throw new TypeError(
+            `Invalid thumbnail timestamp: ${String(timestamp)}. ` +
+               'Timestamps must be non-negative integers, in milliseconds.',
+         );
+      }
+   }
+}
+
+/**
+ * Rejects a quality the JPEG encoder cannot use. The Rust side validates this
+ * too, since it is reachable from other callers; checking here turns it into a
+ * local `TypeError` instead of a round trip.
+ */
+function validateQuality(quality: number | undefined): void {
+   if (quality === undefined) {
+      return;
+   }
+
+   if (!Number.isInteger(quality) || quality < 1 || quality > 100) {
+      throw new TypeError(
+         `Invalid thumbnail quality: ${String(quality)}. ` +
+            'Quality must be an integer between 1 and 100.',
+      );
+   }
 }
 
 function decodeThumbnailEnvelope(raw: ArrayBuffer | Uint8Array): ThumbnailInfo[] {

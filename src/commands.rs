@@ -5,8 +5,9 @@ use tauri::{State, command};
 use url::Url;
 
 use media_parser::{
-   BaseTrackMeta, CoverArt, FileStreamReader, Frame, HttpStreamReader, MediaParser, Metadata,
-   StreamReader, TrackType, format::mp4::ThumbnailIndex,
+   BaseTrackMeta, CoverArt, FileStreamReader, Frame, HttpStreamReader, JpegQuality, MediaParser,
+   Metadata, StreamReader, TrackType,
+   format::mp4::{ThumbnailIndex, ThumbnailOptions},
 };
 
 use crate::Result;
@@ -198,6 +199,7 @@ async fn thumbnail_frames(
    track_id: u32,
    accurate: bool,
    headers: Option<&HashMap<String, String>>,
+   options: ThumbnailOptions,
 ) -> Result<Vec<Frame>> {
    if timestamps.is_empty() {
       return Ok(Vec::new());
@@ -206,13 +208,13 @@ async fn thumbnail_frames(
    if accurate {
       session
          .index
-         .frames(session.reader.as_ref(), timestamps)
+         .frames(session.reader.as_ref(), timestamps, options)
          .await
          .map_err(Into::into)
    } else {
       session
          .index
-         .keyframes(session.reader.as_ref(), timestamps)
+         .keyframes(session.reader.as_ref(), timestamps, options)
          .await
          .map_err(Into::into)
    }
@@ -275,9 +277,11 @@ pub(crate) async fn get_thumbnails(
    timestamps: Vec<u64>,
    track_id: Option<u32>,
    accurate: Option<bool>,
+   quality: Option<u8>,
    headers: Option<HashMap<String, String>>,
    sessions: State<'_, ThumbnailSessions>,
 ) -> Result<tauri::ipc::Response> {
+   let options = thumbnail_options(quality)?;
    let timestamps = thumbnail_durations(&timestamps);
    // Extraction is deterministic per timestamp: dedup repeats so each unique
    // frame is decoded and transferred only once.
@@ -299,6 +303,7 @@ pub(crate) async fn get_thumbnails(
       track_id.unwrap_or(0),
       accurate.unwrap_or(false),
       headers.as_ref(),
+      options,
    )
    .await?;
    Ok(tauri::ipc::Response::new(encode_thumbnail_envelope(
@@ -306,6 +311,20 @@ pub(crate) async fn get_thumbnails(
       &order,
       MAX_THUMBNAIL_OUTPUT_BYTES,
    )?))
+}
+
+/// Validates the caller-supplied JPEG quality, if any, against the encoder's
+/// 1-100 range. `None` keeps the thumbnail-grade default.
+fn thumbnail_options(quality: Option<u8>) -> Result<ThumbnailOptions> {
+   let Some(quality) = quality else {
+      return Ok(ThumbnailOptions::default());
+   };
+   let quality = JpegQuality::new(quality).ok_or_else(|| {
+      crate::Error::Custom(format!(
+         "thumbnail quality must be between 1 and 100, got {quality}"
+      ))
+   })?;
+   Ok(ThumbnailOptions { quality })
 }
 
 fn thumbnail_durations(timestamps_ms: &[u64]) -> Vec<Duration> {
@@ -554,6 +573,36 @@ mod tests {
    }
 
    #[test]
+   fn omitted_thumbnail_quality_keeps_the_default() {
+      assert_eq!(
+         thumbnail_options(None).expect("no quality is valid"),
+         ThumbnailOptions::default()
+      );
+   }
+
+   #[test]
+   fn thumbnail_quality_is_rejected_outside_the_encoder_range() {
+      assert_eq!(
+         thumbnail_options(Some(80))
+            .expect("80 is in range")
+            .quality
+            .get(),
+         80
+      );
+
+      for quality in [0u8, 101, 255] {
+         let error = thumbnail_options(Some(quality))
+            .expect_err("quality outside 1-100 must not reach the encoder")
+            .to_string();
+
+         assert!(
+            error.contains("between 1 and 100"),
+            "unexpected error for quality {quality}: {error}"
+         );
+      }
+   }
+
+   #[test]
    fn thumbnail_durations_use_milliseconds() {
       assert_eq!(
          thumbnail_durations(&[0, 250, 1_000]),
@@ -728,6 +777,7 @@ mod tests {
          0,
          true,
          None,
+         ThumbnailOptions::default(),
       )
       .await
       .expect("accurate thumbnail should decode");
@@ -746,6 +796,7 @@ mod tests {
          0,
          false,
          None,
+         ThumbnailOptions::default(),
       )
       .await
       .expect("fast thumbnail should decode");
@@ -779,6 +830,7 @@ mod tests {
          0,
          false,
          None,
+         ThumbnailOptions::default(),
       )
       .await
       .expect("empty thumbnail request should not need a source");

@@ -1,8 +1,8 @@
 //! Integration tests for MP4 metadata extraction.
 
 use media_parser::{
-   FileStreamReader, MediaParser, PixelFormat, StreamReader, TrackType,
-   format::mp4::{ThumbnailIndex, read_frames},
+   FileStreamReader, JpegQuality, MediaParser, PixelFormat, StreamReader, TrackType,
+   format::mp4::{ThumbnailIndex, ThumbnailOptions, read_frames},
 };
 use std::io::Write;
 use std::path::PathBuf;
@@ -138,7 +138,7 @@ async fn test_mp4_h264_thumbnail_extraction() {
    let path = fixtures_dir().join("multitrack_video.mp4");
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
 
-   let frames = read_frames(&reader, 0, &[Duration::ZERO])
+   let frames = read_frames(&reader, 0, &[Duration::ZERO], ThumbnailOptions::default())
       .await
       .expect("extract thumbnail");
 
@@ -151,6 +151,35 @@ async fn test_mp4_h264_thumbnail_extraction() {
 }
 
 #[tokio::test]
+async fn test_mp4_thumbnail_quality_reaches_the_jpeg_encoder() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let low = ThumbnailOptions {
+      quality: JpegQuality::new(10).expect("10 is in range"),
+   };
+   let high = ThumbnailOptions {
+      quality: JpegQuality::new(95).expect("95 is in range"),
+   };
+
+   let low_frames = read_frames(&reader, 0, &[Duration::ZERO], low)
+      .await
+      .expect("extract low-quality thumbnail");
+   let high_frames = read_frames(&reader, 0, &[Duration::ZERO], high)
+      .await
+      .expect("extract high-quality thumbnail");
+
+   assert!(
+      low_frames[0].data.len() < high_frames[0].data.len(),
+      "q10 produced {} bytes, q95 produced {} bytes",
+      low_frames[0].data.len(),
+      high_frames[0].data.len()
+   );
+   assert_eq!(low_frames[0].format, PixelFormat::Jpeg);
+   assert_eq!(high_frames[0].format, PixelFormat::Jpeg);
+   assert_eq!(low_frames[0].width, high_frames[0].width);
+}
+
+#[tokio::test]
 async fn test_mp4_h264_thumbnails_follow_presentation_order() {
    let path = fixtures_dir().join("multitrack_video.mp4");
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
@@ -160,7 +189,7 @@ async fn test_mp4_h264_thumbnails_follow_presentation_order() {
       Duration::from_millis(200),
    ];
 
-   let frames = read_frames(&reader, 0, &timestamps)
+   let frames = read_frames(&reader, 0, &timestamps, ThumbnailOptions::default())
       .await
       .expect("extract presentation-ordered thumbnails");
 
@@ -196,7 +225,7 @@ async fn test_mp4_h264_thumbnails_follow_presentation_order_with_deep_b_frames()
       .map(|index| Duration::from_millis(index * 100))
       .collect::<Vec<_>>();
 
-   let frames = read_frames(&reader, 0, &timestamps)
+   let frames = read_frames(&reader, 0, &timestamps, ThumbnailOptions::default())
       .await
       .expect("extract reordered thumbnails");
 
@@ -238,7 +267,11 @@ async fn test_mp4_thumbnail_index_can_be_reused_with_another_reader() {
 
    let next_reader = FileStreamReader::new(&path).expect("reopen MP4 fixture");
    let frames = index
-      .frames(&next_reader, &[Duration::from_millis(100)])
+      .frames(
+         &next_reader,
+         &[Duration::from_millis(100)],
+         ThumbnailOptions::default(),
+      )
       .await
       .expect("extract frame with cached index");
 
@@ -255,7 +288,11 @@ async fn test_mp4_fast_thumbnail_reports_the_keyframe_pts() {
       .expect("build thumbnail index");
 
    let frames = index
-      .keyframes(&reader, &[Duration::from_millis(200)])
+      .keyframes(
+         &reader,
+         &[Duration::from_millis(200)],
+         ThumbnailOptions::default(),
+      )
       .await
       .expect("extract keyframe");
 
@@ -280,6 +317,7 @@ async fn test_mp4_fast_thumbnails_read_each_keyframe_once() {
             Duration::from_millis(100),
             Duration::from_millis(200),
          ],
+         ThumbnailOptions::default(),
       )
       .await
       .expect("extract keyframes");
@@ -305,6 +343,7 @@ async fn test_mp4_exact_thumbnails_read_a_shared_gop_once() {
             Duration::from_millis(100),
             Duration::from_millis(200),
          ],
+         ThumbnailOptions::default(),
       )
       .await
       .expect("extract exact frames");
@@ -326,7 +365,11 @@ async fn test_mp4_exact_thumbnails_truncate_the_gop_at_the_last_target() {
    // (or read) the whole GOP.
    reader.reset();
    let partial = index
-      .frames(&reader, &[Duration::ZERO, Duration::from_millis(100)])
+      .frames(
+         &reader,
+         &[Duration::ZERO, Duration::from_millis(100)],
+         ThumbnailOptions::default(),
+      )
       .await
       .expect("extract early frames");
    let partial_bytes = reader.read_bytes();
@@ -336,7 +379,7 @@ async fn test_mp4_exact_thumbnails_truncate_the_gop_at_the_last_target() {
       .map(|index| Duration::from_millis(index * 100))
       .collect::<Vec<_>>();
    let full = index
-      .frames(&reader, &full_timestamps)
+      .frames(&reader, &full_timestamps, ThumbnailOptions::default())
       .await
       .expect("extract all frames");
    let full_bytes = reader.read_bytes();
@@ -367,7 +410,7 @@ async fn test_mp4_thumbnail_batch_rejects_too_many_outputs() {
    let timestamps = vec![Duration::ZERO; 4_097];
 
    let error = index
-      .keyframes(&reader, &timestamps)
+      .keyframes(&reader, &timestamps, ThumbnailOptions::default())
       .await
       .expect_err("an unbounded output batch must be rejected");
 
@@ -382,9 +425,14 @@ async fn test_mp4_frames_rejects_any_timestamp_outside_track_duration() {
    let path = fixtures_dir().join("multitrack_video.mp4");
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
 
-   let error = read_frames(&reader, 0, &[Duration::ZERO, Duration::from_secs(10)])
-      .await
-      .expect_err("mixed valid and invalid timestamps must not change cardinality");
+   let error = read_frames(
+      &reader,
+      0,
+      &[Duration::ZERO, Duration::from_secs(10)],
+      ThumbnailOptions::default(),
+   )
+   .await
+   .expect_err("mixed valid and invalid timestamps must not change cardinality");
 
    assert!(matches!(
       error,
@@ -447,7 +495,7 @@ async fn test_mp4_thumbnail_rejects_non_h264_video() {
    file.flush().expect("flush temp mp4");
 
    let reader = FileStreamReader::new(file.path()).expect("open temp mp4");
-   let error = read_frames(&reader, 0, &[Duration::ZERO])
+   let error = read_frames(&reader, 0, &[Duration::ZERO], ThumbnailOptions::default())
       .await
       .expect_err("non-H.264 video should not produce a thumbnail");
 

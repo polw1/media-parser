@@ -53,9 +53,11 @@ export interface ThumbnailInfo {
    trackId: number;
    width: number;
    height: number;
+   /** Presentation time of the returned frame, in seconds. */
    timestampSec: number;
-   format: string;
-   mimeType: string;
+   /** Always JPEG: decoded frames are encoded as JPEG by the Rust side. */
+   format: 'jpeg';
+   mimeType: 'image/jpeg';
    /** Image bytes backed by the binary IPC response. */
    data: Uint8Array;
 }
@@ -64,12 +66,25 @@ export interface ThumbnailInfo {
  * Options for extracting thumbnails.
  */
 export interface ThumbnailsOptions extends MetadataOptions {
-   /** Timestamps to extract, in milliseconds. */
+   /**
+    * Timestamps to extract, in milliseconds. Each must be a non-negative
+    * safe integer; {@link getThumbnails} rejects anything else before the
+    * call reaches the backend.
+    */
    timestamps: number[];
    /** Track id to extract from. Defaults to the first video track. */
    trackId?: number;
    /** Decode the exact requested frames instead of preceding keyframes. */
    accurate?: boolean;
+   /**
+    * JPEG quality of the returned frames, from 1 to 100. Defaults to 60.
+    *
+    * This trades size, not time: a 1080p frame costs about the same to encode
+    * at 40 as at 85, while the output grows roughly 4×. Note that the encoder
+    * drops to 4:2:0 chroma subsampling below 90, so 89 → 90 is a step rather
+    * than a smooth increase.
+    */
+   quality?: number;
 }
 
 // ============================================================================
