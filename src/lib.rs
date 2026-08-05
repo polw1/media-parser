@@ -47,7 +47,9 @@
 use tauri::{Manager, Runtime, plugin::TauriPlugin};
 
 mod commands;
+mod envelope;
 mod error;
+mod session_cache;
 
 pub use error::{Error, Result};
 
