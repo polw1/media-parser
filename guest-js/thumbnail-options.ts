@@ -1,4 +1,22 @@
 export const MAX_THUMBNAIL_OUTPUTS = 4_096;
+const MAX_JPEG_DIMENSION = 65_535;
+
+/** Rejects dimensions the JPEG encoder cannot represent. */
+export function validateThumbnailDimensions(
+   maxWidth: number | undefined,
+   maxHeight: number | undefined,
+): void {
+   for (const dimension of [maxWidth, maxHeight]) {
+      if (
+         dimension !== undefined &&
+         (!Number.isInteger(dimension) || dimension < 1 || dimension > MAX_JPEG_DIMENSION)
+      ) {
+         throw new TypeError(
+            'Thumbnail dimensions must be integers between 1 and 65535.',
+         );
+      }
+   }
+}
 
 /** Rejects thumbnail requests the backend cannot represent or safely bound. */
 export function validateTimestamps(timestamps: number[]): void {

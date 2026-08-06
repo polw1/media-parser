@@ -5,6 +5,8 @@ use super::{Mp4Nav, iter_boxes};
 use crate::decoders::h264::AvcConfig;
 use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
 
+const SAMPLE_SIZE_PREFIX_INTERVAL: usize = 256;
+
 #[derive(Debug, Clone, Copy)]
 pub struct StscEntry {
    pub first_chunk: u32,
@@ -17,6 +19,81 @@ pub struct SampleSizes {
    pub fixed_size: u32,
    pub sizes: Vec<u32>,
    pub sample_count: u32,
+   size_prefixes: Vec<u64>,
+}
+
+impl SampleSizes {
+   #[cfg(test)]
+   pub(crate) fn fixed(sample_count: u32, fixed_size: u32) -> Option<Self> {
+      (fixed_size != 0).then_some(Self {
+         fixed_size,
+         sizes: Vec::new(),
+         sample_count,
+         size_prefixes: Vec::new(),
+      })
+   }
+
+   #[cfg(test)]
+   pub(crate) fn variable(sizes: Vec<u32>) -> Option<Self> {
+      let sample_count = u32::try_from(sizes.len()).ok()?;
+      Self::from_parts(0, sizes, sample_count)
+   }
+
+   fn from_parts(fixed_size: u32, sizes: Vec<u32>, sample_count: u32) -> Option<Self> {
+      if fixed_size != 0 {
+         return sizes.is_empty().then_some(Self {
+            fixed_size,
+            sizes,
+            sample_count,
+            size_prefixes: Vec::new(),
+         });
+      }
+      if usize::try_from(sample_count).ok()? != sizes.len() {
+         return None;
+      }
+
+      let mut size_prefixes = Vec::new();
+      size_prefixes
+         .try_reserve(sizes.len().div_ceil(SAMPLE_SIZE_PREFIX_INTERVAL))
+         .ok()?;
+      let mut total = 0u64;
+      for (index, size) in sizes.iter().copied().enumerate() {
+         if index % SAMPLE_SIZE_PREFIX_INTERVAL == 0 {
+            size_prefixes.push(total);
+         }
+         total = total.checked_add(u64::from(size))?;
+      }
+      Some(Self {
+         fixed_size,
+         sizes,
+         sample_count,
+         size_prefixes,
+      })
+   }
+
+   /// Bytes occupied by samples preceding `sample_index` (1-based), plus the
+   /// number of raw variable-size entries examined after the nearest prefix.
+   fn byte_offset_before(&self, sample_index: u32) -> Option<(u64, usize)> {
+      if sample_index == 0 || sample_index > self.sample_count {
+         return None;
+      }
+      let preceding = usize::try_from(sample_index - 1).ok()?;
+      if self.fixed_size != 0 {
+         return Some((
+            u64::from(self.fixed_size).checked_mul(u64::try_from(preceding).ok()?)?,
+            0,
+         ));
+      }
+
+      let block = preceding / SAMPLE_SIZE_PREFIX_INTERVAL;
+      let block_start = block.checked_mul(SAMPLE_SIZE_PREFIX_INTERVAL)?;
+      let mut offset = *self.size_prefixes.get(block)?;
+      let remainder = self.sizes.get(block_start..preceding)?;
+      for size in remainder {
+         offset = offset.checked_add(u64::from(*size))?;
+      }
+      Some((offset, remainder.len()))
+   }
 }
 
 /// Reads the entry count of a full-box table (8-byte header of version/flags
@@ -83,11 +160,7 @@ pub fn parse_sample_sizes(stsz: &[u8]) -> Option<SampleSizes> {
       }
    }
 
-   Some(SampleSizes {
-      fixed_size,
-      sizes,
-      sample_count,
-   })
+   SampleSizes::from_parts(fixed_size, sizes, sample_count)
 }
 
 pub fn parse_stsc(stsc: &[u8]) -> Option<Vec<StscEntry>> {
@@ -342,10 +415,9 @@ pub struct SampleLocator<'a> {
    chunk_offsets: &'a [u64],
    runs: StscRuns<'a>,
    run: StscRun,
-   chunk_number: u32,
    next_sample: u32,
-   next_offset: u64,
-   samples_left_in_chunk: u32,
+   #[cfg(test)]
+   size_entries_examined: usize,
 }
 
 impl<'a> SampleLocator<'a> {
@@ -364,10 +436,9 @@ impl<'a> SampleLocator<'a> {
          chunk_offsets,
          runs,
          run,
-         chunk_number: run.first_chunk,
          next_sample: 1,
-         next_offset: *chunk_offsets.first()?,
-         samples_left_in_chunk: run.samples_per_chunk,
+         #[cfg(test)]
+         size_entries_examined: 0,
       })
    }
 
@@ -379,30 +450,38 @@ impl<'a> SampleLocator<'a> {
       {
          return None;
       }
-      while self.next_sample < sample_index {
-         let size = sample_size(self.next_sample, self.sizes)?;
-         self.next_offset = self.next_offset.checked_add(u64::from(size))?;
-         self.next_sample = self.next_sample.checked_add(1)?;
-         self.samples_left_in_chunk -= 1;
-         if self.samples_left_in_chunk == 0 && self.next_sample <= sample_index {
-            self.move_to_next_chunk()?;
-         }
-      }
-      Some(self.next_offset)
-   }
-
-   fn move_to_next_chunk(&mut self) -> Option<()> {
-      self.chunk_number = self.chunk_number.checked_add(1)?;
-      let run_chunks = self.run.sample_count / self.run.samples_per_chunk;
-      if self.chunk_number >= self.run.first_chunk.checked_add(run_chunks)? {
+      let target = sample_index - 1;
+      while target
+         >= self
+            .run
+            .first_sample_index
+            .checked_add(self.run.sample_count)?
+      {
          self.run = self.runs.next()?;
-         self.chunk_number = self.run.first_chunk;
       }
-      self.next_offset = *self
+      let sample_in_run = target.checked_sub(self.run.first_sample_index)?;
+      let chunk_in_run = sample_in_run / self.run.samples_per_chunk;
+      let chunk_number = self.run.first_chunk.checked_add(chunk_in_run)?;
+      let chunk_offset = *self
          .chunk_offsets
-         .get(usize::try_from(self.chunk_number.checked_sub(1)?).ok()?)?;
-      self.samples_left_in_chunk = self.run.samples_per_chunk;
-      Some(())
+         .get(usize::try_from(chunk_number.checked_sub(1)?).ok()?)?;
+      let chunk_first_sample = self
+         .run
+         .first_sample_index
+         .checked_add(chunk_in_run.checked_mul(self.run.samples_per_chunk)?)?
+         .checked_add(1)?;
+      let (sample_prefix, sample_steps) = self.sizes.byte_offset_before(sample_index)?;
+      let (chunk_prefix, chunk_steps) = self.sizes.byte_offset_before(chunk_first_sample)?;
+      #[cfg(test)]
+      {
+         self.size_entries_examined = self
+            .size_entries_examined
+            .checked_add(sample_steps.checked_add(chunk_steps)?)?;
+      }
+      #[cfg(not(test))]
+      let _ = (sample_steps, chunk_steps);
+      self.next_sample = sample_index;
+      chunk_offset.checked_add(sample_prefix.checked_sub(chunk_prefix)?)
    }
 }
 
@@ -477,11 +556,7 @@ mod tests {
    fn two_run_tables() -> (SampleSizes, Vec<StscEntry>, Vec<u64>) {
       // chunks 1-2 use description 1 (2 samples each), chunks 3-4 use
       // description 2 (1 sample each); sample sizes vary per sample.
-      let sizes = SampleSizes {
-         fixed_size: 0,
-         sizes: vec![10, 20, 30, 40, 50, 60],
-         sample_count: 6,
-      };
+      let sizes = SampleSizes::variable(vec![10, 20, 30, 40, 50, 60]).unwrap();
       let stsc = vec![
          StscEntry {
             first_chunk: 1,
@@ -560,6 +635,48 @@ mod tests {
    }
 
    #[test]
+   fn sample_locator_does_not_scan_every_size_before_a_sparse_query() {
+      let sample_count = 10_000;
+      let sizes = SampleSizes::variable(vec![1; sample_count as usize]).unwrap();
+      let stsc = [StscEntry {
+         first_chunk: 1,
+         samples_per_chunk: sample_count,
+         sample_description_index: 1,
+      }];
+      let chunk_offsets = [100];
+      let mut locator = SampleLocator::new(&sizes, &stsc, &chunk_offsets).unwrap();
+
+      assert_eq!(locator.file_offset(sample_count), Some(10_099));
+      assert!(
+         locator.size_entries_examined <= 512,
+         "sparse lookup examined {} preceding sizes",
+         locator.size_entries_examined
+      );
+   }
+
+   #[test]
+   fn sample_locator_bounds_both_sparse_prefix_tails() {
+      let sizes = SampleSizes::variable(vec![1; 768]).unwrap();
+      let stsc = [
+         StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 255,
+            sample_description_index: 1,
+         },
+         StscEntry {
+            first_chunk: 2,
+            samples_per_chunk: 513,
+            sample_description_index: 1,
+         },
+      ];
+      let chunk_offsets = [100, 1_000];
+      let mut locator = SampleLocator::new(&sizes, &stsc, &chunk_offsets).unwrap();
+
+      assert_eq!(locator.file_offset(768), Some(1_512));
+      assert_eq!(locator.size_entries_examined, 510);
+   }
+
+   #[test]
    fn preserves_stsc_sample_description_index() {
       let mut stsc = vec![0; 8];
       stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
@@ -574,11 +691,7 @@ mod tests {
 
    #[test]
    fn locates_samples_without_iterating_every_prior_chunk() {
-      let sizes = SampleSizes {
-         fixed_size: 4,
-         sizes: Vec::new(),
-         sample_count: 1_000_000_000,
-      };
+      let sizes = SampleSizes::fixed(1_000_000_000, 4).unwrap();
       let stsc = [StscEntry {
          first_chunk: 1,
          samples_per_chunk: 1_000_000_000,
@@ -602,11 +715,7 @@ mod tests {
       stts[4..8].copy_from_slice(&1u32.to_be_bytes());
       stts.extend_from_slice(&1u32.to_be_bytes());
       stts.extend_from_slice(&1u32.to_be_bytes());
-      let sizes = SampleSizes {
-         fixed_size: 1,
-         sizes: Vec::new(),
-         sample_count: 1,
-      };
+      let sizes = SampleSizes::fixed(1, 1).unwrap();
       let stsc = [
          StscEntry {
             first_chunk: 1,

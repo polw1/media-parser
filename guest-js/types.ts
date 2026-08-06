@@ -95,6 +95,14 @@ export interface ThumbnailsOptions extends MetadataOptions {
     * than a smooth increase.
     */
    quality?: number;
+   /**
+    * Maximum JPEG width. Together with `maxHeight`, forms an
+    * aspect-ratio-preserving bounding box. The default box is 320×320;
+    * specifying only one dimension leaves the other unconstrained.
+    */
+   maxWidth?: number;
+   /** Maximum JPEG height; see `maxWidth`. */
+   maxHeight?: number;
 }
 
 // ============================================================================

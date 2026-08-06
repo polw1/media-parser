@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { decodeEnvelope } from './envelope';
-import { validateTimestamps } from './thumbnail-options';
+import { validateThumbnailDimensions, validateTimestamps } from './thumbnail-options';
 import type {
    CoverInfo,
    Metadata,
@@ -114,10 +114,11 @@ export async function getCover(
  * sessions expire after five minutes and local sessions after one minute.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
- * @param options - Timestamps, optional track, accuracy, quality, and URL headers
+ * @param options - Timestamps, optional track, accuracy, JPEG bounds/quality, and URL headers
  * @returns Thumbnails in request order, with actual frame times in seconds
  * @throws TypeError if `timestamps` has more than 4,096 entries, is not an
- *    array of non-negative safe integers, or if `quality` is outside 1-100
+ *    array of non-negative safe integers, if `quality` is outside 1-100, or
+ *    if a thumbnail dimension is outside 1-65535
  */
 export async function getThumbnails(
    source: string,
@@ -125,6 +126,7 @@ export async function getThumbnails(
 ): Promise<ThumbnailInfo[]> {
    validateTimestamps(options.timestamps);
    validateQuality(options.quality);
+   validateThumbnailDimensions(options.maxWidth, options.maxHeight);
 
    const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_thumbnails', {
       source,
@@ -132,6 +134,8 @@ export async function getThumbnails(
       trackId: options.trackId,
       accurate: options.accurate,
       quality: options.quality,
+      maxWidth: options.maxWidth,
+      maxHeight: options.maxHeight,
       headers: options.headers,
    });
 

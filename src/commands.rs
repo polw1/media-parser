@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tauri::{State, command};
@@ -7,7 +8,7 @@ use url::Url;
 use media_parser::{
    BaseTrackMeta, FileStreamReader, Frame, HttpStreamReader, JpegQuality, MediaParser, Metadata,
    StreamReader, TrackType,
-   format::mp4::{MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions},
+   format::mp4::{MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions, ThumbnailSize},
 };
 
 use crate::Result;
@@ -17,6 +18,7 @@ use crate::session_cache::SessionCache;
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
 const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(60);
+const SESSION_CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -38,15 +40,52 @@ struct ThumbnailSession {
    index: Arc<ThumbnailIndex>,
 }
 
+#[derive(Default)]
+struct SessionCacheReaper {
+   started: AtomicBool,
+}
+
+impl SessionCacheReaper {
+   fn start<K, V>(&self, cache: Arc<Mutex<SessionCache<K, V>>>, interval: Duration) -> bool
+   where
+      K: PartialEq + Send + 'static,
+      V: Clone + Send + 'static,
+   {
+      if self
+         .started
+         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+         .is_err()
+      {
+         return false;
+      }
+      let cache = Arc::downgrade(&cache);
+      tauri::async_runtime::spawn(async move {
+         loop {
+            tokio::time::sleep(interval).await;
+            let Some(cache) = cache.upgrade() else {
+               break;
+            };
+            let Ok(mut cache) = cache.lock() else {
+               break;
+            };
+            cache.remove_expired(Instant::now());
+         }
+      });
+      true
+   }
+}
+
 pub(crate) struct ThumbnailSessions {
-   cache: Mutex<SessionCache<ThumbnailSessionKey, Arc<ThumbnailSession>>>,
+   cache: Arc<Mutex<SessionCache<ThumbnailSessionKey, Arc<ThumbnailSession>>>>,
+   expiration_reaper: SessionCacheReaper,
    build_locks: Mutex<HashMap<ThumbnailSessionKey, Weak<tauri::async_runtime::Mutex<()>>>>,
 }
 
 impl Default for ThumbnailSessions {
    fn default() -> Self {
       Self {
-         cache: Mutex::new(SessionCache::new(MAX_THUMBNAIL_SESSIONS)),
+         cache: Arc::new(Mutex::new(SessionCache::new(MAX_THUMBNAIL_SESSIONS))),
+         expiration_reaper: SessionCacheReaper::default(),
          build_locks: Mutex::new(HashMap::new()),
       }
    }
@@ -177,11 +216,16 @@ async fn thumbnail_session(
    let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
    let session = Arc::new(ThumbnailSession { reader, index });
    let expires_at = thumbnail_session_expiration(is_remote, Instant::now());
+   {
+      sessions
+         .cache
+         .lock()
+         .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
+         .insert(key, Arc::clone(&session), expires_at);
+   }
    sessions
-      .cache
-      .lock()
-      .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
-      .insert(key, Arc::clone(&session), expires_at);
+      .expiration_reaper
+      .start(Arc::clone(&sessions.cache), SESSION_CACHE_REAPER_INTERVAL);
    Ok(session)
 }
 
@@ -263,19 +307,32 @@ pub(crate) async fn get_cover(
    Ok(tauri::ipc::Response::new(cover_envelope(cover)?))
 }
 
+async fn run_thumbnail_envelope_task<T, F>(task: F) -> Result<T>
+where
+   T: Send + 'static,
+   F: FnOnce() -> Result<T> + Send + 'static,
+{
+   tauri::async_runtime::spawn_blocking(task)
+      .await
+      .map_err(|error| crate::Error::Custom(format!("thumbnail envelope task failed: {error}")))?
+}
+
 /// Extract thumbnails from a video track at millisecond timestamps.
 #[command]
+#[allow(clippy::too_many_arguments)] // Tauri exposes each command field as a top-level IPC argument.
 pub(crate) async fn get_thumbnails(
    source: String,
    timestamps: Vec<u64>,
    track_id: Option<u32>,
    accurate: Option<bool>,
    quality: Option<u8>,
+   max_width: Option<u32>,
+   max_height: Option<u32>,
    headers: Option<HashMap<String, String>>,
    sessions: State<'_, ThumbnailSessions>,
 ) -> Result<tauri::ipc::Response> {
    let (unique_timestamps, order) = prepare_thumbnail_timestamps(&timestamps)?;
-   let options = thumbnail_options(quality)?;
+   let options = thumbnail_options(quality, max_width, max_height)?;
    let frames = thumbnail_frames(
       &sessions,
       &source,
@@ -286,16 +343,20 @@ pub(crate) async fn get_thumbnails(
       options,
    )
    .await?;
-   Ok(tauri::ipc::Response::new(encode_thumbnail_envelope(
-      &frames,
-      &order,
-      MAX_THUMBNAIL_OUTPUT_BYTES,
-   )?))
+   let envelope = run_thumbnail_envelope_task(move || {
+      encode_thumbnail_envelope(&frames, &order, MAX_THUMBNAIL_OUTPUT_BYTES)
+   })
+   .await?;
+   Ok(tauri::ipc::Response::new(envelope))
 }
 
 /// Validates the caller-supplied JPEG quality, if any, against the encoder's
 /// 1-100 range. `None` keeps the thumbnail-grade default.
-fn thumbnail_options(quality: Option<u8>) -> Result<ThumbnailOptions> {
+fn thumbnail_options(
+   quality: Option<u8>,
+   max_width: Option<u32>,
+   max_height: Option<u32>,
+) -> Result<ThumbnailOptions> {
    let quality = quality
       .map(|quality| {
          JpegQuality::new(quality).ok_or_else(|| {
@@ -306,8 +367,21 @@ fn thumbnail_options(quality: Option<u8>) -> Result<ThumbnailOptions> {
       })
       .transpose()?
       .unwrap_or_default();
+   let size = match (max_width, max_height) {
+      (None, None) => ThumbnailSize::default(),
+      (max_width, max_height) => ThumbnailSize::new(
+         max_width.unwrap_or(u16::MAX.into()),
+         max_height.unwrap_or(u16::MAX.into()),
+      )
+      .ok_or_else(|| {
+         crate::Error::Custom(
+            "thumbnail dimensions must be integers between 1 and 65535".to_string(),
+         )
+      })?,
+   };
    Ok(ThumbnailOptions {
       quality,
+      size,
       max_output_bytes: Some(MAX_THUMBNAIL_OUTPUT_BYTES),
    })
 }
@@ -437,16 +511,35 @@ mod tests {
 
    #[test]
    fn omitted_thumbnail_quality_keeps_the_default() {
-      let options = thumbnail_options(None).expect("no quality is valid");
+      let options = thumbnail_options(None, None, None).expect("omitted options are valid");
 
       assert_eq!(options.quality, JpegQuality::DEFAULT);
+      assert_eq!(options.size, ThumbnailSize::default());
       assert_eq!(options.max_output_bytes, Some(MAX_THUMBNAIL_OUTPUT_BYTES));
+   }
+
+   #[test]
+   fn thumbnail_dimensions_are_validated_and_default_independently() {
+      assert_eq!(
+         thumbnail_options(None, Some(640), Some(360))
+            .expect("valid dimensions")
+            .size,
+         ThumbnailSize::new(640, 360).expect("valid size")
+      );
+      assert_eq!(
+         thumbnail_options(None, Some(640), None)
+            .expect("one dimension leaves the other unconstrained")
+            .size,
+         ThumbnailSize::new(640, u16::MAX.into()).expect("valid one-axis bounds")
+      );
+      assert!(thumbnail_options(None, Some(0), None).is_err());
+      assert!(thumbnail_options(None, None, Some(65_536)).is_err());
    }
 
    #[test]
    fn thumbnail_quality_is_rejected_outside_the_encoder_range() {
       assert_eq!(
-         thumbnail_options(Some(80))
+         thumbnail_options(Some(80), None, None)
             .expect("80 is in range")
             .quality
             .get(),
@@ -454,7 +547,7 @@ mod tests {
       );
 
       for quality in [0u8, 101, 255] {
-         let error = thumbnail_options(Some(quality))
+         let error = thumbnail_options(Some(quality), None, None)
             .expect_err("quality outside 1-100 must not reach the encoder")
             .to_string();
 
@@ -504,6 +597,17 @@ mod tests {
          .expect("the documented output boundary should be accepted");
 
       assert_eq!(order.len(), MAX_THUMBNAIL_OUTPUTS);
+   }
+
+   #[tokio::test(flavor = "current_thread")]
+   async fn thumbnail_envelope_work_runs_off_the_async_runtime_thread() {
+      let runtime_thread = std::thread::current().id();
+
+      let worker_thread = run_thumbnail_envelope_task(|| Ok(std::thread::current().id()))
+         .await
+         .expect("blocking thumbnail work should complete");
+
+      assert_ne!(worker_thread, runtime_thread);
    }
 
    #[tokio::test]
@@ -579,6 +683,38 @@ mod tests {
          thumbnail_session_expiration(false, now),
          now.checked_add(LOCAL_THUMBNAIL_SESSION_TTL)
       );
+   }
+
+   #[tokio::test]
+   async fn session_cache_reaper_starts_only_once() {
+      let cache = Arc::new(Mutex::new(SessionCache::<&str, Arc<()>>::new(1)));
+      let reaper = SessionCacheReaper::default();
+
+      assert!(reaper.start(Arc::clone(&cache), Duration::from_millis(1)));
+      assert!(!reaper.start(cache, Duration::from_millis(1)));
+   }
+
+   #[tokio::test]
+   async fn session_expiration_releases_values_without_later_cache_access() {
+      let cache = Arc::new(Mutex::new(SessionCache::new(1)));
+      let reaper = SessionCacheReaper::default();
+      let value = Arc::new(());
+      let weak = Arc::downgrade(&value);
+      let deadline = Instant::now() + Duration::from_millis(10);
+      cache
+         .lock()
+         .unwrap()
+         .insert("local", Arc::clone(&value), Some(deadline));
+      assert!(reaper.start(Arc::clone(&cache), Duration::from_millis(2)));
+      drop(value);
+
+      tokio::time::timeout(Duration::from_secs(1), async {
+         while weak.upgrade().is_some() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+         }
+      })
+      .await
+      .expect("the expiration task should release the cached value");
    }
 
    #[tokio::test]

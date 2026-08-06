@@ -55,7 +55,11 @@
 //! containers. [`ThumbnailIndex::keyframes`](format::mp4::ThumbnailIndex::keyframes)
 //! returns preceding keyframes; use
 //! [`ThumbnailIndex::frames`](format::mp4::ThumbnailIndex::frames) for exact
-//! requested frames. For practical development performance, enable optimized
+//! requested frames. Output preserves aspect ratio, never upscales, and fits
+//! a 320×320 bounding box by default; customize
+//! [`ThumbnailOptions::size`](format::mp4::ThumbnailOptions::size) with
+//! [`ThumbnailSize`](format::mp4::ThumbnailSize). For practical development
+//! performance, enable optimized
 //! dependencies in the consuming application's `Cargo.toml`:
 //!
 //! ```toml

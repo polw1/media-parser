@@ -9,7 +9,7 @@ use super::atoms::{
 };
 use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
 use crate::decoders::h264::{
-   AvcConfig, DecodedImage, JpegQuality, OutputBudget, decode_frames_to_jpeg,
+   AvcConfig, DecodedImage, JpegQuality, OutputBudget, ThumbnailSize, decode_frames_to_jpeg,
 };
 use crate::errors::{MediaParserError, Result};
 use crate::helpers::{read_u32_be, read_u64_be};
@@ -31,6 +31,8 @@ const MAX_CONCURRENT_DECODES: usize = 4;
 pub struct ThumbnailOptions {
    /// JPEG quality of the encoded frames. Defaults to [`JpegQuality::DEFAULT`].
    pub quality: JpegQuality,
+   /// Maximum output dimensions. Defaults to a 320×320 bounding box.
+   pub size: ThumbnailSize,
    /// Maximum total bytes represented by returned JPEG payloads. `None`
    /// preserves the unbounded behavior for direct crate callers.
    pub max_output_bytes: Option<usize>,
@@ -138,6 +140,7 @@ impl ThumbnailIndex {
       for (index, target) in targets.iter().enumerate() {
          targets_by_gop.entry(target.gop).or_default().push(index);
       }
+      validate_gop_sample_budget(&targets_by_gop, &targets)?;
 
       let mut plans = Vec::new();
       plans
@@ -196,7 +199,13 @@ impl ThumbnailIndex {
          });
       }
 
-      let images = run_decode_jobs(jobs, options.quality, options.max_output_bytes).await?;
+      let images = run_decode_jobs(
+         jobs,
+         options.quality,
+         options.size,
+         options.max_output_bytes,
+      )
+      .await?;
       assemble_frames(&self.track, targets, images)
    }
 
@@ -255,7 +264,13 @@ impl ThumbnailIndex {
          });
       }
 
-      let images = run_decode_jobs(jobs, options.quality, options.max_output_bytes).await?;
+      let images = run_decode_jobs(
+         jobs,
+         options.quality,
+         options.size,
+         options.max_output_bytes,
+      )
+      .await?;
       assemble_frames(&self.track, targets, images)
    }
 
@@ -284,6 +299,7 @@ impl ThumbnailIndex {
 async fn run_decode_jobs(
    jobs: Vec<DecodeJob>,
    quality: JpegQuality,
+   size: ThumbnailSize,
    max_output_bytes: Option<usize>,
 ) -> Result<HashMap<(Gop, usize), DecodedImage>> {
    let output_budget = OutputBudget::new(max_output_bytes);
@@ -304,6 +320,7 @@ async fn run_decode_jobs(
                &output_indices,
                &output_counts,
                quality,
+               size,
                &output_budget,
             )
             .map(|images| (output_indices, images))
@@ -578,15 +595,10 @@ fn plan_gop_job(
    target_indices: &[usize],
    targets: &mut [ExactTarget],
 ) -> Result<JobPlan> {
-   let end_sample = target_indices
-      .iter()
-      .map(|index| targets[*index].sample_index)
-      .max()
-      .ok_or_else(|| MediaParserError::InvalidFormat("thumbnail GOP has no targets".to_string()))?;
-   let truncated = Gop {
-      start_sample: gop.start_sample,
-      end_sample,
-   };
+   let truncated = truncated_gop(gop, target_indices, targets)?;
+   if gop_sample_count(truncated)? > MAX_SAMPLES_PER_THUMBNAIL_BATCH {
+      return Err(too_many_thumbnail_samples());
+   }
    let mut presentation_order = timeline
       .ticks_for_range(truncated.start_sample, truncated.end_sample)
       .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
@@ -626,6 +638,52 @@ fn plan_gop_job(
       output_indices: unique_output_indices,
       output_counts,
    })
+}
+
+fn truncated_gop(gop: Gop, target_indices: &[usize], targets: &[ExactTarget]) -> Result<Gop> {
+   let mut end_sample = None;
+   for index in target_indices {
+      let sample_index = targets
+         .get(*index)
+         .ok_or_else(|| MediaParserError::InvalidFormat("invalid thumbnail target".to_string()))?
+         .sample_index;
+      end_sample = Some(end_sample.map_or(sample_index, |end: u32| end.max(sample_index)));
+   }
+   let end_sample = end_sample
+      .ok_or_else(|| MediaParserError::InvalidFormat("thumbnail GOP has no targets".to_string()))?;
+   Ok(Gop {
+      start_sample: gop.start_sample,
+      end_sample,
+   })
+}
+
+fn gop_sample_count(gop: Gop) -> Result<usize> {
+   gop.end_sample
+      .checked_sub(gop.start_sample)
+      .and_then(|count| count.checked_add(1))
+      .and_then(|count| usize::try_from(count).ok())
+      .ok_or_else(too_many_thumbnail_samples)
+}
+
+fn too_many_thumbnail_samples() -> MediaParserError {
+   MediaParserError::InvalidFormat("too many thumbnail samples".to_string())
+}
+
+fn validate_gop_sample_budget(
+   targets_by_gop: &BTreeMap<Gop, Vec<usize>>,
+   targets: &[ExactTarget],
+) -> Result<()> {
+   let mut total = 0usize;
+   for (gop, target_indices) in targets_by_gop {
+      let truncated = truncated_gop(*gop, target_indices, targets)?;
+      total = total
+         .checked_add(gop_sample_count(truncated)?)
+         .ok_or_else(too_many_thumbnail_samples)?;
+      if total > MAX_SAMPLES_PER_THUMBNAIL_BATCH {
+         return Err(too_many_thumbnail_samples());
+      }
+   }
+   Ok(())
 }
 
 fn keyframe_target(
@@ -812,6 +870,90 @@ mod tests {
       }
    }
 
+   fn test_timeline(sample_count: u32) -> PresentationTimeline {
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stts.extend_from_slice(&sample_count.to_be_bytes());
+      stts.extend_from_slice(&1u32.to_be_bytes());
+      PresentationTimeline::new(&stts, None, 0, sample_count).unwrap()
+   }
+
+   #[test]
+   fn rejects_oversized_gop_before_materializing_its_timeline_range() {
+      let timeline = test_timeline(1);
+      let oversized_end = u32::try_from(MAX_SAMPLES_PER_THUMBNAIL_BATCH).unwrap() + 1;
+      let mut targets = vec![ExactTarget {
+         gop: Gop {
+            start_sample: 1,
+            end_sample: oversized_end,
+         },
+         sample_index: oversized_end,
+         presentation_tick: 0,
+         output_index: 0,
+      }];
+
+      let error = plan_gop_job(&timeline, targets[0].gop, &[0], &mut targets)
+         .expect_err("an oversized GOP must be rejected before reading the timeline range");
+
+      assert_eq!(
+         error.to_string(),
+         "Invalid MP4 format: too many thumbnail samples"
+      );
+   }
+
+   #[test]
+   fn rejects_combined_gop_ranges_before_planning_jobs() {
+      let first_end = u32::try_from(MAX_SAMPLES_PER_THUMBNAIL_BATCH / 2).unwrap();
+      let second_start = first_end + 1;
+      let second_end = u32::try_from(MAX_SAMPLES_PER_THUMBNAIL_BATCH).unwrap() + 1;
+      let targets = vec![
+         ExactTarget {
+            gop: Gop {
+               start_sample: 1,
+               end_sample: first_end,
+            },
+            sample_index: first_end,
+            presentation_tick: 0,
+            output_index: 0,
+         },
+         ExactTarget {
+            gop: Gop {
+               start_sample: second_start,
+               end_sample: second_end,
+            },
+            sample_index: second_end,
+            presentation_tick: 0,
+            output_index: 0,
+         },
+      ];
+      let targets_by_gop = BTreeMap::from([(targets[0].gop, vec![0]), (targets[1].gop, vec![1])]);
+
+      let error = validate_gop_sample_budget(&targets_by_gop, &targets)
+         .expect_err("the combined sample budget must be checked before planning jobs");
+
+      assert_eq!(
+         error.to_string(),
+         "Invalid MP4 format: too many thumbnail samples"
+      );
+   }
+
+   #[test]
+   fn accepts_the_exact_gop_sample_budget() {
+      let end_sample = u32::try_from(MAX_SAMPLES_PER_THUMBNAIL_BATCH).unwrap();
+      let targets = vec![ExactTarget {
+         gop: Gop {
+            start_sample: 1,
+            end_sample,
+         },
+         sample_index: end_sample,
+         presentation_tick: 0,
+         output_index: 0,
+      }];
+      let targets_by_gop = BTreeMap::from([(targets[0].gop, vec![0])]);
+
+      validate_gop_sample_budget(&targets_by_gop, &targets).unwrap();
+   }
+
    #[test]
    fn assembles_one_frame_per_target_in_request_order() {
       let targets = vec![test_target(5, 0, 200), test_target(0, 1, 100)];
@@ -873,11 +1015,7 @@ mod tests {
       let tables = VideoSampleTables {
          stts: stts.to_vec(),
          composition_offsets: None,
-         sizes: SampleSizes {
-            fixed_size: 1,
-            sizes: Vec::new(),
-            sample_count: 1,
-         },
+         sizes: SampleSizes::fixed(1, 1).unwrap(),
          stsc: vec![StscEntry {
             first_chunk: 1,
             samples_per_chunk: 1,

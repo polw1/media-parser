@@ -13,6 +13,8 @@ expectType<Promise<ThumbnailInfo[]>>(
       timestamps: [0, 250],
       trackId: 3,
       accurate: true,
+      maxWidth: 640,
+      maxHeight: 360,
       headers: { Authorization: 'Bearer token' },
    }),
 );

@@ -338,7 +338,11 @@ impl HttpStreamReader {
          let header_value = HeaderValue::from_str(v.as_str()).map_err(|e| {
             MediaParserError::HttpRequest(format!("Invalid header value for '{}': {}", k, e))
          })?;
-         header_map.insert(header_name, header_value);
+         if header_map.insert(header_name, header_value).is_some() {
+            return Err(MediaParserError::HttpRequest(format!(
+               "duplicate header name ignoring case: '{k}'"
+            )));
+         }
       }
       Self::build_with_headers(url, header_map).await
    }
@@ -753,6 +757,20 @@ mod tests {
       let result = reader.read_at(0, &mut buffer).await;
 
       assert!(matches!(result, Err(MediaParserError::HttpRequest(_))));
+   }
+
+   #[tokio::test]
+   async fn test_http_rejects_duplicate_header_names_ignoring_case() {
+      let headers = HashMap::from([
+         ("Authorization".to_string(), "Bearer first".to_string()),
+         ("authorization".to_string(), "Bearer second".to_string()),
+      ]);
+
+      let result = HttpStreamReader::with_headers("https://example.com/video.mp4", headers).await;
+
+      assert!(
+         matches!(result, Err(MediaParserError::HttpRequest(message)) if message.contains("duplicate header name"))
+      );
    }
 
    #[tokio::test]

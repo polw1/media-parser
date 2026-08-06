@@ -5,7 +5,7 @@ mod common;
 use common::fixtures_dir;
 use media_parser::{
    FileStreamReader, JpegQuality, PixelFormat, StreamReader,
-   format::mp4::{ThumbnailIndex, ThumbnailOptions, read_frames, read_keyframes},
+   format::mp4::{ThumbnailIndex, ThumbnailOptions, ThumbnailSize, read_frames, read_keyframes},
 };
 use std::io::Write;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -89,6 +89,42 @@ async fn test_mp4_h264_thumbnail_extraction() {
    assert_eq!(frames[0].format, PixelFormat::Jpeg);
    assert!(frames[0].width > 0);
    assert!(frames[0].height > 0);
+   assert!(frames[0].data.starts_with(&[0xff, 0xd8]));
+   assert!(frames[0].data.ends_with(&[0xff, 0xd9]));
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_jpeg_capacity_tracks_compressed_bytes() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+
+   let frames = read_frames(&reader, 0, &[Duration::ZERO], ThumbnailOptions::default())
+      .await
+      .expect("extract thumbnail");
+   let jpeg = &frames[0].data;
+
+   assert!(
+      jpeg.capacity() <= jpeg.len().saturating_mul(2),
+      "JPEG retains {} bytes for a {}-byte payload",
+      jpeg.capacity(),
+      jpeg.len()
+   );
+}
+
+#[tokio::test]
+async fn test_mp4_thumbnail_is_resized_before_jpeg_encoding() {
+   let path = fixtures_dir().join("multitrack_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open MP4 fixture");
+   let options = ThumbnailOptions {
+      size: ThumbnailSize::new(80, 80).expect("valid thumbnail bounds"),
+      ..ThumbnailOptions::default()
+   };
+
+   let frames = read_keyframes(&reader, 0, &[Duration::ZERO], options)
+      .await
+      .expect("extract resized thumbnail");
+
+   assert_eq!((frames[0].width, frames[0].height), (80, 45));
    assert!(frames[0].data.starts_with(&[0xff, 0xd8]));
    assert!(frames[0].data.ends_with(&[0xff, 0xd9]));
 }

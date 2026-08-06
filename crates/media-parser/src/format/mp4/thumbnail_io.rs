@@ -205,11 +205,7 @@ mod tests {
    use async_trait::async_trait;
 
    fn fixed_samples(sample_count: u32, fixed_size: u32) -> SampleSizes {
-      SampleSizes {
-         fixed_size,
-         sizes: Vec::new(),
-         sample_count,
-      }
+      SampleSizes::fixed(sample_count, fixed_size).expect("test sample size must be non-zero")
    }
 
    fn one_sample_per_chunk() -> [StscEntry; 1] {
@@ -302,11 +298,7 @@ mod tests {
 
    #[test]
    fn splits_a_nearby_read_that_would_exceed_the_coalesced_limit() {
-      let sizes = SampleSizes {
-         fixed_size: 0,
-         sizes: vec![MAX_COALESCED_READ_BYTES as u32, 1],
-         sample_count: 2,
-      };
+      let sizes = SampleSizes::variable(vec![MAX_COALESCED_READ_BYTES as u32, 1]).unwrap();
       let batches = plan_read_batches(
          &[1, 2],
          &sizes,

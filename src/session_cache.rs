@@ -19,10 +19,14 @@ impl<K: PartialEq, V: Clone> SessionCache<K, V> {
       }
    }
 
-   pub(crate) fn get(&mut self, key: &K, now: Instant) -> Option<V> {
+   pub(crate) fn remove_expired(&mut self, now: Instant) {
       self
          .entries
          .retain(|entry| entry.expires_at.is_none_or(|deadline| deadline > now));
+   }
+
+   pub(crate) fn get(&mut self, key: &K, now: Instant) -> Option<V> {
+      self.remove_expired(now);
       let index = self.entries.iter().position(|entry| &entry.key == key)?;
       let entry = self.entries.remove(index);
       let value = entry.value.clone();

@@ -193,6 +193,8 @@ import { getThumbnails } from '@silvermine/tauri-plugin-media-parser';
 const thumbnails = await getThumbnails('/path/to/video.mp4', {
    // Input timestamps are milliseconds.
    timestamps: [0, 5_000, 10_000],
+   maxWidth: 640,
+   maxHeight: 360,
    quality: 60,
 });
 
@@ -206,6 +208,11 @@ Fast mode is the default (`accurate: false`). It returns the preceding
 keyframe, so `timestampSec` can be earlier than the requested timestamp. Set
 `accurate: true` to decode the exact requested frame. Timestamps must be
 non-negative safe integers, and one request may contain at most 4,096 entries.
+JPEGs preserve the source aspect ratio, never upscale, and fit within a 320×320
+box by default. Set `maxWidth` and/or `maxHeight` to choose another bound; when
+only one is supplied, the other dimension is unconstrained. Downscaling occurs
+directly from decoded YUV, before allocating the RGB buffer used by the JPEG
+encoder.
 
 All `data` fields returned by one call are subarray views into a shared binary
 IPC buffer. Retaining one thumbnail retains the complete response. Copy a view
