@@ -94,6 +94,24 @@ async fn test_mp4_h264_thumbnail_extraction() {
 }
 
 #[tokio::test]
+async fn test_mp4_hd_thumbnail_uses_the_area_scaler_and_the_declared_matrix() {
+   // 1280x720 (generated with ffmpeg, 0.3s testsrc2) carrying BT.709 limited
+   // range in its SPS VUI and no `colr` box. The default 320 box makes this a
+   // 4x luma reduction, which is past the bilinear threshold, so this is the
+   // only fixture that reaches the stratified taps and a non-default matrix.
+   // The pinned bytes fail if either the VUI parse or the scaler regresses.
+   let path = fixtures_dir().join("bt709_hd_video.mp4");
+   let reader = FileStreamReader::new(&path).expect("open HD fixture");
+
+   let frames = read_frames(&reader, 0, &[Duration::ZERO], ThumbnailOptions::default())
+      .await
+      .expect("extract BT.709 thumbnail");
+
+   assert_eq!((frames[0].width, frames[0].height), (320, 180));
+   assert_eq!(fnv1a(&frames[0].data), 0x57dc_f044_fdee_db13);
+}
+
+#[tokio::test]
 async fn test_mp4_thumbnail_jpeg_capacity_tracks_compressed_bytes() {
    let path = fixtures_dir().join("multitrack_video.mp4");
    let reader = FileStreamReader::new(&path).expect("open MP4 fixture");

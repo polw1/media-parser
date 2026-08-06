@@ -10,6 +10,10 @@ use std::{
    },
 };
 
+mod color;
+
+use color::{GopColor, MatrixCoefficients, resolve_gop_color, visit_avc_nals};
+
 const MAX_DECODED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_THUMBNAIL_BOUND: u32 = 320;
 
@@ -74,12 +78,22 @@ impl Default for JpegQuality {
    }
 }
 
-/// AVC decoder configuration extracted from an MP4 `avcC` box.
+/// Container color metadata extracted from an MP4 `colr` box.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AvcColorMetadata {
+   /// ISO/IEC matrix-coefficients identifier, when declared.
+   pub matrix_coefficients: Option<u16>,
+   /// `true` for full-range YUV and `false` for limited-range YUV.
+   pub full_range: Option<bool>,
+}
+
+/// AVC decoder configuration and color metadata extracted from an MP4 sample entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvcConfig {
    pub length_size: usize,
    pub sps: Vec<Vec<u8>>,
    pub pps: Vec<Vec<u8>>,
+   pub color: AvcColorMetadata,
 }
 
 /// Decoded JPEG thumbnail.
@@ -140,6 +154,7 @@ struct OutputSelection<'a> {
    indices: &'a [usize],
    counts: &'a [usize],
    budget: &'a OutputBudget,
+   color: GopColor,
 }
 
 /// Decodes one GOP and encodes the selected presentation-order pictures.
@@ -164,19 +179,22 @@ pub fn decode_frames_to_jpeg(
    {
       return Err("requested H.264 output is outside the sample range".to_string());
    }
+   let color = resolve_gop_color(config, samples);
    let output_selection = OutputSelection {
       indices: output_indices,
       counts: output_counts,
       budget: output_budget,
+      color,
    };
 
    let mut decoder = Decoder::new().map_err(|error| error.to_string())?;
    let no_flush = DecodeOptions::new().flush_after_decode(Flush::NoFlush);
    let headers = parameter_sets_annex_b(config)?;
-   if decoder
-      .decode_with_options(&headers, no_flush.clone())
-      .map_err(|error| error.to_string())?
-      .is_some()
+   if !headers.is_empty()
+      && decoder
+         .decode_with_options(&headers, no_flush.clone())
+         .map_err(|error| error.to_string())?
+         .is_some()
    {
       return Err("OpenH264 emitted a frame for AVC parameter sets".to_string());
    }
@@ -267,7 +285,7 @@ fn store_selected_frame(
    let Some((last_position, earlier_positions)) = positions.split_last() else {
       return Ok(());
    };
-   let image = yuv_to_jpeg(yuv, rgb, quality, size)?;
+   let image = yuv_to_jpeg(yuv, rgb, quality, size, output_selection.color)?;
    let output_count = positions.iter().try_fold(0usize, |total, position| {
       total.checked_add(output_selection.counts[*position])
    });
@@ -287,8 +305,9 @@ fn yuv_to_jpeg(
    rgb: &mut Vec<u8>,
    quality: JpegQuality,
    size: ThumbnailSize,
+   color: GopColor,
 ) -> Result<DecodedImage, String> {
-   let (width, height) = yuv_to_rgb(yuv, rgb, size)?;
+   let (width, height) = yuv_to_rgb(yuv, rgb, size, color)?;
    let width_u16 =
       u16::try_from(width).map_err(|_| "frame width exceeds JPEG limits".to_string())?;
    let height_u16 =
@@ -354,13 +373,13 @@ impl Write for FallibleJpegWriter {
    }
 }
 
-/// Converts `yuv` into `rgb`, which is grown in place. `write_rgb8` needs an
-/// initialized slice, so the buffer is zero-filled the first time; reusing it
-/// across frames of the same size makes the fill and the allocation no-ops.
+/// Converts `yuv` using the resolved matrix and range. Reusing `rgb` across
+/// frames of the same size makes its zero-fill and allocation no-ops.
 fn yuv_to_rgb(
    yuv: &DecodedYUV<'_>,
    rgb: &mut Vec<u8>,
    size: ThumbnailSize,
+   color: GopColor,
 ) -> Result<(u32, u32), String> {
    let (source_width, source_height) = yuv.dimensions();
    let source_width =
@@ -375,11 +394,7 @@ fn yuv_to_rgb(
    rgb.try_reserve_exact(rgb_len.saturating_sub(rgb.len()))
       .map_err(|_| "decoded frame is too large".to_string())?;
    rgb.resize(rgb_len, 0);
-   if (width, height) == (source_width, source_height) {
-      yuv.write_rgb8(rgb);
-   } else {
-      write_scaled_rgb(yuv, rgb, width as usize, height as usize)?;
-   }
+   write_rgb_with_color(yuv, rgb, width as usize, height as usize, color)?;
    Ok((width, height))
 }
 
@@ -502,6 +517,8 @@ fn axis_taps(source_len: usize, target_len: usize) -> Result<Vec<AxisTaps>, Stri
    Ok(taps)
 }
 
+/// I420 geometry proven once per frame, so the conversion loops below can
+/// index the planes directly instead of paying a bounds check per pixel.
 struct ValidatedI420 {
    source_width: usize,
    source_height: usize,
@@ -512,7 +529,60 @@ struct ValidatedI420 {
    v_stride: usize,
 }
 
-fn validate_scaled_rgb(
+impl GopColor {
+   fn coefficients(self) -> YuvCoefficients {
+      if self.matrix == MatrixCoefficients::Bt601 && !self.full_range {
+         // Preserve OpenH264 0.9.7's established BT.601 limited output for
+         // streams without color metadata and for existing BT.601 content.
+         return YuvCoefficients {
+            y_offset: 16.0,
+            y_mul: 255.0 / 219.0,
+            rv_mul: 255.0 / 224.0 * 1.402,
+            gv_mul: -255.0 / 224.0 * 1.402 * 0.299 / 0.687,
+            gu_mul: -255.0 / 224.0 * 1.772 * 0.114 / 0.587,
+            bu_mul: 255.0 / 224.0 * 1.772,
+         };
+      }
+      let (kr, kb) = match self.matrix {
+         MatrixCoefficients::Bt601 => (0.299, 0.114),
+         MatrixCoefficients::Bt709 => (0.2126, 0.0722),
+      };
+      let kg = 1.0 - kr - kb;
+      let (y_offset, y_mul, chroma_mul) = if self.full_range {
+         (0.0, 1.0, 1.0)
+      } else {
+         (16.0, 255.0 / 219.0, 255.0 / 224.0)
+      };
+      YuvCoefficients {
+         y_offset,
+         y_mul,
+         rv_mul: chroma_mul * (2.0 - 2.0 * kr),
+         gv_mul: -chroma_mul * (2.0 - 2.0 * kr) * kr / kg,
+         gu_mul: -chroma_mul * (2.0 - 2.0 * kb) * kb / kg,
+         bu_mul: chroma_mul * (2.0 - 2.0 * kb),
+      }
+   }
+}
+
+struct YuvCoefficients {
+   y_offset: f32,
+   y_mul: f32,
+   rv_mul: f32,
+   gv_mul: f32,
+   gu_mul: f32,
+   bu_mul: f32,
+}
+
+/// Proves the source geometry and the target length once per frame: every
+/// stride covers its plane width, every plane holds its last row, and `target`
+/// matches the requested output exactly.
+///
+/// Odd sources are accepted on their `div_ceil` chroma geometry rather than
+/// rejected outright, but only once the planes are shown to carry it. OpenH264
+/// emits even 4:2:0 frames whose planes are `stride * height` long, so an odd
+/// source that reuses that layout fails the plane check with a controlled error
+/// instead of indexing out of bounds.
+fn validate_i420(
    yuv: &impl YUVSource,
    target: &[u8],
    width: usize,
@@ -520,35 +590,33 @@ fn validate_scaled_rgb(
 ) -> Result<ValidatedI420, String> {
    let (source_width, source_height) = yuv.dimensions();
    if source_width == 0 || source_height == 0 || width == 0 || height == 0 {
-      return Err("scaled image has zero dimensions".to_string());
+      return Err("decoded frame has zero dimensions".to_string());
    }
-   if source_width % 2 != 0 || source_height % 2 != 0 {
-      return Err("decoded frame is not even I420".to_string());
-   }
+   let uv_width = source_width.div_ceil(2);
+   let uv_height = source_height.div_ceil(2);
    let (y_stride, u_stride, v_stride) = yuv.strides();
-   let uv_width = source_width / 2;
-   let uv_height = source_height / 2;
    if y_stride < source_width || u_stride < uv_width || v_stride < uv_width {
       return Err("decoded I420 stride is too small".to_string());
    }
-   let y_len = y_stride
-      .checked_mul(source_height)
-      .ok_or_else(|| "decoded I420 plane length overflow".to_string())?;
-   let u_len = u_stride
-      .checked_mul(uv_height)
-      .ok_or_else(|| "decoded I420 plane length overflow".to_string())?;
-   let v_len = v_stride
-      .checked_mul(uv_height)
-      .ok_or_else(|| "decoded I420 plane length overflow".to_string())?;
-   if yuv.y().len() < y_len || yuv.u().len() < u_len || yuv.v().len() < v_len {
+   let plane_len = |stride: usize, plane_width: usize, plane_height: usize| {
+      plane_height
+         .checked_sub(1)
+         .and_then(|last_row| last_row.checked_mul(stride))
+         .and_then(|offset| offset.checked_add(plane_width))
+         .ok_or_else(|| "decoded I420 plane length overflow".to_string())
+   };
+   if yuv.y().len() < plane_len(y_stride, source_width, source_height)?
+      || yuv.u().len() < plane_len(u_stride, uv_width, uv_height)?
+      || yuv.v().len() < plane_len(v_stride, uv_width, uv_height)?
+   {
       return Err("decoded I420 plane is too short".to_string());
    }
    let target_len = width
       .checked_mul(height)
       .and_then(|pixels| pixels.checked_mul(3))
-      .ok_or_else(|| "scaled RGB target length overflow".to_string())?;
+      .ok_or_else(|| "RGB target length overflow".to_string())?;
    if target.len() != target_len {
-      return Err("scaled RGB target has an invalid length".to_string());
+      return Err("RGB target has an invalid length".to_string());
    }
    Ok(ValidatedI420 {
       source_width,
@@ -561,19 +629,51 @@ fn validate_scaled_rgb(
    })
 }
 
-fn write_scaled_rgb(
+/// Converts `yuv` into `target` at `width` × `height`, resampling only when the
+/// output differs from the source. Both branches share one validation and one
+/// set of coefficients so their colour cannot drift apart.
+fn write_rgb_with_color(
    yuv: &impl YUVSource,
    target: &mut [u8],
    width: usize,
    height: usize,
+   color: GopColor,
 ) -> Result<(), String> {
-   const Y_MUL: f32 = 255.0 / 219.0;
-   const RV_MUL: f32 = 255.0 / 224.0 * 1.402;
-   const GV_MUL: f32 = -255.0 / 224.0 * 1.402 * 0.299 / 0.687;
-   const GU_MUL: f32 = -255.0 / 224.0 * 1.772 * 0.114 / 0.587;
-   const BU_MUL: f32 = 255.0 / 224.0 * 1.772;
+   let source = validate_i420(yuv, target, width, height)?;
+   let coefficients = color.coefficients();
+   if (source.source_width, source.source_height) == (width, height) {
+      write_unscaled_rgb(yuv, target, &source, &coefficients);
+      return Ok(());
+   }
+   write_resized_rgb(yuv, target, &source, width, height, &coefficients)
+}
 
-   let source = validate_scaled_rgb(yuv, target, width, height)?;
+fn write_unscaled_rgb(
+   yuv: &impl YUVSource,
+   target: &mut [u8],
+   source: &ValidatedI420,
+   coefficients: &YuvCoefficients,
+) {
+   let (width, height) = (source.source_width, source.source_height);
+   for target_y in 0..height {
+      for target_x in 0..width {
+         let y = f32::from(yuv.y()[target_y * source.y_stride + target_x]);
+         let u = f32::from(yuv.u()[target_y / 2 * source.u_stride + target_x / 2]);
+         let v = f32::from(yuv.v()[target_y / 2 * source.v_stride + target_x / 2]);
+         let offset = (target_y * width + target_x) * 3;
+         write_pixel(coefficients, y, u, v, &mut target[offset..offset + 3]);
+      }
+   }
+}
+
+fn write_resized_rgb(
+   yuv: &impl YUVSource,
+   target: &mut [u8],
+   source: &ValidatedI420,
+   width: usize,
+   height: usize,
+   coefficients: &YuvCoefficients,
+) -> Result<(), String> {
    let y_x_taps = axis_taps(source.source_width, width)?;
    let y_y_taps = axis_taps(source.source_height, height)?;
    // Chroma uses its own normalized plane extent. This assumes the aligned
@@ -585,16 +685,27 @@ fn write_scaled_rgb(
       let uv_y = uv_y_taps[target_y];
       for target_x in 0..width {
          let y = separable_sample(yuv.y(), source.y_stride, y_x_taps[target_x], y_y);
-         let u = separable_sample(yuv.u(), source.u_stride, uv_x_taps[target_x], uv_y) - 128.0;
-         let v = separable_sample(yuv.v(), source.v_stride, uv_x_taps[target_x], uv_y) - 128.0;
-         let y = Y_MUL * (y - 16.0);
+         let u = separable_sample(yuv.u(), source.u_stride, uv_x_taps[target_x], uv_y);
+         let v = separable_sample(yuv.v(), source.v_stride, uv_x_taps[target_x], uv_y);
          let offset = (target_y * width + target_x) * 3;
-         target[offset] = RV_MUL.mul_add(v, y) as u8;
-         target[offset + 1] = GV_MUL.mul_add(v, GU_MUL.mul_add(u, y)) as u8;
-         target[offset + 2] = BU_MUL.mul_add(u, y) as u8;
+         write_pixel(coefficients, y, u, v, &mut target[offset..offset + 3]);
       }
    }
    Ok(())
+}
+
+/// Writes one RGB triple. Both conversion paths funnel through here, which is
+/// what keeps a bounded and an unbounded frame from coming back with different
+/// colours for the same source.
+fn write_pixel(coefficients: &YuvCoefficients, y: f32, u: f32, v: f32, pixel: &mut [u8]) {
+   let y = coefficients.y_mul * (y - coefficients.y_offset);
+   let u = u - 128.0;
+   let v = v - 128.0;
+   pixel[0] = coefficients.rv_mul.mul_add(v, y) as u8;
+   pixel[1] = coefficients
+      .gv_mul
+      .mul_add(v, coefficients.gu_mul.mul_add(u, y)) as u8;
+   pixel[2] = coefficients.bu_mul.mul_add(u, y) as u8;
 }
 
 fn separable_sample(plane: &[u8], stride: usize, x_taps: AxisTaps, y_taps: AxisTaps) -> f32 {
@@ -613,38 +724,12 @@ fn source_coordinate(target: usize, target_len: usize, source_len: usize) -> f32
       .clamp(0.0, source_len.saturating_sub(1) as f32)
 }
 
-#[cfg(test)]
-fn bilinear_sample(
-   plane: &[u8],
-   stride: usize,
-   width: usize,
-   height: usize,
-   x: f32,
-   y: f32,
-) -> f32 {
-   let x0 = x.floor() as usize;
-   let y0 = y.floor() as usize;
-   let x1 = (x0 + 1).min(width - 1);
-   let y1 = (y0 + 1).min(height - 1);
-   let x_weight = x - x0 as f32;
-   let y_weight = y - y0 as f32;
-   let top = f32::from(plane[y0 * stride + x0]) * (1.0 - x_weight)
-      + f32::from(plane[y0 * stride + x1]) * x_weight;
-   let bottom = f32::from(plane[y1 * stride + x0]) * (1.0 - x_weight)
-      + f32::from(plane[y1 * stride + x1]) * x_weight;
-   top * (1.0 - y_weight) + bottom * y_weight
-}
-
 fn parameter_sets_annex_b(config: &AvcConfig) -> Result<Vec<u8>, String> {
    let mut data = Vec::new();
    for parameter_set in config.sps.iter().chain(&config.pps) {
       append_annex_b_nal(&mut data, parameter_set)?;
    }
-   if data.is_empty() {
-      Err("avcC contains no SPS/PPS parameter sets".to_string())
-   } else {
-      Ok(data)
-   }
+   Ok(data)
 }
 
 /// Rewrites a length-prefixed AVC sample into `output` as Annex B. `output` is
@@ -654,47 +739,13 @@ fn sample_to_annex_b(
    length_size: usize,
    output: &mut Vec<u8>,
 ) -> Result<(), String> {
-   if !(1..=4).contains(&length_size) {
-      return Err(format!("invalid H.264 NAL length size: {length_size}"));
-   }
-
    output.clear();
    // Lower bound only: with `length_size < 4` the 4-byte start codes make the
    // output longer than the input, and `append_annex_b_nal` grows from here.
    output
       .try_reserve(sample.len().saturating_add(4))
       .map_err(|_| "H.264 sample is too large".to_string())?;
-   let mut offset = 0usize;
-   while offset < sample.len() {
-      let length_end = offset
-         .checked_add(length_size)
-         .ok_or_else(|| "NAL offset overflow".to_string())?;
-      let length_bytes = sample
-         .get(offset..length_end)
-         .ok_or_else(|| "truncated NAL length".to_string())?;
-      let nal_length = length_bytes
-         .iter()
-         .fold(0usize, |length, byte| (length << 8) | *byte as usize);
-      offset = length_end;
-      if nal_length == 0 {
-         continue;
-      }
-
-      let nal_end = offset
-         .checked_add(nal_length)
-         .ok_or_else(|| "NAL size overflow".to_string())?;
-      let nal = sample
-         .get(offset..nal_end)
-         .ok_or_else(|| "truncated NAL payload".to_string())?;
-      append_annex_b_nal(output, nal)?;
-      offset = nal_end;
-   }
-
-   if output.is_empty() {
-      Err("sample contained no H.264 NAL units".to_string())
-   } else {
-      Ok(())
-   }
+   visit_avc_nals(sample, length_size, |nal| append_annex_b_nal(output, nal))
 }
 
 fn append_annex_b_nal(output: &mut Vec<u8>, nal: &[u8]) -> Result<(), String> {
@@ -722,6 +773,17 @@ fn append_annex_b_nal(output: &mut Vec<u8>, nal: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   /// Exercises the conversion under the default colour policy, which is what
+   /// every stream without usable metadata resolves to.
+   fn write_scaled_rgb(
+      yuv: &impl YUVSource,
+      target: &mut [u8],
+      width: usize,
+      height: usize,
+   ) -> Result<(), String> {
+      write_rgb_with_color(yuv, target, width, height, GopColor::DEFAULT)
+   }
 
    struct FakeYuv<'a> {
       dimensions: (usize, usize),
@@ -803,7 +865,135 @@ mod tests {
       write_scaled_rgb(&source, &mut rgb, 1, 1).expect("valid source scales");
 
       assert_eq!(rgb, [120, 120, 120]);
-      assert_eq!(bilinear_sample(&y, 2, 2, 2, 1.0, 1.0), 145.0);
+   }
+
+   #[test]
+   fn bt709_limited_conversion_uses_the_declared_matrix() {
+      use openh264::formats::YUVSlices;
+
+      let y = [81; 4];
+      let u = [90];
+      let v = [240];
+      let source = YUVSlices::new((&y, &u, &v), (2, 2), (2, 1, 1));
+      let mut rgb = [0; 3];
+
+      write_rgb_with_color(
+         &source,
+         &mut rgb,
+         1,
+         1,
+         GopColor {
+            matrix: MatrixCoefficients::Bt709,
+            full_range: false,
+         },
+      )
+      .expect("valid BT.709 source scales");
+
+      assert_eq!(rgb, [255, 24, 0]);
+   }
+
+   #[test]
+   fn same_size_conversion_uses_the_declared_color_policy() {
+      use openh264::formats::YUVSlices;
+
+      let y = [81; 4];
+      let u = [90];
+      let v = [240];
+      let source = YUVSlices::new((&y, &u, &v), (2, 2), (2, 1, 1));
+      let mut rgb = [0; 12];
+
+      write_rgb_with_color(
+         &source,
+         &mut rgb,
+         2,
+         2,
+         GopColor {
+            matrix: MatrixCoefficients::Bt709,
+            full_range: false,
+         },
+      )
+      .expect("same-size BT.709 source converts");
+
+      assert_eq!(rgb, [255, 24, 0, 255, 24, 0, 255, 24, 0, 255, 24, 0]);
+   }
+
+   #[test]
+   fn same_size_conversion_reuses_each_i420_chroma_sample_for_two_pixels() {
+      use openh264::formats::YUVSlices;
+
+      let y = [81; 8];
+      let u = [90, 128];
+      let v = [240, 128];
+      let source = YUVSlices::new((&y, &u, &v), (4, 2), (4, 2, 2));
+      let mut rgb = [0; 24];
+
+      write_rgb_with_color(
+         &source,
+         &mut rgb,
+         4,
+         2,
+         GopColor {
+            matrix: MatrixCoefficients::Bt709,
+            full_range: false,
+         },
+      )
+      .expect("same-size I420 source converts");
+
+      assert_eq!(&rgb[..6], &[255, 24, 0, 255, 24, 0]);
+      assert_eq!(&rgb[6..12], &[75, 75, 75, 75, 75, 75]);
+      assert_eq!(&rgb[12..], &rgb[..12]);
+   }
+
+   #[test]
+   fn full_range_conversion_does_not_apply_limited_range_offsets() {
+      use openh264::formats::YUVSlices;
+
+      let y = [16; 4];
+      let u = [128];
+      let v = [128];
+      let source = YUVSlices::new((&y, &u, &v), (2, 2), (2, 1, 1));
+      let mut rgb = [0; 3];
+
+      write_rgb_with_color(
+         &source,
+         &mut rgb,
+         1,
+         1,
+         GopColor {
+            matrix: MatrixCoefficients::Bt601,
+            full_range: true,
+         },
+      )
+      .expect("valid full-range source scales");
+
+      assert_eq!(rgb, [16, 16, 16]);
+   }
+
+   #[test]
+   fn bt709_full_range_conversion_drops_both_limited_range_scalings() {
+      use openh264::formats::YUVSlices;
+
+      let y = [81; 4];
+      let u = [90];
+      let v = [240];
+      let source = YUVSlices::new((&y, &u, &v), (2, 2), (2, 1, 1));
+      let mut rgb = [0; 3];
+
+      write_rgb_with_color(
+         &source,
+         &mut rgb,
+         1,
+         1,
+         GopColor {
+            matrix: MatrixCoefficients::Bt709,
+            full_range: true,
+         },
+      )
+      .expect("valid BT.709 full-range source scales");
+
+      // The same source is [255, 24, 0] under BT.709 limited above, so this
+      // pins the range handling and not just the matrix.
+      assert_eq!(rgb, [255, 35, 10]);
    }
 
    #[test]
@@ -898,6 +1088,42 @@ mod tests {
    }
 
    #[test]
+   fn scales_an_odd_source_only_when_its_chroma_planes_are_present() {
+      // The `YUVSource` trait permits odd frames even though OpenH264 never
+      // emits them, so accept one whose div_ceil chroma planes are really there.
+      let y = [16; 9];
+      let uv = [128; 4];
+      let complete = FakeYuv {
+         dimensions: (3, 3),
+         strides: (3, 2, 2),
+         y: &y,
+         u: &uv,
+         v: &uv,
+      };
+      let mut rgb = [0; 3];
+
+      write_scaled_rgb(&complete, &mut rgb, 1, 1).expect("proven odd geometry scales");
+
+      assert_eq!(rgb, [0, 0, 0]);
+
+      // OpenH264 sizes chroma as `height / 2` rows, which is one row short of
+      // an odd frame: that must be a controlled error, not an out-of-bounds read.
+      let openh264_layout = FakeYuv {
+         dimensions: (3, 3),
+         strides: (3, 2, 2),
+         y: &y,
+         u: &uv[..2],
+         v: &uv[..2],
+      };
+
+      assert!(
+         write_scaled_rgb(&openh264_layout, &mut rgb, 1, 1)
+            .expect_err("an odd frame with half-height chroma is invalid")
+            .contains("plane is too short")
+      );
+   }
+
+   #[test]
    fn rejects_invalid_i420_sources_and_targets() {
       let y = [16; 6];
       let uv = [128; 2];
@@ -914,19 +1140,6 @@ mod tests {
          write_scaled_rgb(&zero_sized, target, 1, 1)
             .expect_err("zero source is invalid")
             .contains("zero dimensions")
-      );
-
-      let odd_sized = FakeYuv {
-         dimensions: (3, 2),
-         strides: (3, 1, 1),
-         y: &y,
-         u: &uv[..1],
-         v: &uv[..1],
-      };
-      assert!(
-         write_scaled_rgb(&odd_sized, target, 1, 1)
-            .expect_err("odd I420 source is invalid")
-            .contains("even I420")
       );
 
       let short_stride = FakeYuv {
@@ -1046,5 +1259,17 @@ mod tests {
 
       assert!(sample_to_annex_b(&[], 4, &mut output).is_err());
       assert!(output.is_empty());
+   }
+
+   #[test]
+   fn allows_avc3_parameter_sets_to_arrive_in_band() {
+      let config = AvcConfig {
+         length_size: 4,
+         sps: Vec::new(),
+         pps: Vec::new(),
+         color: AvcColorMetadata::default(),
+      };
+
+      assert_eq!(parameter_sets_annex_b(&config), Ok(Vec::new()));
    }
 }

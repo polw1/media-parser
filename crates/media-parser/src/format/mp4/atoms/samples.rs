@@ -2,7 +2,7 @@
 
 use super::sample_timing::{CompositionOffset, stts_sample_count};
 use super::{Mp4Nav, iter_boxes};
-use crate::decoders::h264::AvcConfig;
+use crate::decoders::h264::{AvcColorMetadata, AvcConfig};
 use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
 
 const SAMPLE_SIZE_PREFIX_INTERVAL: usize = 256;
@@ -104,10 +104,44 @@ pub fn table_entries(buf: &[u8], entry_size: usize) -> Option<usize> {
    (entry_count <= buf.len().checked_sub(8)? / entry_size).then_some(entry_count)
 }
 
+/// Reads the matrix and range hints from an `nclx`/`nclc` colour box.
+///
+/// Returns `false` for other parameter types and for bodies too short to carry
+/// a matrix, so the caller keeps looking at later `colr` boxes. Colour is a
+/// presentation hint: an unreadable one must never invalidate the `avcC` it
+/// sits next to.
+fn parse_colr(payload: &[u8], color: &mut AvcColorMetadata) -> bool {
+   let Some(parameter_type) = payload.get(..4) else {
+      return false;
+   };
+   if parameter_type != b"nclx" && parameter_type != b"nclc" {
+      return false;
+   }
+   let Some(matrix_coefficients) = read_u16_be(payload, 8) else {
+      return false;
+   };
+   color.matrix_coefficients = (matrix_coefficients != 2).then_some(matrix_coefficients);
+   if parameter_type == b"nclx" {
+      // Some muxers emit an `nclx` body without its trailing flags byte; the
+      // matrix is still usable on its own.
+      color.full_range = payload.get(10).map(|flags| flags & 0x80 != 0);
+   }
+   true
+}
+
 pub fn parse_avc_config(sample_entry_payload: &[u8]) -> Option<AvcConfig> {
    let children = sample_entry_payload.get(78..)?;
-   let avcc =
-      iter_boxes(children).find_map(|(fourcc, payload)| (&fourcc == b"avcC").then_some(payload))?;
+   let mut avcc = None;
+   let mut color = AvcColorMetadata::default();
+   let mut color_found = false;
+   for (fourcc, payload) in iter_boxes(children) {
+      match &fourcc {
+         b"avcC" if avcc.is_none() => avcc = Some(payload),
+         b"colr" if !color_found => color_found = parse_colr(payload, &mut color),
+         _ => {}
+      }
+   }
+   let avcc = avcc?;
    if avcc.len() < 7 || avcc[0] != 1 {
       return None;
    }
@@ -141,6 +175,7 @@ pub fn parse_avc_config(sample_entry_payload: &[u8]) -> Option<AvcConfig> {
       length_size,
       sps,
       pps,
+      color,
    })
 }
 
@@ -552,6 +587,84 @@ pub fn validate_sample_tables(
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   fn append_box(target: &mut Vec<u8>, fourcc: &[u8; 4], payload: &[u8]) {
+      let size = u32::try_from(payload.len() + 8).expect("test box fits u32");
+      target.extend_from_slice(&size.to_be_bytes());
+      target.extend_from_slice(fourcc);
+      target.extend_from_slice(payload);
+   }
+
+   #[test]
+   fn parses_nclx_matrix_and_range_with_avc_config() {
+      let mut sample_entry = vec![0; 78];
+      append_box(&mut sample_entry, b"avcC", &[1, 66, 0, 30, 0xff, 0xe0, 0]);
+      let mut colr = Vec::from(&b"nclx"[..]);
+      colr.extend_from_slice(&1u16.to_be_bytes());
+      colr.extend_from_slice(&1u16.to_be_bytes());
+      colr.extend_from_slice(&1u16.to_be_bytes());
+      colr.push(0x80);
+      append_box(&mut sample_entry, b"colr", &colr);
+
+      let config = parse_avc_config(&sample_entry).expect("valid avc3 description parses");
+
+      assert_eq!(config.color.matrix_coefficients, Some(1));
+      assert_eq!(config.color.full_range, Some(true));
+   }
+
+   #[test]
+   fn parses_nclc_matrix_without_inventing_a_range() {
+      let mut sample_entry = vec![0; 78];
+      append_box(&mut sample_entry, b"avcC", &[1, 66, 0, 30, 0xff, 0xe0, 0]);
+      let mut colr = Vec::from(&b"nclc"[..]);
+      colr.extend_from_slice(&6u16.to_be_bytes());
+      colr.extend_from_slice(&6u16.to_be_bytes());
+      colr.extend_from_slice(&6u16.to_be_bytes());
+      append_box(&mut sample_entry, b"colr", &colr);
+
+      let config = parse_avc_config(&sample_entry).expect("valid nclc description parses");
+
+      assert_eq!(config.color.matrix_coefficients, Some(6));
+      assert_eq!(config.color.full_range, None);
+   }
+
+   #[test]
+   fn keeps_the_avc_config_when_the_colr_box_is_truncated() {
+      let mut sample_entry = vec![0; 78];
+      append_box(&mut sample_entry, b"avcC", &[1, 66, 0, 30, 0xff, 0xe0, 0]);
+      // An `nclx` body without its trailing flags byte, and a `colr` too short
+      // to even name its parameter type.
+      let mut short_nclx = Vec::from(&b"nclx"[..]);
+      short_nclx.extend_from_slice(&1u16.to_be_bytes());
+      short_nclx.extend_from_slice(&1u16.to_be_bytes());
+      short_nclx.extend_from_slice(&1u16.to_be_bytes());
+      append_box(&mut sample_entry, b"colr", &short_nclx);
+      append_box(&mut sample_entry, b"colr", b"ncl");
+
+      let config = parse_avc_config(&sample_entry).expect("a bad colr cannot void the avcC");
+
+      assert_eq!(config.length_size, 4);
+      assert_eq!(config.color.matrix_coefficients, Some(1));
+      assert_eq!(config.color.full_range, None);
+   }
+
+   #[test]
+   fn finds_nclx_after_an_unsupported_colr_box() {
+      let mut sample_entry = vec![0; 78];
+      append_box(&mut sample_entry, b"avcC", &[1, 66, 0, 30, 0xff, 0xe0, 0]);
+      append_box(&mut sample_entry, b"colr", b"profignored");
+      let mut nclx = Vec::from(&b"nclx"[..]);
+      nclx.extend_from_slice(&1u16.to_be_bytes());
+      nclx.extend_from_slice(&1u16.to_be_bytes());
+      nclx.extend_from_slice(&1u16.to_be_bytes());
+      nclx.push(0);
+      append_box(&mut sample_entry, b"colr", &nclx);
+
+      let config = parse_avc_config(&sample_entry).expect("valid later nclx is found");
+
+      assert_eq!(config.color.matrix_coefficients, Some(1));
+      assert_eq!(config.color.full_range, Some(false));
+   }
 
    fn two_run_tables() -> (SampleSizes, Vec<StscEntry>, Vec<u64>) {
       // chunks 1-2 use description 1 (2 samples each), chunks 3-4 use

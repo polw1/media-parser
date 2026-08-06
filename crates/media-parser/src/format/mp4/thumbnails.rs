@@ -1028,6 +1028,7 @@ mod tests {
                length_size: 4,
                sps: vec![vec![1]],
                pps: vec![vec![2]],
+               color: Default::default(),
             }),
             None,
          ],
