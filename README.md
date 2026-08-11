@@ -181,6 +181,29 @@ for (const track of tracks) {
 }
 ```
 
+### Cover art
+
+`getCover` extracts embedded cover artwork. Unlike thumbnails, it works for
+MP3 as well as MP4/M4A/MOV, and it returns `null` when the file carries no
+cover, so the result must be checked before use.
+
+```typescript
+import { getCover } from '@silvermine/tauri-plugin-media-parser';
+
+const cover = await getCover('/path/to/song.mp3');
+
+if (cover) {
+   // `format` is 'jpeg' or 'png', whichever the file embeds.
+   console.log(cover.format, cover.mimeType, cover.data.length);
+} else {
+   console.log('This file has no embedded cover art.');
+}
+```
+
+The `data` field is a view into the binary IPC response rather than a
+standalone copy. Copy it with `new Uint8Array(cover.data)` when it must
+outlive the rest of the response.
+
 ### Video thumbnails
 
 `getThumbnails` extracts JPEG previews from H.264/AVC video tracks in
@@ -213,6 +236,12 @@ box by default. Set `maxWidth` and/or `maxHeight` to choose another bound; when
 only one is supplied, the other dimension is unconstrained. Downscaling occurs
 directly from decoded YUV, before allocating the RGB buffer used by the JPEG
 encoder.
+
+Thumbnail output is capped at 256 MiB in total, including the envelope header
+and JPEG payloads. Identical requested timestamps are decoded once and share
+one JPEG payload. Distinct timestamps count separately even when they resolve
+to the same frame. Large dimensions can reach the cap well before the
+4,096-entry limit, and exceeding it rejects the whole request at runtime.
 
 All `data` fields returned by one call are subarray views into a shared binary
 IPC buffer. Retaining one thumbnail retains the complete response. Copy a view
@@ -252,6 +281,19 @@ npm run standards
 ## License
 
 MIT
+
+### Third-party notices
+
+This plugin links code whose license requires notices beyond the usual MIT and
+Apache-2.0 boilerplate: the JPEG encoder carries an Independent JPEG Group
+obligation. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) records it, with
+the exact text the license asks for.
+
+That obligation transfers. The license requires the notice to reach the user
+with the distribution, so an application that ships a compiled binary
+containing this plugin must carry it in its own documentation, licenses
+screen, or bundled resources. This repository supplies the text; including it
+is the application's step.
 
 ## Contributing
 

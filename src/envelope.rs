@@ -10,7 +10,7 @@
 //! entries so decoders can reject a header they don't understand instead of
 //! misreading it; bump it whenever an entry's fields change shape.
 
-use media_parser::{CoverArt, Frame};
+use media_parser::{CoverArt, Frame, PixelFormat};
 use serde::Serialize;
 
 use crate::Result;
@@ -29,7 +29,7 @@ struct EnvelopeHeader<T> {
 #[serde(rename_all = "camelCase")]
 struct CoverEnvelopeEntry {
    format: &'static str,
-   mime_type: String,
+   mime_type: &'static str,
    offset: usize,
    length: usize,
 }
@@ -51,9 +51,15 @@ pub(crate) fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
    let Some(cover) = cover else {
       return encode_binary_envelope(Vec::<CoverEnvelopeEntry>::new(), &[], usize::MAX);
    };
+   if !matches!(&cover.format, PixelFormat::Jpeg | PixelFormat::Png) {
+      return Err(crate::Error::Custom(format!(
+         "cover must be JPEG or PNG, got {}",
+         cover.format.label()
+      )));
+   }
    let entry = CoverEnvelopeEntry {
       format: cover.format.label(),
-      mime_type: cover.mime_type,
+      mime_type: cover.format.mime_type(),
       offset: 0,
       length: cover.data.len(),
    };
@@ -61,6 +67,13 @@ pub(crate) fn cover_envelope(cover: Option<CoverArt>) -> Result<Vec<u8>> {
    encode_binary_envelope(vec![entry], &payloads, usize::MAX)
 }
 
+/// Builds one thumbnail entry after `encode_thumbnail_envelope` has enforced
+/// the JPEG-only contract over every payload frame.
+///
+/// `ThumbnailInfo` publishes `format: 'jpeg'` and `mimeType: 'image/jpeg'` as
+/// closed literals, and the TypeScript decoder casts the header without
+/// validating it. `Frame::format` is open over the whole `PixelFormat` enum, so
+/// any other format is a bug in the decode path.
 fn thumbnail_envelope_entry(frame: &Frame, offset: usize) -> ThumbnailEnvelopeEntry {
    ThumbnailEnvelopeEntry {
       track_id: frame.track_id,
@@ -88,6 +101,12 @@ pub(crate) fn encode_thumbnail_envelope(
       .map_err(|_| crate::Error::Custom("too many thumbnail entries".to_string()))?;
    let mut payload_len = 0usize;
    for frame in frames {
+      if frame.format != PixelFormat::Jpeg {
+         return Err(crate::Error::Custom(format!(
+            "thumbnail must be JPEG, got {}",
+            frame.format.label()
+         )));
+      }
       offsets.push(payload_len);
       payload_len = payload_len
          .checked_add(frame.data.len())
@@ -152,6 +171,11 @@ mod tests {
    use media_parser::PixelFormat;
    use std::time::Duration;
 
+   /// Every frame here is JPEG because that is the only format the envelope
+   /// accepts, matching what the decode path produces and what `ThumbnailInfo`
+   /// publishes. See
+   /// `thumbnail_envelope_rejects_an_unreferenced_non_jpeg_frame` for the
+   /// boundary check itself.
    fn test_frames() -> Vec<Frame> {
       vec![
          Frame {
@@ -168,7 +192,7 @@ mod tests {
             width: 640,
             height: 360,
             timestamp: Duration::from_secs(1),
-            format: PixelFormat::Png,
+            format: PixelFormat::Jpeg,
             data: vec![4, 5],
             strides: None,
          },
@@ -207,6 +231,47 @@ mod tests {
       assert_eq!(payload, &[1, 2, 3]);
    }
 
+   /// Unlike thumbnails, covers carry the format the file declares, so this
+   /// pins that the entry reports the cover's own format instead of a constant.
+   #[test]
+   fn encodes_a_png_cover_with_its_own_format() {
+      let envelope = cover_envelope(Some(CoverArt {
+         format: PixelFormat::Png,
+         // The envelope must derive this from `format`, not trust a second
+         // independently mutable field.
+         mime_type: "image/jpeg".to_string(),
+         data: vec![4, 5],
+      }))
+      .expect("cover should encode");
+      let (header, payload) = envelope_parts(&envelope);
+
+      assert_eq!(
+         header,
+         serde_json::json!({
+            "version": 1,
+            "entries": [{
+               "format": "png",
+               "mimeType": "image/png",
+               "offset": 0,
+               "length": 2,
+            }],
+         })
+      );
+      assert_eq!(payload, &[4, 5]);
+   }
+
+   #[test]
+   fn cover_envelope_rejects_an_unsupported_pixel_format() {
+      let error = cover_envelope(Some(CoverArt {
+         format: PixelFormat::Rgb24,
+         mime_type: "application/octet-stream".to_string(),
+         data: vec![1, 2, 3],
+      }))
+      .expect_err("a raw pixel buffer must not reach the published cover envelope");
+
+      assert_eq!(error.to_string(), "cover must be JPEG or PNG, got rgb24");
+   }
+
    #[test]
    fn encodes_missing_cover_as_an_empty_envelope() {
       let envelope = cover_envelope(None).expect("empty cover should encode");
@@ -242,8 +307,8 @@ mod tests {
                   "width": 640,
                   "height": 360,
                   "timestampSec": 1.0,
-                  "format": "png",
-                  "mimeType": "image/png",
+                  "format": "jpeg",
+                  "mimeType": "image/jpeg",
                   "offset": 3,
                   "length": 2,
                },
@@ -267,6 +332,17 @@ mod tests {
       assert_eq!(entries[0]["length"], entries[2]["length"]);
       assert_eq!(entries[1]["offset"], serde_json::json!(3));
       assert_eq!(payload, &[1, 2, 3, 4, 5]);
+   }
+
+   #[test]
+   fn thumbnail_envelope_rejects_an_unreferenced_non_jpeg_frame() {
+      let mut frames = test_frames();
+      frames[1].format = PixelFormat::Png;
+
+      let error = encode_thumbnail_envelope(&frames, &[0], usize::MAX)
+         .expect_err("every thumbnail payload must satisfy the published envelope");
+
+      assert_eq!(error.to_string(), "thumbnail must be JPEG, got png");
    }
 
    #[test]
