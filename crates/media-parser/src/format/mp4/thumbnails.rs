@@ -596,7 +596,8 @@ fn plan_gop_job(
    targets: &mut [ExactTarget],
 ) -> Result<JobPlan> {
    let truncated = truncated_gop(gop, target_indices, targets)?;
-   if gop_sample_count(truncated)? > MAX_SAMPLES_PER_THUMBNAIL_BATCH {
+   let gop_len = gop_sample_count(truncated)?;
+   if gop_len > MAX_SAMPLES_PER_THUMBNAIL_BATCH {
       return Err(too_many_thumbnail_samples());
    }
    let mut presentation_order = timeline
@@ -604,15 +605,32 @@ fn plan_gop_job(
       .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
    presentation_order.sort_unstable_by_key(|(sample_index, tick)| (*tick, *sample_index));
 
+   // `ticks_for_range` emits exactly one entry per sample of the truncated
+   // range, so sorting only permutes it and each sample has a single position.
+   // Inverting the permutation once per GOP keeps the per-target lookup O(1)
+   // instead of rescanning the whole range for every target.
+   let mut output_index_by_sample = Vec::new();
+   output_index_by_sample
+      .try_reserve_exact(gop_len)
+      .map_err(|_| too_many_thumbnail_samples())?;
+   output_index_by_sample.resize(gop_len, None);
+   for (output_index, (sample_index, _)) in presentation_order.iter().enumerate() {
+      let slot = sample_offset(*sample_index, truncated.start_sample)
+         .and_then(|offset| output_index_by_sample.get_mut(offset))
+         .ok_or_else(|| {
+            MediaParserError::InvalidFormat("invalid video timing tables".to_string())
+         })?;
+      *slot = Some(output_index);
+   }
+
    let mut output_indices = Vec::new();
    output_indices
       .try_reserve(target_indices.len())
       .map_err(|_| MediaParserError::InvalidFormat("too many thumbnail targets".to_string()))?;
    for index in target_indices {
       let target = &mut targets[*index];
-      let output_index = presentation_order
-         .iter()
-         .position(|(sample_index, _)| *sample_index == target.sample_index)
+      let output_index = sample_offset(target.sample_index, truncated.start_sample)
+         .and_then(|offset| output_index_by_sample.get(offset).copied().flatten())
          .ok_or_else(|| {
             MediaParserError::InvalidFormat("selected sample is outside its GOP".to_string())
          })?;
@@ -655,6 +673,12 @@ fn truncated_gop(gop: Gop, target_indices: &[usize], targets: &[ExactTarget]) ->
       start_sample: gop.start_sample,
       end_sample,
    })
+}
+
+/// Position of `sample_index` within a GOP starting at `start_sample`, or
+/// `None` when the sample precedes the GOP.
+fn sample_offset(sample_index: u32, start_sample: u32) -> Option<usize> {
+   usize::try_from(sample_index.checked_sub(start_sample)?).ok()
 }
 
 fn gop_sample_count(gop: Gop) -> Result<usize> {
@@ -952,6 +976,76 @@ mod tests {
       let targets_by_gop = BTreeMap::from([(targets[0].gop, vec![0])]);
 
       validate_gop_sample_budget(&targets_by_gop, &targets).unwrap();
+   }
+
+   #[test]
+   fn maps_repeated_targets_to_presentation_positions_when_reordered() {
+      // Decode order I P B B presents as I B B P, so every sample but the
+      // first sits at a presentation position that differs from its decode one.
+      let mut stts = vec![0; 8];
+      stts[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stts.extend_from_slice(&4u32.to_be_bytes());
+      stts.extend_from_slice(&1u32.to_be_bytes());
+      let composition_offsets = [
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: 0,
+         },
+         CompositionOffset {
+            sample_count: 1,
+            sample_offset: 2,
+         },
+         CompositionOffset {
+            sample_count: 2,
+            sample_offset: -1,
+         },
+      ];
+      let timeline = PresentationTimeline::new(&stts, Some(&composition_offsets), 0, 4).unwrap();
+      let gop = Gop {
+         start_sample: 1,
+         end_sample: 4,
+      };
+      let target = |sample_index, presentation_tick| ExactTarget {
+         gop,
+         sample_index,
+         presentation_tick,
+         output_index: 0,
+      };
+      let mut targets = vec![target(4, 2), target(2, 3), target(4, 2)];
+
+      let plan = plan_gop_job(&timeline, gop, &[0, 1, 2], &mut targets).unwrap();
+
+      // Presentation order is samples 1, 3, 4, 2.
+      assert_eq!(targets[0].output_index, 2);
+      assert_eq!(targets[1].output_index, 3);
+      assert_eq!(targets[2].output_index, 2);
+      assert_eq!(plan.gop, gop);
+      assert_eq!(plan.output_indices, vec![2, 3]);
+      assert_eq!(plan.output_counts, vec![2, 1]);
+   }
+
+   #[test]
+   fn rejects_a_target_that_precedes_its_gop() {
+      let timeline = test_timeline(4);
+      let gop = Gop {
+         start_sample: 2,
+         end_sample: 4,
+      };
+      let target = |sample_index| ExactTarget {
+         gop,
+         sample_index,
+         presentation_tick: 0,
+         output_index: 0,
+      };
+      let mut targets = vec![target(1), target(4)];
+
+      let error = plan_gop_job(&timeline, gop, &[0, 1], &mut targets)
+         .expect_err("a target before its GOP start has no presentation position");
+
+      assert_eq!(
+         error.to_string(),
+         "Invalid MP4 format: selected sample is outside its GOP"
+      );
    }
 
    #[test]

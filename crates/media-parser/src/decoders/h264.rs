@@ -1021,10 +1021,15 @@ mod tests {
          std::panic::catch_unwind(|| AxisTaps::stratified(usize::MAX - 1, usize::MAX, usize::MAX))
             .expect("large dimensions must not panic");
 
-      if let Ok(taps) = result {
-         assert_eq!(taps.len, 4);
-         assert!(taps.indices.iter().all(|index| *index < usize::MAX));
-         assert!((taps.weights.iter().sum::<f32>() - 1.0).abs() < f32::EPSILON);
+      match result {
+         // The tap products fit in u128 on 32-bit targets and overflow on
+         // 64-bit ones, so both outcomes are pinned rather than accepted.
+         Ok(taps) => {
+            assert_eq!(taps.len, 4);
+            assert!(taps.indices.iter().all(|index| *index < usize::MAX));
+            assert!((taps.weights.iter().sum::<f32>() - 1.0).abs() < f32::EPSILON);
+         }
+         Err(error) => assert_eq!(error, "scaled image axis arithmetic overflow"),
       }
    }
 
