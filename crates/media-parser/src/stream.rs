@@ -348,9 +348,12 @@ impl HttpStreamReader {
    }
 
    async fn build_with_headers(url: &str, headers: HeaderMap) -> Result<Self> {
-      let client = Client::builder()
+      let builder = Client::builder()
          .default_headers(headers)
-         .timeout(Duration::from_secs(30))
+         .timeout(Duration::from_secs(30));
+      #[cfg(target_os = "android")]
+      let builder = builder.tls_certs_only(bundled_tls_certificates()?);
+      let client = builder
          .build()
          .map_err(|e| MediaParserError::HttpRequest(format!("Failed to build client: {}", e)))?;
 
@@ -552,6 +555,15 @@ impl HttpStreamReader {
       }
       Ok(total_read)
    }
+}
+
+#[cfg(target_os = "android")]
+fn bundled_tls_certificates() -> Result<Vec<reqwest::Certificate>> {
+   webpki_root_certs::TLS_SERVER_ROOT_CERTS
+      .iter()
+      .map(|certificate| reqwest::Certificate::from_der(certificate.as_ref()))
+      .collect::<reqwest::Result<Vec<_>>>()
+      .map_err(|error| MediaParserError::HttpRequest(format!("Invalid bundled TLS root: {error}")))
 }
 
 #[async_trait]
