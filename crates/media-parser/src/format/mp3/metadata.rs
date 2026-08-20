@@ -130,6 +130,12 @@ struct Id3Frame {
 
 /// Reads all ID3v2 frames from the tag.
 async fn read_id3_frames(reader: &dyn StreamReader, header: &Id3Header) -> Result<Vec<Id3Frame>> {
+   // ID3v2.2 uses 6-byte frame headers with 3-character IDs; parsing it with
+   // the 10-byte header layout would misread sizes, so its frames are skipped.
+   if header.version.0 < 3 {
+      return Ok(Vec::new());
+   }
+
    let tag_size = usize::try_from(header.tag_size)
       .map_err(|_| MediaParserError::InvalidFormat("ID3 tag is too large".to_string()))?;
    if tag_size > MAX_ID3_TAG_BYTES {
@@ -146,11 +152,9 @@ async fn read_id3_frames(reader: &dyn StreamReader, header: &Id3Header) -> Resul
    let bytes_read = reader
       .read_at(ID3_HEADER_SIZE as u64, &mut tag_data)
       .await?;
-   if bytes_read != tag_size {
-      return Err(MediaParserError::InvalidFormat(format!(
-         "truncated ID3 tag: expected {tag_size} bytes, read {bytes_read}"
-      )));
-   }
+   // A tag whose declared size runs past the end of the object yields the
+   // frames that arrived instead of failing the whole file.
+   tag_data.truncate(bytes_read);
 
    let tag_unsynchronized = header.flags & 0x80 != 0;
    if tag_unsynchronized && header.version.0 < 4 {
@@ -244,9 +248,9 @@ fn parse_id3_frames(
          break;
       }
       if frame_end > tag_data.len() {
-         return Err(MediaParserError::InvalidFormat(
-            "truncated ID3 frame data".to_string(),
-         ));
+         // A frame that overruns the tag ends the walk; the frames gathered
+         // so far are still returned.
+         break;
       }
 
       let format_flags = frame_header[9];
@@ -509,5 +513,126 @@ mod tests {
    fn test_deunsynchronize_removes_inserted_zeroes_and_preserves_final_byte() {
       let decoded = deunsynchronize(&[0xff, 0, 0xff, 0, 0x12, 0xff]).expect("decode");
       assert_eq!(decoded, [0xff, 0xff, 0x12, 0xff]);
+   }
+
+   struct BytesReader(Vec<u8>);
+
+   #[async_trait::async_trait]
+   impl StreamReader for BytesReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
+
+   struct UnreadableReader;
+
+   #[async_trait::async_trait]
+   impl StreamReader for UnreadableReader {
+      async fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<usize> {
+         Err(MediaParserError::Other("unexpected read".into()))
+      }
+
+      async fn size(&self) -> Result<u64> {
+         Err(MediaParserError::Other("unexpected size read".into()))
+      }
+   }
+
+   fn id3_header(version: u8, tag_size: usize) -> Vec<u8> {
+      let size = tag_size as u32;
+      vec![
+         b'I',
+         b'D',
+         b'3',
+         version,
+         0,
+         0,
+         ((size >> 21) & 0x7f) as u8,
+         ((size >> 14) & 0x7f) as u8,
+         ((size >> 7) & 0x7f) as u8,
+         (size & 0x7f) as u8,
+      ]
+   }
+
+   /// Builds a v2.3 TIT2 text frame holding `text` (UTF-8 encoding byte).
+   fn tit2_frame(text: &str) -> Vec<u8> {
+      let mut frame = b"TIT2".to_vec();
+      frame.extend_from_slice(&(text.len() as u32 + 1).to_be_bytes());
+      frame.extend_from_slice(&[0, 0]);
+      frame.push(3);
+      frame.extend_from_slice(text.as_bytes());
+      frame
+   }
+
+   /// Builds `count` 417-byte MPEG-1 Layer III frames (128 kbps, 44.1 kHz).
+   fn audio_frames(count: usize) -> Vec<u8> {
+      const FRAME_SIZE: usize = 417;
+      let mut data = vec![0; FRAME_SIZE * count];
+      for index in 0..count {
+         data[FRAME_SIZE * index..FRAME_SIZE * index + 4]
+            .copy_from_slice(&[0xff, 0xfb, 0x90, 0x00]);
+      }
+      data
+   }
+
+   #[tokio::test]
+   async fn read_metadata_keeps_frames_and_zero_duration_for_truncated_tag() {
+      // Declared tag size runs past the end of the object.
+      let mut data = id3_header(3, 1000);
+      data.extend_from_slice(&tit2_frame("Hi"));
+      data.extend_from_slice(&audio_frames(2));
+
+      let metadata = read_metadata(&BytesReader(data)).await.unwrap();
+
+      assert!(
+         metadata
+            .values
+            .iter()
+            .any(|meta| meta.key == "TIT2" && meta.value == "Hi")
+      );
+      assert_eq!(metadata.duration, 0);
+   }
+
+   #[tokio::test]
+   async fn read_metadata_stops_walk_on_frame_overrunning_tag() {
+      let mut data = id3_header(3, tit2_frame("Hi").len() + ID3_FRAME_HEADER_SIZE);
+      data.extend_from_slice(&tit2_frame("Hi"));
+      // A frame header whose declared size overruns the end of the tag.
+      data.extend_from_slice(b"TALB");
+      data.extend_from_slice(&500u32.to_be_bytes());
+      data.extend_from_slice(&[0, 0]);
+      data.extend_from_slice(&audio_frames(2));
+
+      let metadata = read_metadata(&BytesReader(data)).await.unwrap();
+
+      assert!(
+         metadata
+            .values
+            .iter()
+            .any(|meta| meta.key == "TIT2" && meta.value == "Hi")
+      );
+      assert!(metadata.values.iter().all(|meta| meta.key != "TALB"));
+      assert_eq!(metadata.duration, 52);
+   }
+
+   #[tokio::test]
+   async fn read_id3_frames_skips_id3v22_without_reading_tag_data() {
+      let header = Id3Header {
+         version: (2, 0),
+         flags: 0,
+         tag_size: 9,
+      };
+
+      let frames = read_id3_frames(&UnreadableReader, &header).await.unwrap();
+
+      assert!(frames.is_empty());
    }
 }
