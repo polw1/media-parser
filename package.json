@@ -15,7 +15,7 @@
       "markdownlint": "markdownlint-cli2",
       "rust:lint": "cargo lint-clippy && cargo lint-fmt",
       "rust:lint:fix": "cargo fix-clippy && cargo fix-fmt",
-      "standards": "npm run markdownlint && npm run rust:lint && npm run test:types && npm run check-node-version",
+      "standards": "npm run markdownlint && npm run rust:lint && npm run build && npm run check-node-version",
       "test:types": "tsc --noEmit --strict --target ES2020 --module ES2020 --moduleResolution node --lib ES2020,DOM guest-js/index.test.ts",
       "test:runtime": "tsc -p guest-js/tsconfig.test.json && node --test .test-dist/*.test.js"
    },

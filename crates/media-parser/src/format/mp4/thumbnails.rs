@@ -463,14 +463,7 @@ fn find_video_track(
       let Some(stbl) = mdia.nav(&[*b"minf", *b"stbl"]) else {
          continue;
       };
-      let presentation_offset = match trak.nav(&[*b"edts", *b"elst"]) {
-         Some(elst) => parse_elst_media_time(elst).ok_or_else(|| {
-            MediaParserError::InvalidFormat(
-               "video track uses an unsupported MP4 edit list".to_string(),
-            )
-         })?,
-         None => 0,
-      };
+      let presentation_offset = track_presentation_offset(trak);
 
       let tables = parse_video_sample_tables(stbl)?;
       // Some files carry a zero mdhd duration; fall back to the duration
@@ -721,9 +714,13 @@ fn keyframe_target(
       MediaParserError::InvalidFormat("could not select video sample".to_string())
    })?;
    let sync_sample = nearest_sync_sample(selection.sample_index, tables.sync_samples.as_deref());
+   // The timeline keeps negative ticks for samples preceding a non-empty
+   // edit's media time, and walking back to the enclosing sync sample can land
+   // on one when a clip is trimmed mid-GOP. Such a keyframe presents at the
+   // start of the edited timeline, so clamp rather than fail the request.
    let presentation_tick = timeline
       .tick(sync_sample)
-      .and_then(|tick| u64::try_from(tick).ok())
+      .and_then(|tick| u64::try_from(tick.max(0)).ok())
       .ok_or_else(|| MediaParserError::InvalidFormat("invalid video timing tables".to_string()))?;
    Ok(ExactTarget {
       gop: Gop {
@@ -825,6 +822,25 @@ fn parse_avc_descriptions(stsd: &[u8]) -> Option<Vec<Option<AvcConfig>>> {
    (descriptions.len() == entry_count).then_some(descriptions)
 }
 
+/// Resolves the presentation offset an `edts`/`elst` applies to a track,
+/// degrading to none for edit lists this parser does not model.
+///
+/// Only a single normal-rate segment maps to a scalar offset. A list with
+/// several real segments can repeat, reorder or retime media, which one
+/// offset cannot express — applying the first segment's `media_time` to the
+/// whole timeline would silently misplace every later segment. Falling back
+/// to zero instead leaves such a track behaving exactly like one carrying no
+/// `edts` at all, which is the same degrade-rather-than-fail policy
+/// `resolve_gop_color` applies to the colour hint.
+fn track_presentation_offset(trak: &[u8]) -> i64 {
+   trak
+      .nav(&[*b"edts", *b"elst"])
+      .and_then(parse_elst_media_time)
+      .unwrap_or(0)
+}
+
+/// Reads the media time of an edit list, or `None` when the list is not a
+/// single normal-rate segment. See [`track_presentation_offset`].
 fn parse_elst_media_time(elst: &[u8]) -> Option<i64> {
    let version = *elst.first()?;
    let entry_size = match version {
@@ -894,12 +910,43 @@ mod tests {
       }
    }
 
-   fn test_timeline(sample_count: u32) -> PresentationTimeline {
+   fn stts_bytes(sample_count: u32, sample_delta: u32) -> Vec<u8> {
       let mut stts = vec![0; 8];
       stts[4..8].copy_from_slice(&1u32.to_be_bytes());
       stts.extend_from_slice(&sample_count.to_be_bytes());
-      stts.extend_from_slice(&1u32.to_be_bytes());
-      PresentationTimeline::new(&stts, None, 0, sample_count).unwrap()
+      stts.extend_from_slice(&sample_delta.to_be_bytes());
+      stts
+   }
+
+   fn test_timeline(sample_count: u32) -> PresentationTimeline {
+      PresentationTimeline::new(&stts_bytes(sample_count, 1), None, 0, sample_count).unwrap()
+   }
+
+   fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+      let mut data = u32::try_from(payload.len() + 8)
+         .unwrap()
+         .to_be_bytes()
+         .to_vec();
+      data.extend_from_slice(fourcc);
+      data.extend_from_slice(payload);
+      data
+   }
+
+   /// Builds a version 0 `elst` payload from `(segment_duration, media_time)`
+   /// pairs, all at normal rate.
+   fn elst_payload(segments: &[(u32, i32)]) -> Vec<u8> {
+      let mut payload = vec![0; 4];
+      payload.extend_from_slice(&u32::try_from(segments.len()).unwrap().to_be_bytes());
+      for (segment_duration, media_time) in segments {
+         payload.extend_from_slice(&segment_duration.to_be_bytes());
+         payload.extend_from_slice(&media_time.to_be_bytes());
+         payload.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+      }
+      payload
+   }
+
+   fn trak_with_edit_list(segments: &[(u32, i32)]) -> Vec<u8> {
+      mp4_box(b"edts", &mp4_box(b"elst", &elst_payload(segments)))
    }
 
    #[test]
@@ -1152,5 +1199,60 @@ mod tests {
 
       assert_eq!(parse_elst_media_time(&empty_edit), Some(0));
       assert_eq!(parse_elst_media_time(&multiple_edits), None);
+   }
+
+   #[test]
+   fn falls_back_to_no_presentation_offset_for_unmodeled_edit_lists() {
+      let single_segment = trak_with_edit_list(&[(1_000, 512)]);
+      let several_segments = trak_with_edit_list(&[(1_000, 0), (1_000, 1_000)]);
+      let malformed = mp4_box(b"edts", &mp4_box(b"elst", &[0, 0]));
+
+      assert_eq!(track_presentation_offset(&single_segment), 512);
+      assert_eq!(
+         track_presentation_offset(&several_segments),
+         0,
+         "a multi-segment edit list must degrade to no offset, as a track without edts does"
+      );
+      assert_eq!(track_presentation_offset(&malformed), 0);
+      assert_eq!(track_presentation_offset(&[]), 0);
+   }
+
+   #[test]
+   fn clamps_a_keyframe_preceding_the_edit_to_zero() {
+      // Four samples 100 ticks apart, trimmed 250 ticks in. Only the last
+      // sample presents at or after the edit; the sole sync sample is the
+      // first, three positions behind it in decode order.
+      let stts = stts_bytes(4, 100);
+      let timeline = PresentationTimeline::new(&stts, None, 250, 4).unwrap();
+      let track = VideoTrack {
+         id: 1,
+         timescale: 1_000,
+         duration: 400,
+         presentation_offset: 250,
+      };
+      let tables = VideoSampleTables {
+         stts,
+         composition_offsets: None,
+         sizes: SampleSizes::fixed(4, 1).unwrap(),
+         stsc: vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 4,
+            sample_description_index: 1,
+         }],
+         chunk_offsets: vec![0],
+         sync_samples: Some(vec![1]),
+         avc_configs: vec![Some(AvcConfig {
+            length_size: 4,
+            sps: vec![vec![1]],
+            pps: vec![vec![2]],
+            color: Default::default(),
+         })],
+      };
+
+      let target = keyframe_target(&track, &tables, &timeline, Duration::from_millis(50))
+         .expect("a keyframe before the edit must not fail the request");
+
+      assert_eq!(target.sample_index, 1);
+      assert_eq!(target.presentation_tick, 0);
    }
 }
