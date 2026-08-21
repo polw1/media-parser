@@ -65,7 +65,7 @@ pub mod signatures;
 
 use crate::Result;
 use crate::stream::StreamReader;
-use crate::types::{Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -80,6 +80,12 @@ pub type AsyncTrackParser =
    for<'a> fn(
       &'a dyn StreamReader,
    ) -> Pin<Box<dyn Future<Output = Result<Vec<TrackType>>> + Send + 'a>>;
+
+/// Async cover parser function type.
+pub type AsyncCoverParser =
+   for<'a> fn(
+      &'a dyn StreamReader,
+   ) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + 'a>>;
 
 /// Format signature for identification.
 ///
@@ -104,6 +110,7 @@ pub struct Format {
    pub signature: FormatSignature,
    pub parser: AsyncParser,
    pub track_parser: AsyncTrackParser,
+   pub cover_parser: AsyncCoverParser,
 }
 
 impl Format {
@@ -111,11 +118,13 @@ impl Format {
       signature: FormatSignature,
       parser: AsyncParser,
       track_parser: AsyncTrackParser,
+      cover_parser: AsyncCoverParser,
    ) -> Self {
       Self {
          signature,
          parser,
          track_parser,
+         cover_parser,
       }
    }
 

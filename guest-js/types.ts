@@ -36,6 +36,75 @@ export interface MetadataOptions {
    headers?: Record<string, string>;
 }
 
+/**
+ * Embedded cover artwork.
+ */
+export interface CoverInfo {
+   format: 'jpeg' | 'png';
+   mimeType: 'image/jpeg' | 'image/png';
+   /**
+    * Image bytes backed by the shared binary IPC response. Retaining this view
+    * retains the whole response; copy it with `new Uint8Array(data)` to detach.
+    */
+   data: Uint8Array;
+}
+
+/**
+ * Thumbnail extracted from a video track.
+ */
+export interface ThumbnailInfo {
+   trackId: number;
+   width: number;
+   height: number;
+   /** Presentation time of the returned frame, in seconds. */
+   timestampSec: number;
+   /** Always JPEG: decoded frames are encoded as JPEG by the Rust side. */
+   format: 'jpeg';
+   mimeType: 'image/jpeg';
+   /**
+    * Image bytes backed by the batch's shared binary IPC response. Retaining
+    * this view retains the whole batch; copy it to detach the thumbnail.
+    */
+   data: Uint8Array;
+}
+
+/**
+ * Options for extracting thumbnails.
+ */
+export interface ThumbnailsOptions extends MetadataOptions {
+   /**
+    * Timestamps to extract, in milliseconds. Each must be a non-negative
+    * safe integer, and at most 4,096 entries may be requested at once;
+    * {@link getThumbnails} rejects anything else before the call reaches the
+    * backend.
+    */
+   timestamps: number[];
+   /** Track id to extract from. Defaults to the first video track. */
+   trackId?: number;
+   /**
+    * Decode exact requested frames. Defaults to `false`, which returns the
+    * preceding keyframe and its actual presentation time.
+    */
+   accurate?: boolean;
+   /**
+    * JPEG quality of the returned frames, from 1 to 100. Defaults to 60.
+    *
+    * This trades size, not time: a 1080p frame costs about the same to encode
+    * at 40 as at 85, while the output grows roughly 4×. Note that the encoder
+    * drops to 4:2:0 chroma subsampling below 90, so 89 → 90 is a step rather
+    * than a smooth increase.
+    */
+   quality?: number;
+   /**
+    * Maximum JPEG width. Together with `maxHeight`, forms an
+    * aspect-ratio-preserving bounding box. The default box is 320×320;
+    * specifying only one dimension leaves the other unconstrained.
+    */
+   maxWidth?: number;
+   /** Maximum JPEG height; see `maxWidth`. */
+   maxHeight?: number;
+}
+
 // ============================================================================
 // Track Types
 // ============================================================================

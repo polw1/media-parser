@@ -17,7 +17,7 @@ use super::{Format, FormatSignature};
 use crate::Result;
 use crate::errors::MediaParserError;
 use crate::stream::StreamReader;
-use crate::types::{Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, TrackType};
 use std::sync::LazyLock;
 
 /// Global registry of supported formats.
@@ -40,30 +40,31 @@ pub fn detect_format_by_extension(ext: &str) -> Option<&'static Format> {
    FORMATS.iter().find(|f| f.matches_extension(ext)).copied()
 }
 
-/// Parses metadata by detecting format and dispatching to the appropriate parser.
-pub async fn parse_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
-   // Read enough bytes to detect format (ftyp box is within first 32 bytes)
+async fn detect_format_async(reader: &dyn StreamReader) -> Result<&'static Format> {
    let mut header = [0u8; 32];
    reader.read_at(0, &mut header).await?;
 
-   let format = detect_format(&header).ok_or_else(|| {
+   detect_format(&header).ok_or_else(|| {
       MediaParserError::InvalidFormat("Could not detect format from file header".to_string())
-   })?;
+   })
+}
 
-   // Dispatch to the appropriate parser
+/// Parses metadata by detecting format and dispatching to the appropriate parser.
+pub async fn parse_metadata(reader: &dyn StreamReader) -> Result<Metadata> {
+   let format = detect_format_async(reader).await?;
    (format.parser)(reader).await
 }
 
 /// Parses track metadata by detecting format and dispatching to the appropriate parser.
 pub async fn parse_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
-   let mut header = [0u8; 32];
-   reader.read_at(0, &mut header).await?;
-
-   let format = detect_format(&header).ok_or_else(|| {
-      MediaParserError::InvalidFormat("Could not detect format from file header".to_string())
-   })?;
-
+   let format = detect_format_async(reader).await?;
    (format.track_parser)(reader).await
+}
+
+/// Parses embedded cover artwork.
+pub async fn parse_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
+   let format = detect_format_async(reader).await?;
+   (format.cover_parser)(reader).await
 }
 
 /// Returns an iterator over all supported format signatures.

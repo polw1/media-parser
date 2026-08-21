@@ -9,7 +9,7 @@
 //! ├── mod.rs          # Format registration and public API
 //! ├── metadata.rs     # Duration, timescale, tags extraction
 //! ├── subtitles.rs    # Subtitle track extraction (TODO)
-//! ├── thumbnails.rs   # Thumbnail/poster extraction (TODO)
+//! ├── thumbnails.rs   # H.264 thumbnail/keyframe extraction
 //! └── atoms/          # Box parsing utilities
 //!     ├── types.rs    # Mp4Box enum
 //!     ├── iter.rs     # Mp4BoxIter, iter_boxes
@@ -35,13 +35,14 @@
 pub mod atoms;
 pub mod metadata;
 pub mod subtitles;
+mod thumbnail_io;
 pub mod thumbnails;
 pub mod tracks;
 
 use crate::Result;
-use crate::format::{AsyncParser, AsyncTrackParser, Format};
+use crate::format::{AsyncCoverParser, AsyncParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::{Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, TrackType};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -59,11 +60,18 @@ fn parse_tracks(
    Box::pin(tracks::read_tracks(reader))
 }
 
+fn parse_cover(
+   reader: &dyn StreamReader,
+) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + '_>> {
+   Box::pin(read_cover(reader))
+}
+
 /// MP4 format definition registered in the global table.
 pub static FORMAT: Format = Format::new(
    SIGNATURE,
    parse as AsyncParser,
    parse_tracks as AsyncTrackParser,
+   parse_cover as AsyncCoverParser,
 );
 
 /// Main parsing function.
@@ -71,6 +79,16 @@ async fn parse_mp4(reader: &dyn StreamReader) -> Result<Metadata> {
    metadata::read_metadata(reader).await
 }
 
+pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
+   let moov = atoms::find_and_read_moov_box(reader).await?;
+   let moov_payload = atoms::parse_moov_payload(&moov)?;
+   Ok(atoms::parse_cover_art(moov_payload))
+}
+
 // Re-export for direct access
+pub use crate::decoders::h264::ThumbnailSize;
 pub use metadata::read_metadata;
+pub use thumbnails::{
+   MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions, read_frame, read_frames, read_keyframes,
+};
 pub use tracks::read_tracks;

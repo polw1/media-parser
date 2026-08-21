@@ -52,12 +52,13 @@ const MOOV_CHILD_FOURCCS: &[[u8; 4]] = &[
 /// # }
 /// ```
 pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>> {
-   let file_size = reader.size().await?;
-
    // Strategy 1: Head - iterate aligned boxes
-   let head_len = HEAD_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
-   let mut head_buf = vec![0u8; head_len];
-   let _ = reader.read_at(0, &mut head_buf).await?;
+   // Read before asking for size so HTTP readers can learn it from Content-Range
+   // and avoid a separate HEAD request.
+   let mut head_buf = vec![0u8; HEAD_SIZE];
+   let head_read = reader.read_at(0, &mut head_buf).await?;
+   head_buf.truncate(head_read);
+   let file_size = reader.size().await?;
 
    if let Some((pos, size)) = find_moov_aligned(&head_buf, 0) {
       return read_moov_at(reader, pos, size, &head_buf, 0).await;
@@ -174,6 +175,35 @@ fn find_moov_pattern(buf: &[u8], base_offset: u64, file_size: u64) -> Option<(u6
 #[cfg(test)]
 mod tests {
    use super::*;
+   use std::sync::atomic::{AtomicBool, Ordering};
+
+   struct ReadBeforeSizeReader {
+      data: Vec<u8>,
+      read_started: AtomicBool,
+   }
+
+   #[async_trait::async_trait]
+   impl StreamReader for ReadBeforeSizeReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+         self.read_started.store(true, Ordering::Relaxed);
+         let start = usize::try_from(offset).unwrap_or(usize::MAX);
+         let Some(source) = self.data.get(start..) else {
+            return Ok(0);
+         };
+         let read = buf.len().min(source.len());
+         buf[..read].copy_from_slice(&source[..read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> Result<u64> {
+         if !self.read_started.load(Ordering::Relaxed) {
+            return Err(MediaParserError::Other(
+               "size was requested before the initial range read".to_string(),
+            ));
+         }
+         Ok(self.data.len() as u64)
+      }
+   }
 
    fn make_box(fourcc: &[u8; 4], payload_size: usize) -> Vec<u8> {
       let total = 8 + payload_size;
@@ -205,6 +235,20 @@ mod tests {
       buf.extend_from_slice(&(total as u64).to_be_bytes());
       buf.extend(mvhd);
       buf
+   }
+
+   #[tokio::test]
+   async fn reads_the_head_before_requesting_stream_size() {
+      let reader = ReadBeforeSizeReader {
+         data: make_moov_with_mvhd(),
+         read_started: AtomicBool::new(false),
+      };
+
+      let moov = find_and_read_moov_box(&reader)
+         .await
+         .expect("the first read should make the size available");
+
+      assert_eq!(moov, reader.data);
    }
 
    #[test]

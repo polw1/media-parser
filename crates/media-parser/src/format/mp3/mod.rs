@@ -44,9 +44,9 @@ pub mod tables;
 pub mod tags;
 
 use crate::Result;
-use crate::format::{AsyncParser, AsyncTrackParser, Format};
+use crate::format::{AsyncCoverParser, AsyncParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::{AudioTrackMeta, BaseTrackMeta, Metadata, TrackType};
+use crate::types::{AudioTrackMeta, BaseTrackMeta, CoverArt, Metadata, TrackType};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -65,11 +65,18 @@ fn parse_tracks(
    Box::pin(read_tracks(reader))
 }
 
+fn parse_cover(
+   reader: &dyn StreamReader,
+) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + '_>> {
+   Box::pin(metadata::read_cover(reader))
+}
+
 /// MP3 format definition registered in the global table.
 pub static FORMAT: Format = Format::new(
    SIGNATURE,
    parse as AsyncParser,
    parse_tracks as AsyncTrackParser,
+   parse_cover as AsyncCoverParser,
 );
 
 /// Main parsing function.

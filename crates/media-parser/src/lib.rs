@@ -24,6 +24,49 @@
 //! }
 //! ```
 //!
+//! ### Extract MP4/H.264 thumbnails
+//!
+//! [`ThumbnailIndex`](format::mp4::ThumbnailIndex) parses an MP4 video index
+//! once and can reuse it for multiple exact-frame or keyframe requests. Input
+//! timestamps are [`Duration`](std::time::Duration) values; each returned
+//! [`Frame`] reports the actual presentation time of the decoded frame.
+//!
+//! ```no_run
+//! use std::time::Duration;
+//! use media_parser::{FileStreamReader, format::mp4::{ThumbnailIndex, ThumbnailOptions}};
+//!
+//! #[tokio::main]
+//! async fn main() -> media_parser::Result<()> {
+//!     let reader = FileStreamReader::new("video.mp4")?;
+//!     let index = ThumbnailIndex::read(&reader, 0).await?;
+//!     let timestamps = [Duration::ZERO, Duration::from_secs(5)];
+//!     let frames = index
+//!         .keyframes(&reader, &timestamps, ThumbnailOptions::default())
+//!         .await?;
+//!
+//!     for frame in frames {
+//!         println!("JPEG at {:?}: {} bytes", frame.timestamp, frame.data.len());
+//!     }
+//!     Ok(())
+//! }
+//! ```
+//!
+//! Thumbnail extraction supports H.264/AVC video tracks in MP4-family
+//! containers. [`ThumbnailIndex::keyframes`](format::mp4::ThumbnailIndex::keyframes)
+//! returns preceding keyframes; use
+//! [`ThumbnailIndex::frames`](format::mp4::ThumbnailIndex::frames) for exact
+//! requested frames. Output preserves aspect ratio, never upscales, and fits
+//! a 320×320 bounding box by default; customize
+//! [`ThumbnailOptions::size`](format::mp4::ThumbnailOptions::size) with
+//! [`ThumbnailSize`](format::mp4::ThumbnailSize). For practical development
+//! performance, enable optimized
+//! dependencies in the consuming application's `Cargo.toml`:
+//!
+//! ```toml
+//! [profile.dev.package."*"]
+//! opt-level = 2
+//! ```
+//!
 //! ### Parse a remote file via HTTP
 //!
 //! ```no_run
@@ -51,6 +94,7 @@
 //! | [`MediaParser`] | High-level parser handle wrapping a stream reader |
 //! | [`FileStreamReader`] | Read from local filesystem |
 //! | [`HttpStreamReader`] | Read from HTTP/HTTPS URLs with range requests |
+//! | [`ThumbnailIndex`](format::mp4::ThumbnailIndex) | Reusable MP4/H.264 thumbnail index |
 //!
 //! ### Core Types
 //!
@@ -121,23 +165,25 @@
 //! }
 //! ```
 
+mod decoders;
 pub mod errors;
 pub mod format;
 pub mod helpers;
 pub mod stream;
 pub mod types;
-use std::time::Duration;
 
 // Public API
+pub use decoders::h264::JpegQuality;
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{
-   detect_format, get_format_info, is_supported, parse_metadata, parse_tracks, supported_formats,
+   detect_format, get_format_info, is_supported, parse_cover, parse_metadata, parse_tracks,
+   supported_formats,
 };
 pub use stream::{FileStreamReader, HttpStreamReader, StreamReader};
 pub use types::{
-   AudioTrackMeta, BaseTrackMeta, Frame, Meta, Metadata, PixelFormat, SubtitleCue, SubtitleTrack,
-   SubtitleTrackMeta, TrackFilter, TrackType, UnknownTrackMeta, VideoTrackMeta,
+   AudioTrackMeta, BaseTrackMeta, CoverArt, Frame, Meta, Metadata, PixelFormat, SubtitleCue,
+   SubtitleTrack, SubtitleTrackMeta, TrackFilter, TrackType, UnknownTrackMeta, VideoTrackMeta,
 };
 
 /// High-level parser handle.
@@ -161,45 +207,16 @@ impl<R: StreamReader> MediaParser<R> {
       format::registry::parse_tracks(&self.reader).await
    }
 
+   /// Extract embedded cover artwork, when present.
+   pub async fn cover(&self) -> Result<Option<CoverArt>> {
+      format::registry::parse_cover(&self.reader).await
+   }
+
    /// Extract subtitle tracks from the media file.
    pub async fn subtitles(&self, filter: Option<TrackFilter>) -> Result<Vec<SubtitleTrack>> {
       // TODO: Implement actual subtitle parsing
       let _ = filter; // Suppress unused parameter warning
       Ok(vec![])
-   }
-
-   /// Extract a single frame from a video track at the specified timestamp.
-   pub async fn frame(&self, track_id: u32, timestamp: Duration) -> Result<Frame> {
-      // TODO: Implement actual frame extraction
-      Ok(Frame {
-         track_id,
-         width: 1920,
-         height: 1080,
-         timestamp,
-         format: PixelFormat::Yuv420p,
-         data: vec![0; 1920 * 1080 * 3 / 2],  // YUV420p size
-         strides: Some(vec![1920, 960, 960]), // Y, U, V strides
-      })
-   }
-
-   /// Extract multiple frames from a video track at the specified timestamps.
-   pub async fn frames(&self, track_id: u32, timestamps: &[Duration]) -> Result<Vec<Frame>> {
-      // TODO: Implement actual frame extraction
-      let mut frames = Vec::new();
-
-      for &timestamp in timestamps {
-         frames.push(Frame {
-            track_id,
-            width: 1920,
-            height: 1080,
-            timestamp,
-            format: PixelFormat::Yuv420p,
-            data: vec![0; 1920 * 1080 * 3 / 2],  // YUV420p size
-            strides: Some(vec![1920, 960, 960]), // Y, U, V strides
-         });
-      }
-
-      Ok(frames)
    }
 
    /// List all supported format names.

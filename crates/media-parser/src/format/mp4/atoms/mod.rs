@@ -16,15 +16,19 @@
 //! └── tags.rs     # tag_name, fourcc_to_key
 //! ```
 
+mod cover;
 mod iter;
 mod media;
 mod moov;
 mod nav;
 mod read;
+mod sample_timing;
+mod samples;
 mod tags;
 mod types;
 
 // Re-export public items
+pub(super) use cover::parse_cover_art;
 pub use iter::{Mp4BoxIter, iter_boxes};
 pub use moov::find_and_read_moov_box;
 pub(super) use moov::parse_moov_payload;
@@ -37,4 +41,13 @@ pub use types::Mp4Box;
 pub(super) use media::{
    audio_params, fourcc_string, parse_hdlr, parse_mdhd, parse_stsd, parse_tkhd, stts_sample_count,
    visual_dimensions,
+};
+pub(super) use sample_timing::{
+   CompositionOffset, PresentationTimeline, duration_to_ticks, parse_ctts, stts_duration_ticks,
+   ticks_to_duration,
+};
+pub(super) use samples::{
+   SampleLocator, SampleSizes, StscEntry, nearest_sync_sample, next_sync_sample, parse_avc_config,
+   parse_chunk_offsets, parse_sample_sizes, parse_stsc, parse_stss, range_uses_description_index,
+   sample_description_index, sample_size, table_entries, validate_sample_tables,
 };

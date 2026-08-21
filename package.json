@@ -9,13 +9,15 @@
       "permissions"
    ],
    "scripts": {
-      "build": "tsc -p guest-js/tsconfig.json",
+      "build": "tsc -p guest-js/tsconfig.json && npm run test:types && npm run test:runtime",
       "check-node-version": "check-node-version --npm 11.17.0",
       "commitlint": "commitlint --from 3c4cb7c",
       "markdownlint": "markdownlint-cli2",
       "rust:lint": "cargo lint-clippy && cargo lint-fmt",
       "rust:lint:fix": "cargo fix-clippy && cargo fix-fmt",
-      "standards": "npm run markdownlint && npm run rust:lint && npm run check-node-version"
+      "standards": "npm run markdownlint && npm run rust:lint && npm run build && npm run check-node-version",
+      "test:types": "tsc --noEmit --strict --target ES2020 --module ES2020 --moduleResolution node --lib ES2020,DOM guest-js/index.test.ts",
+      "test:runtime": "tsc -p guest-js/tsconfig.test.json && node --test .test-dist/*.test.js"
    },
    "author": "Jeremy Thomerson",
    "license": "MIT",
@@ -26,6 +28,7 @@
    "devDependencies": {
       "@silvermine/standardization": "2.2.3",
       "@tauri-apps/api": "2.9.0",
+      "@types/node": "20.19.43",
       "typescript": "5.8.3"
    },
    "peerDependencies": {
