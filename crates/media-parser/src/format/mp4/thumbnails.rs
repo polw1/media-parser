@@ -17,10 +17,20 @@ use crate::stream::StreamReader;
 use crate::types::{Frame, PixelFormat};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 pub const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
+
+/// Limits CPU-bound index builds to the process's available parallelism.
+static INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
+   LazyLock::new(|| Arc::new(Semaphore::new(index_build_parallelism())));
+
+fn index_build_parallelism() -> usize {
+   std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get())
+}
 
 /// Encoding options for extracted thumbnails.
 ///
@@ -101,9 +111,28 @@ struct JobPlan {
 
 impl ThumbnailIndex {
    /// Reads and parses the selected video track's sample index.
+   ///
+   /// Reads the `moov` asynchronously, then builds its CPU-bound index on the
+   /// blocking pool, limited to the process's available parallelism.
    pub async fn read(reader: &dyn StreamReader, track_id: u32) -> Result<Self> {
       let moov = find_and_read_moov_box(reader).await?;
-      let moov_payload = parse_moov_payload(&moov)?;
+      // Keep the permit until parsing finishes, even if the caller is aborted.
+      let permit = Arc::clone(&INDEX_BUILD_PERMITS)
+         .acquire_owned()
+         .await
+         .expect("the index-build semaphore is never closed");
+      tokio::task::spawn_blocking(move || {
+         let _permit = permit;
+         Self::from_moov(&moov, track_id)
+      })
+      .await
+      .map_err(|error| {
+         MediaParserError::BlockingTask(format!("thumbnail index task failed: {error}"))
+      })?
+   }
+
+   fn from_moov(moov: &[u8], track_id: u32) -> Result<Self> {
+      let moov_payload = parse_moov_payload(moov)?;
       let (track, tables) = find_video_track(moov_payload, track_id)?.ok_or(
          MediaParserError::TrackNotFound(if track_id == 0 { 1 } else { track_id }),
       )?;
@@ -880,6 +909,61 @@ fn parse_elst_media_time(elst: &[u8]) -> Option<i64> {
 #[cfg(test)]
 mod tests {
    use super::*;
+
+   struct InMemoryReader(Vec<u8>);
+
+   #[async_trait::async_trait]
+   impl StreamReader for InMemoryReader {
+      async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+         let start = usize::try_from(offset)
+            .unwrap_or(usize::MAX)
+            .min(self.0.len());
+         let read = buf.len().min(self.0.len() - start);
+         buf[..read].copy_from_slice(&self.0[start..start + read]);
+         Ok(read)
+      }
+
+      async fn size(&self) -> Result<u64> {
+         Ok(self.0.len() as u64)
+      }
+   }
+
+   fn empty_moov_file() -> Vec<u8> {
+      let mut file = 8u32.to_be_bytes().to_vec();
+      file.extend_from_slice(b"moov");
+      file
+   }
+
+   // Verifies that index builds wait for and return the global concurrency permit.
+   #[tokio::test]
+   async fn index_builds_wait_for_a_permit_and_return_it() {
+      let total = index_build_parallelism();
+      let held = Arc::clone(&INDEX_BUILD_PERMITS)
+         .acquire_many_owned(u32::try_from(total).expect("parallelism fits u32"))
+         .await
+         .expect("the index-build semaphore is never closed");
+      assert_eq!(INDEX_BUILD_PERMITS.available_permits(), 0);
+
+      let mut build = tokio::spawn(async move {
+         let reader = InMemoryReader(empty_moov_file());
+         ThumbnailIndex::read(&reader, 0).await
+      });
+
+      assert!(
+         tokio::time::timeout(Duration::from_millis(100), &mut build)
+            .await
+            .is_err(),
+         "the index build ran while every permit was held"
+      );
+
+      drop(held);
+      let error = build
+         .await
+         .expect("the index build task did not panic")
+         .expect_err("an empty moov describes no video track");
+      assert!(matches!(error, MediaParserError::TrackNotFound(_)));
+      assert_eq!(INDEX_BUILD_PERMITS.available_permits(), total);
+   }
 
    fn test_track() -> VideoTrack {
       VideoTrack {
