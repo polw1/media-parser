@@ -8,6 +8,7 @@ Default permissions for the media-parser plugin
 - `allow-get-tracks`
 - `allow-get-cover`
 - `allow-get-thumbnails`
+- `allow-get-subtitles`
 
 ## Permission Table
 
@@ -66,6 +67,32 @@ Enables the get_metadata command without any pre-configured scope.
 <td>
 
 Denies the get_metadata command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`media-parser:allow-get-subtitles`
+
+</td>
+<td>
+
+Enables the get_subtitles command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`media-parser:deny-get-subtitles`
+
+</td>
+<td>
+
+Denies the get_subtitles command without any pre-configured scope.
 
 </td>
 </tr>
