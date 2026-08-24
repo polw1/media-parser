@@ -54,20 +54,104 @@ async fn main() -> media_parser::Result<()> {
 ### 3) Subtitles
 
 ```rust
-use media_parser::{MediaParser, FileStreamReader, TrackFilter};
+use std::time::Duration;
+use media_parser::{FileStreamReader, MediaParser, TrackFilter};
 
 #[tokio::main]
 async fn main() -> media_parser::Result<()> {
-    let mut parser = MediaParser::new(FileStreamReader::new("video.mp4"));
-    let subs = parser.subtitles(Some(TrackFilter::Language("eng".into()))).await?; // Vec<SubtitleTrack>
-    for t in &subs {
-        for cue in &t.cues {
-            println!("[{:?} - {:?}] {}", cue.start_time, cue.end_time, cue.text);
-        }
-    }
-    Ok(())
+   let parser = MediaParser::new(FileStreamReader::new("video.mp4")?);
+   let tracks = parser
+      .subtitles_in_range(
+         Some(TrackFilter::Language("ENG".into())),
+         (Duration::from_secs(5), Duration::from_secs(15)),
+      )
+      .await?;
+
+   for track in tracks {
+      for cue in track.cues {
+         println!(
+            "#{} [{:?} - {:?}] {}",
+            cue.cue_id, cue.start_time, cue.end_time, cue.text,
+         );
+      }
+   }
+   Ok(())
 }
 ```
+
+`MediaParser::subtitles` returns all cues; `subtitles_in_range` returns cues
+that overlap the half-open range `[start, end)`. Cue times remain absolute to
+the source rather than being clipped or rebased, and each `cue_id` is the
+stable, one-based MP4 sample index. `SubtitleTrack::base.duration` is the raw
+media duration in `base.timescale` ticks; cue times are `Duration` values.
+
+Only a single, non-empty, normal-rate MP4 edit-list segment is modeled as a
+scalar presentation offset before range selection. Empty, multi-segment,
+malformed, or non-1× edit lists degrade to a zero offset.
+
+The MP4 implementation supports `tx3g`, `wvtt`, `stpp`, and QuickTime `text`
+sample entries. It does not decode CEA-608/708 data embedded in video samples.
+Formats without a subtitle implementation, including MP3, return an empty
+vector.
+
+With no `TrackFilter`, all valid supported tracks are returned. Language
+matching is ASCII case-insensitive, an exact track ID selects that track, and a
+filter with no match returns an empty vector. `TrackFilter::TrackId(0)` is a
+literal ID in the Rust API; only the Tauri/TypeScript layer treats zero as
+"first valid supported track". An explicitly selected recoverably malformed or
+unsupported track returns an error, while unfiltered or language-filtered
+extraction skips it. Container-wide, I/O, and aggregate-budget failures still
+fail the complete request.
+
+#### Reusing an MP4 subtitle index
+
+Repeated range requests should build one `SubtitleIndex` and retain it:
+
+```rust
+use std::time::Duration;
+use media_parser::{FileStreamReader, TrackFilter, format::mp4::SubtitleIndex};
+
+#[tokio::main]
+async fn main() -> media_parser::Result<()> {
+   let reader = FileStreamReader::new("video.mp4")?;
+   let index = SubtitleIndex::read(&reader).await?;
+
+   for start in [0, 30] {
+      let tracks = index
+         .subtitles(
+            &reader,
+            Some(TrackFilter::Language("eng".into())),
+            Some((
+               Duration::from_secs(start),
+               Duration::from_secs(start + 30),
+            )),
+         )
+         .await?;
+      println!("{} track(s) overlap this segment", tracks.len());
+   }
+   Ok(())
+}
+```
+
+The index retains compact sample tables, not subtitle payloads or decoded text.
+It may be reused with any reader over exactly the same immutable source bytes;
+using it after the source changes is a caller error. The convenience functions
+`format::mp4::read_subtitles` and `read_subtitles_in_range` build a temporary
+index for each call.
+
+Clients making repeated range requests should retain one `SubtitleIndex`
+across those requests. Because returned cue times stay absolute to the media
+source, callers must clamp and rebase them when their output uses a different
+timeline.
+
+Index construction scans at most 1,000 MP4 tracks, accounts at most 200,000
+subtitle samples, and retains at most 32 MiB of index data. A request selects at
+most 200,000 samples/cues, reads at most 1 MiB per sample, 64 MiB logically and
+96 MiB physically, decodes at most 32 MiB of text, and projects at most 64 MiB
+of output. Coalesced I/O is limited to 4,096 regions of at most 8 MiB, with at
+most a 64 KiB gap joined into a region. These aggregate limits are shared across
+every selected track and overflow or allocation failures return errors instead
+of permitting unbounded growth.
 
 ### 4) Frames
 

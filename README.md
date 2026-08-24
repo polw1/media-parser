@@ -261,6 +261,75 @@ application's `src-tauri/Cargo.toml` for usable development performance:
 opt-level = 2
 ```
 
+### Subtitles
+
+`getSubtitles` extracts `tx3g`, `wvtt`, `stpp`, and QuickTime `text` subtitle
+tracks from MP4/M4V/MOV sources. It does not decode CEA-608/708 captions carried
+inside video samples. This Tauri command is MP4-family-only; a non-MP4 source,
+including MP3, returns a parsing error. The lower-level Rust `MediaParser`
+registry instead returns an empty subtitle vector for MP3.
+
+```typescript
+import { getSubtitles } from '@silvermine/tauri-plugin-media-parser';
+
+const tracks = await getSubtitles('/path/to/video.mp4', {
+   language: 'ENG',
+   // The range is half-open: cues overlap [5,000 ms, 15,000 ms).
+   startMs: 5_000,
+   endMs: 15_000,
+});
+
+for (const track of tracks) {
+   for (const cue of track.cues) {
+      // Times remain absolute to the source and are expressed in seconds.
+      console.log(cue.cueId, cue.startSec, cue.endSec, cue.text);
+   }
+}
+```
+
+A cue is selected when it overlaps the requested half-open range; it is not
+clipped or rebased. `cueId` is the stable, one-based MP4 sample index, so it
+does not change between full and ranged requests. `SubtitleInfo.duration` is
+the raw media duration in `timescale` ticks; `startSec` and `endSec` are seconds.
+
+Only a single, non-empty, normal-rate MP4 edit-list segment is modeled as a
+scalar presentation offset before selection. Empty, multi-segment, malformed,
+or non-1× edit lists degrade to a zero offset.
+
+Subtitle filters behave as follows:
+
+   * With neither `trackId` nor `language`, every valid supported track is
+     returned.
+   * Language matching is ASCII case-insensitive. An empty language is a valid
+     filter and normally returns no matches.
+   * `trackId` takes precedence when both selectors are present. `trackId: 0`
+     selects only the first valid supported track; a positive value selects
+     that exact track.
+   * A selector with no match returns an empty array.
+
+Unfiltered and language-filtered requests skip recoverably malformed or
+unsupported tracks. Selecting one of those tracks explicitly by a positive
+`trackId` returns an error instead of a partial result.
+
+`startMs` and `endMs` must either both be absent or both be non-negative safe
+integers with `startMs < endMs`. Subtitle work is bounded per request: at most
+200,000 selected samples and cues, 1 MiB per sample, 64 MiB of logical sample
+data, 96 MiB of physical reads, 32 MiB of decoded UTF-8 text, and a 64 MiB
+binary response envelope. Reads are further capped at 4,096 coalesced regions
+of at most 8 MiB each, with at most a 64 KiB gap joined into a region.
+
+The plugin caches at most eight source-wide subtitle sessions separately from
+the thumbnail cache. All filters and ranges for a source reuse the same parsed
+index; concurrent cold requests share its construction. Local sessions expire
+after one minute and remote sessions after five minutes. The source bytes must
+remain unchanged while a session is reused. Local path keys include file size
+and modification time; remote content served by the same URL and headers may
+remain cached until its TTL expires.
+
+Clients making repeated range requests should retain one core `SubtitleIndex`
+across those requests. Its cues keep absolute source times, so callers remain
+responsible for clamping and rebasing them to their output timeline.
+
 ## Development Standards
 
 This project follows the
