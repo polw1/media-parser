@@ -13,12 +13,13 @@
 //! └──────────────┴─────────────────┘
 //! ```
 
-use super::{Format, FormatSignature};
+use super::{Format, FormatSignature, validate_subtitle_range};
 use crate::Result;
 use crate::errors::MediaParserError;
 use crate::stream::StreamReader;
-use crate::types::{CoverArt, Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, SubtitleTrack, TrackFilter, TrackType};
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Global registry of supported formats.
 static FORMATS: LazyLock<Vec<&'static Format>> = LazyLock::new(|| {
@@ -65,6 +66,17 @@ pub async fn parse_tracks(reader: &dyn StreamReader) -> Result<Vec<TrackType>> {
 pub async fn parse_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
    let format = detect_format_async(reader).await?;
    (format.cover_parser)(reader).await
+}
+
+/// Parses subtitle tracks by detecting the format and dispatching to its parser.
+pub async fn parse_subtitles(
+   reader: &dyn StreamReader,
+   filter: Option<TrackFilter>,
+   range: Option<(Duration, Duration)>,
+) -> Result<Vec<SubtitleTrack>> {
+   validate_subtitle_range(range)?;
+   let format = detect_format_async(reader).await?;
+   (format.subtitle_parser)(reader, filter, range).await
 }
 
 /// Returns an iterator over all supported format signatures.
