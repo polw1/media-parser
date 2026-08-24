@@ -1,11 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { decodeEnvelope } from './envelope';
+import { decodeSubtitleEnvelope } from './subtitle-envelope';
+import { validateSubtitleOptions } from './subtitle-options';
 import { validateThumbnailDimensions, validateTimestamps } from './thumbnail-options';
 import type {
    CoverInfo,
    Metadata,
    MetadataOptions,
+   SubtitleInfo,
+   SubtitleOptions,
    ThumbnailInfo,
    ThumbnailsOptions,
    TrackInfo,
@@ -140,6 +144,36 @@ export async function getThumbnails(
    });
 
    return decodeThumbnailEnvelope(raw);
+}
+
+/**
+ * Extract subtitle tracks, optionally filtered and restricted to a half-open
+ * millisecond range.
+ *
+ * `trackId` takes precedence over `language`. `trackId: 0` selects the first
+ * valid supported subtitle track; without either filter, all valid supported
+ * subtitle tracks are returned. A filter with no match returns an empty array.
+ *
+ * @param source - Absolute path to a local file or URL of a remote media file
+ * @param options - Optional track/language filter, paired range, and URL headers
+ * @returns Subtitle tracks with absolute source cue times in seconds
+ * @throws TypeError if the track ID or paired range cannot be represented
+ */
+export async function getSubtitles(
+   source: string,
+   options: SubtitleOptions = {},
+): Promise<SubtitleInfo[]> {
+   validateSubtitleOptions(options);
+   const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_subtitles', {
+      source,
+      trackId: options.trackId,
+      language: options.language,
+      startMs: options.startMs,
+      endMs: options.endMs,
+      headers: options.headers,
+   });
+
+   return decodeSubtitleEnvelope(raw);
 }
 
 /**
