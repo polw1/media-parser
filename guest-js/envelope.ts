@@ -14,7 +14,32 @@ interface EnvelopeEntry {
    length: number;
 }
 
+export interface ParsedEnvelopeHeader<T> {
+   version: number;
+   entries: T[];
+   buffer: Uint8Array;
+   payloadStart: number;
+   payloadLength: number;
+}
+
 export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
+   const parsed = parseEnvelopeHeader<T & EnvelopeEntry>(raw);
+
+   if (!SUPPORTED_ENVELOPE_VERSIONS.has(parsed.version)) {
+      throw new TypeError(`Unsupported media envelope version: ${String(parsed.version)}.`);
+   }
+
+   return parsed.entries.map((entry) => decodeEnvelopeEntry(
+      entry,
+      parsed.buffer,
+      parsed.payloadStart,
+      parsed.payloadLength,
+   ));
+}
+
+export function parseEnvelopeHeader<T>(
+   raw: ArrayBuffer | Uint8Array,
+): ParsedEnvelopeHeader<T> {
    const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
    if (buffer.byteLength < 4) {
@@ -33,14 +58,15 @@ export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: U
 
    const parsed: unknown = JSON.parse(new TextDecoder().decode(header));
    const { version, entries } = normalizeEnvelopeHeader<T>(parsed);
-
-   if (!SUPPORTED_ENVELOPE_VERSIONS.has(version)) {
-      throw new TypeError(`Unsupported media envelope version: ${String(version)}.`);
-   }
-
    const payloadLength = buffer.byteLength - headerEnd;
 
-   return entries.map((entry) => decodeEnvelopeEntry(entry, buffer, headerEnd, payloadLength));
+   return {
+      version,
+      entries,
+      buffer,
+      payloadStart: headerEnd,
+      payloadLength,
+   };
 }
 
 function decodeEnvelopeEntry<T>(
@@ -81,9 +107,9 @@ function decodeEnvelopeEntry<T>(
 
 function normalizeEnvelopeHeader<T>(
    parsed: unknown,
-): { version: number; entries: (T & EnvelopeEntry)[] } {
+): { version: number; entries: T[] } {
    if (Array.isArray(parsed)) {
-      return { version: 0, entries: parsed as (T & EnvelopeEntry)[] };
+      return { version: 0, entries: parsed as T[] };
    }
 
    if (typeof parsed !== 'object' || parsed === null) {
@@ -101,6 +127,6 @@ function normalizeEnvelopeHeader<T>(
 
    return {
       version: header.version,
-      entries: header.entries as (T & EnvelopeEntry)[],
+      entries: header.entries as T[],
    };
 }

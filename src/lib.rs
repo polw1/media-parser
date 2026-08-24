@@ -50,6 +50,7 @@ mod commands;
 mod envelope;
 mod error;
 mod session_cache;
+mod source;
 
 pub use error::{Error, Result};
 

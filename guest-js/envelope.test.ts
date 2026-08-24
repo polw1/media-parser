@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { decodeEnvelope } from './envelope';
+import { decodeEnvelope, parseEnvelopeHeader } from './envelope';
 
 interface Entry {
    label: string;
@@ -42,6 +42,33 @@ test('decodes a version 1 { version, entries } header', () => {
    assert.equal(entries.length, 2);
    assert.deepEqual([...entries[0].data], [1, 2]);
    assert.deepEqual([...entries[1].data], [3]);
+});
+
+test('parses the shared prefix, normalized header, and payload boundaries', () => {
+   const envelope = buildEnvelope(
+      { version: 1, entries: [{ label: 'a', offset: 0, length: 2 }] },
+      [7, 8],
+   );
+
+   const parsed = parseEnvelopeHeader<Entry>(envelope);
+
+   assert.equal(parsed.version, 1);
+   assert.equal(parsed.entries[0].label, 'a');
+   assert.equal(parsed.buffer, envelope);
+   assert.equal(parsed.payloadStart + parsed.payloadLength, envelope.byteLength);
+   assert.deepEqual(
+      [...parsed.buffer.subarray(parsed.payloadStart, parsed.payloadStart + parsed.payloadLength)],
+      [7, 8],
+   );
+});
+
+test('shared header parsing normalizes a legacy bare array to version 0', () => {
+   const parsed = parseEnvelopeHeader<Entry>(
+      buildEnvelope([{ label: 'a', offset: 0, length: 0 }], []),
+   );
+
+   assert.equal(parsed.version, 0);
+   assert.equal(parsed.entries.length, 1);
 });
 
 test('decodes an empty envelope as zero entries', () => {
