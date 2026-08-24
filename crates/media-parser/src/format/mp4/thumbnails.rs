@@ -5,14 +5,17 @@ use super::atoms::{
    find_and_read_moov_box, iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config,
    parse_chunk_offsets, parse_ctts, parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes,
    parse_stsc, parse_stss, parse_tkhd, range_uses_description_index, sample_description_index,
-   stts_duration_ticks, table_entries, ticks_to_duration, validate_sample_tables,
+   stts_duration_ticks, table_entries, ticks_to_duration, track_presentation_offset,
+   validate_sample_tables,
 };
-use super::thumbnail_io::{MAX_SAMPLES_PER_THUMBNAIL_BATCH, read_samples_coalesced};
+use super::sample_io::{
+   MAX_SAMPLES_PER_THUMBNAIL_BATCH, SampleData, SampleReadBudget, SampleReadLimits,
+   read_samples_coalesced,
+};
 use crate::decoders::h264::{
    AvcConfig, DecodedImage, JpegQuality, OutputBudget, ThumbnailSize, decode_frames_to_jpeg,
 };
 use crate::errors::{MediaParserError, Result};
-use crate::helpers::{read_u32_be, read_u64_be};
 use crate::stream::StreamReader;
 use crate::types::{Frame, PixelFormat};
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -23,6 +26,15 @@ use tokio::sync::Semaphore;
 
 pub const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
+const THUMBNAIL_SAMPLE_READ_LIMITS: SampleReadLimits = SampleReadLimits {
+   max_samples: MAX_SAMPLES_PER_THUMBNAIL_BATCH,
+   max_sample_bytes: 64 * 1024 * 1024,
+   max_logical_bytes: 128 * 1024 * 1024,
+   max_physical_bytes: 128 * 1024 * 1024,
+   max_regions: MAX_SAMPLES_PER_THUMBNAIL_BATCH,
+   max_region_bytes: 64 * 1024 * 1024,
+   max_coalesce_gap_bytes: 32 * 1024,
+};
 
 /// Limits CPU-bound index builds to the process's available parallelism.
 static INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
@@ -95,7 +107,7 @@ struct ExactTarget {
 struct DecodeJob {
    gop: Gop,
    avc_config: AvcConfig,
-   samples: Vec<Vec<u8>>,
+   samples: Vec<SampleData>,
    output_indices: Vec<usize>,
    output_counts: Vec<usize>,
 }
@@ -185,12 +197,15 @@ impl ThumbnailIndex {
       }
 
       let wanted_samples = samples_for_gops(plans.iter().map(|plan| plan.gop))?;
+      let mut sample_read_budget = SampleReadBudget::default();
       let mut samples = read_samples_coalesced(
          reader,
          &wanted_samples,
          &self.tables.sizes,
          &self.tables.stsc,
          &self.tables.chunk_offsets,
+         THUMBNAIL_SAMPLE_READ_LIMITS,
+         &mut sample_read_budget,
       )
       .await?;
 
@@ -263,12 +278,15 @@ impl ThumbnailIndex {
             .entry(target.sample_index)
             .or_insert(0) += 1usize;
       }
+      let mut sample_read_budget = SampleReadBudget::default();
       let mut samples = read_samples_coalesced(
          reader,
          &unique_samples,
          &self.tables.sizes,
          &self.tables.stsc,
          &self.tables.chunk_offsets,
+         THUMBNAIL_SAMPLE_READ_LIMITS,
+         &mut sample_read_budget,
       )
       .await?;
 
@@ -851,61 +869,6 @@ fn parse_avc_descriptions(stsd: &[u8]) -> Option<Vec<Option<AvcConfig>>> {
    (descriptions.len() == entry_count).then_some(descriptions)
 }
 
-/// Resolves the presentation offset an `edts`/`elst` applies to a track,
-/// degrading to none for edit lists this parser does not model.
-///
-/// Only a single normal-rate segment maps to a scalar offset. A list with
-/// several real segments can repeat, reorder or retime media, which one
-/// offset cannot express — applying the first segment's `media_time` to the
-/// whole timeline would silently misplace every later segment. Falling back
-/// to zero instead leaves such a track behaving exactly like one carrying no
-/// `edts` at all, which is the same degrade-rather-than-fail policy
-/// `resolve_gop_color` applies to the colour hint.
-fn track_presentation_offset(trak: &[u8]) -> i64 {
-   trak
-      .nav(&[*b"edts", *b"elst"])
-      .and_then(parse_elst_media_time)
-      .unwrap_or(0)
-}
-
-/// Reads the media time of an edit list, or `None` when the list is not a
-/// single normal-rate segment. See [`track_presentation_offset`].
-fn parse_elst_media_time(elst: &[u8]) -> Option<i64> {
-   let version = *elst.first()?;
-   let entry_size = match version {
-      0 => 12usize,
-      1 => 20usize,
-      _ => return None,
-   };
-   if table_entries(elst, entry_size)? != 1 {
-      return None;
-   }
-
-   let offset = 8;
-   let (segment_duration, media_time, rate_offset) = if version == 0 {
-      (
-         u64::from(read_u32_be(elst, offset)?),
-         i64::from(i32::from_be_bytes(
-            read_u32_be(elst, offset + 4)?.to_be_bytes(),
-         )),
-         offset + 8,
-      )
-   } else {
-      (
-         read_u64_be(elst, offset)?,
-         i64::from_be_bytes(read_u64_be(elst, offset + 8)?.to_be_bytes()),
-         offset + 16,
-      )
-   };
-   let media_rate = read_u32_be(elst, rate_offset)?;
-   if segment_duration == 0 || media_rate != 0x0001_0000 || media_time < -1 {
-      return None;
-   }
-   // An empty edit (media_time -1) only delays presentation; it does not shift
-   // media timestamps, so it maps to no presentation offset.
-   Some(media_time.max(0))
-}
-
 #[cfg(test)]
 mod tests {
    use super::*;
@@ -1004,33 +967,6 @@ mod tests {
 
    fn test_timeline(sample_count: u32) -> PresentationTimeline {
       PresentationTimeline::new(&stts_bytes(sample_count, 1), None, 0, sample_count).unwrap()
-   }
-
-   fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-      let mut data = u32::try_from(payload.len() + 8)
-         .unwrap()
-         .to_be_bytes()
-         .to_vec();
-      data.extend_from_slice(fourcc);
-      data.extend_from_slice(payload);
-      data
-   }
-
-   /// Builds a version 0 `elst` payload from `(segment_duration, media_time)`
-   /// pairs, all at normal rate.
-   fn elst_payload(segments: &[(u32, i32)]) -> Vec<u8> {
-      let mut payload = vec![0; 4];
-      payload.extend_from_slice(&u32::try_from(segments.len()).unwrap().to_be_bytes());
-      for (segment_duration, media_time) in segments {
-         payload.extend_from_slice(&segment_duration.to_be_bytes());
-         payload.extend_from_slice(&media_time.to_be_bytes());
-         payload.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-      }
-      payload
-   }
-
-   fn trak_with_edit_list(segments: &[(u32, i32)]) -> Vec<u8> {
-      mp4_box(b"edts", &mp4_box(b"elst", &elst_payload(segments)))
    }
 
    #[test]
@@ -1266,42 +1202,6 @@ mod tests {
    }
 
    #[test]
-   fn accepts_empty_edit_and_rejects_multi_segment_edit_lists() {
-      let mut empty_edit = vec![0, 0, 0, 0];
-      empty_edit.extend_from_slice(&1u32.to_be_bytes());
-      empty_edit.extend_from_slice(&1_000u32.to_be_bytes());
-      empty_edit.extend_from_slice(&(-1i32).to_be_bytes());
-      empty_edit.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-
-      let mut multiple_edits = vec![0, 0, 0, 0];
-      multiple_edits.extend_from_slice(&2u32.to_be_bytes());
-      for media_time in [0i32, 1_000] {
-         multiple_edits.extend_from_slice(&1_000u32.to_be_bytes());
-         multiple_edits.extend_from_slice(&media_time.to_be_bytes());
-         multiple_edits.extend_from_slice(&0x0001_0000u32.to_be_bytes());
-      }
-
-      assert_eq!(parse_elst_media_time(&empty_edit), Some(0));
-      assert_eq!(parse_elst_media_time(&multiple_edits), None);
-   }
-
-   #[test]
-   fn falls_back_to_no_presentation_offset_for_unmodeled_edit_lists() {
-      let single_segment = trak_with_edit_list(&[(1_000, 512)]);
-      let several_segments = trak_with_edit_list(&[(1_000, 0), (1_000, 1_000)]);
-      let malformed = mp4_box(b"edts", &mp4_box(b"elst", &[0, 0]));
-
-      assert_eq!(track_presentation_offset(&single_segment), 512);
-      assert_eq!(
-         track_presentation_offset(&several_segments),
-         0,
-         "a multi-segment edit list must degrade to no offset, as a track without edts does"
-      );
-      assert_eq!(track_presentation_offset(&malformed), 0);
-      assert_eq!(track_presentation_offset(&[]), 0);
-   }
-
-   #[test]
    fn clamps_a_keyframe_preceding_the_edit_to_zero() {
       // Four samples 100 ticks apart, trimmed 250 ticks in. Only the last
       // sample presents at or after the edit; the sole sync sample is the
@@ -1338,5 +1238,47 @@ mod tests {
 
       assert_eq!(target.sample_index, 1);
       assert_eq!(target.presentation_tick, 0);
+   }
+
+   #[tokio::test]
+   async fn real_decode_job_produces_an_image_from_a_shared_sample_region() {
+      let path =
+         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bframes_video.mp4");
+      let reader = crate::stream::FileStreamReader::new(path).unwrap();
+      let index = ThumbnailIndex::read(&reader, 0).await.unwrap();
+      let target =
+         keyframe_target(&index.track, &index.tables, &index.timeline, Duration::ZERO).unwrap();
+      let mut budget = SampleReadBudget::default();
+      let mut samples = read_samples_coalesced(
+         &reader,
+         &[target.sample_index],
+         &index.tables.sizes,
+         &index.tables.stsc,
+         &index.tables.chunk_offsets,
+         THUMBNAIL_SAMPLE_READ_LIMITS,
+         &mut budget,
+      )
+      .await
+      .unwrap();
+      let job = DecodeJob {
+         gop: target.gop,
+         avc_config: avc_config_for_range(&index.tables, target.sample_index, target.sample_index)
+            .unwrap()
+            .clone(),
+         samples: vec![samples.remove(&target.sample_index).unwrap()],
+         output_indices: vec![0],
+         output_counts: vec![1],
+      };
+
+      let images = run_decode_jobs(
+         vec![job],
+         JpegQuality::default(),
+         ThumbnailSize::default(),
+         None,
+      )
+      .await
+      .expect("the fixture-backed decode job must succeed");
+
+      assert!(images.contains_key(&(target.gop, 0)));
    }
 }

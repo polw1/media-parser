@@ -35,7 +35,7 @@
 pub mod atoms;
 pub mod metadata;
 pub mod subtitles;
-mod thumbnail_io;
+mod sample_io;
 pub mod thumbnails;
 pub mod tracks;
 

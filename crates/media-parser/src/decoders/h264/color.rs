@@ -347,7 +347,7 @@ fn resolved_color(sps: AvcColorMetadata, container: AvcColorMetadata) -> GopColo
 /// inconsistent metadata degrades to [`GopColor::DEFAULT`] instead of failing
 /// the whole thumbnail request. Mid-segment colour changes keep the first
 /// slice's policy: one decoded GOP produces one set of coefficients.
-pub(super) fn resolve_gop_color(config: &AvcConfig, samples: &[Vec<u8>]) -> GopColor {
+pub(super) fn resolve_gop_color<S: AsRef<[u8]>>(config: &AvcConfig, samples: &[S]) -> GopColor {
    let mut sps_by_id = HashMap::new();
    let mut pps_to_sps = HashMap::new();
    for nal in &config.sps {
@@ -365,7 +365,7 @@ pub(super) fn resolve_gop_color(config: &AvcConfig, samples: &[Vec<u8>]) -> GopC
    for sample in samples {
       // A malformed NAL length simply ends the search for this sample; the
       // decoder reports its own error for the same data.
-      let _ = visit_avc_nals(sample, config.length_size, |nal| {
+      let _ = visit_avc_nals(sample.as_ref(), config.length_size, |nal| {
          match nal[0] & 0x1f {
             7 => {
                if let Ok(parsed) = parse_sps_color(nal) {
@@ -776,5 +776,29 @@ mod tests {
       for samples in [vec![unreadable], vec![avc_sample(&[pps(0, 0)])], Vec::new()] {
          assert_eq!(resolve_gop_color(&config, &samples), GopColor::DEFAULT);
       }
+   }
+
+   #[test]
+   fn resolves_color_from_a_non_vec_sample_view() {
+      struct SampleView<'a>(&'a [u8]);
+
+      impl AsRef<[u8]> for SampleView<'_> {
+         fn as_ref(&self) -> &[u8] {
+            self.0
+         }
+      }
+
+      let config = AvcConfig {
+         length_size: 4,
+         sps: vec![baseline_sps(0, 8, false)],
+         pps: vec![pps(0, 0)],
+         color: AvcColorMetadata::default(),
+      };
+      let sample = avc_sample(&[idr_slice(0)]);
+      let expected = resolve_gop_color(&config, std::slice::from_ref(&sample));
+
+      let color = resolve_gop_color(&config, &[SampleView(&sample)]);
+
+      assert_eq!(color, expected);
    }
 }

@@ -1,5 +1,6 @@
 //! Media-oriented MP4 atom parsers shared by track-oriented features.
 
+use super::budget::{RetainedBudget, TableParseError, TableResult, budgeted_vec};
 use super::read_box;
 use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
 
@@ -23,6 +24,11 @@ pub struct SampleDescription<T> {
    pub codec: String,
    pub entry_count: u32,
    pub entry: T,
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::format::mp4) struct SampleDescriptionEntry {
+   pub codec: String,
 }
 
 const TKHD_V0_TRACK_ID_OFFSET: usize = 12;
@@ -123,14 +129,60 @@ pub fn parse_stsd<T>(
    stsd: &[u8],
    decode_entry: impl FnOnce(&[u8]) -> T,
 ) -> Option<SampleDescription<T>> {
-   let entry_count = read_u32_be(stsd, 4)?;
-   let sample_entry = read_box(stsd, STSD_ENTRIES_OFFSET)?;
+   let (entry_count, entries) = stsd_header(stsd)?;
+   let sample_entry = read_box(entries, 0)?;
 
    Some(SampleDescription {
       codec: fourcc_string(sample_entry.fourcc),
       entry_count,
       entry: decode_entry(sample_entry.payload),
    })
+}
+
+pub(in crate::format::mp4) fn parse_stsd_entries_bounded(
+   stsd: &[u8],
+   budget: &mut RetainedBudget,
+) -> TableResult<Vec<SampleDescriptionEntry>> {
+   let (raw_entry_count, entries_bytes) =
+      stsd_header(stsd).ok_or(TableParseError::Invalid("malformed stsd table"))?;
+   let entry_count =
+      usize::try_from(raw_entry_count).map_err(|_| TableParseError::BudgetExceeded)?;
+   let mut entries = budgeted_vec(entry_count, budget)?;
+   if entry_count > entries_bytes.len() / 8 {
+      return Err(TableParseError::Invalid("malformed stsd entry count"));
+   }
+
+   let mut offset = 0;
+   for _ in 0..entry_count {
+      let sample_entry =
+         read_box(entries_bytes, offset).ok_or(TableParseError::Invalid("malformed stsd entry"))?;
+      offset = offset
+         .checked_add(sample_entry.total_size)
+         .filter(|end| *end <= entries_bytes.len())
+         .ok_or(TableParseError::Invalid("malformed stsd entry"))?;
+      let codec = budgeted_fourcc(sample_entry.fourcc, budget)?;
+      entries.push(SampleDescriptionEntry { codec });
+   }
+   if offset != entries_bytes.len() {
+      return Err(TableParseError::Invalid("trailing bytes in stsd table"));
+   }
+   Ok(entries)
+}
+
+fn stsd_header(stsd: &[u8]) -> Option<(u32, &[u8])> {
+   Some((read_u32_be(stsd, 4)?, stsd.get(STSD_ENTRIES_OFFSET..)?))
+}
+
+fn budgeted_fourcc(fourcc: [u8; 4], budget: &mut RetainedBudget) -> TableResult<String> {
+   let lossy = String::from_utf8_lossy(&fourcc);
+   budget.charge_bytes(lossy.len())?;
+   let mut codec = String::new();
+   codec
+      .try_reserve_exact(lossy.len())
+      .map_err(|_| TableParseError::AllocationFailed)?;
+   budget.charge_bytes(codec.capacity().saturating_sub(lossy.len()))?;
+   codec.push_str(&lossy);
+   Ok(codec)
 }
 
 pub fn visual_dimensions(payload: &[u8]) -> (Option<u32>, Option<u32>) {
@@ -330,6 +382,32 @@ mod tests {
       audio_payload[24..28].copy_from_slice(&(48_000u32 << 16).to_be_bytes());
 
       assert_eq!(audio_params(&audio_payload), (None, None));
+   }
+
+   #[test]
+   fn bounded_stsd_precharges_declared_entries_before_framing_validation() {
+      let mut stsd = vec![0u8; 8];
+      stsd[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+      let mut budget = RetainedBudget::new(8);
+
+      assert_eq!(
+         parse_stsd_entries_bounded(&stsd, &mut budget).unwrap_err(),
+         TableParseError::BudgetExceeded
+      );
+   }
+
+   #[test]
+   fn bounded_stsd_rejects_trailing_framing_bytes() {
+      let mut stsd = vec![0u8; 8];
+      stsd[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stsd.extend(make_box(b"tx3g", &[0; 8]));
+      stsd.push(0);
+      let mut budget = RetainedBudget::new(1024);
+
+      assert!(matches!(
+         parse_stsd_entries_bounded(&stsd, &mut budget),
+         Err(TableParseError::Invalid(_))
+      ));
    }
 
    fn make_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {

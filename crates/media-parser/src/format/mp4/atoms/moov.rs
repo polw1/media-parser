@@ -6,7 +6,7 @@
 
 use super::read::{read_box, read_box_header};
 use crate::errors::{MediaParserError, Result};
-use crate::stream::StreamReader;
+use crate::stream::{StreamReader, try_copy_bytes, try_zeroed_bytes};
 
 const HEAD_SIZE: usize = 8 * 1024;
 const TAIL_SIZE: usize = 512 * 1024;
@@ -55,7 +55,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    // Strategy 1: Head - iterate aligned boxes
    // Read before asking for size so HTTP readers can learn it from Content-Range
    // and avoid a separate HEAD request.
-   let mut head_buf = vec![0u8; HEAD_SIZE];
+   let mut head_buf = try_zeroed_bytes(HEAD_SIZE, "moov head buffer")?;
    let head_read = reader.read_at(0, &mut head_buf).await?;
    head_buf.truncate(head_read);
    let file_size = reader.size().await?;
@@ -67,7 +67,7 @@ pub async fn find_and_read_moov_box(reader: &dyn StreamReader) -> Result<Vec<u8>
    // Strategy 2: Tail - pattern search for "moov" fourcc
    let tail_len = TAIL_SIZE.min(usize::try_from(file_size).unwrap_or(usize::MAX));
    let tail_offset = file_size.saturating_sub(tail_len as u64);
-   let mut tail_buf = vec![0u8; tail_len];
+   let mut tail_buf = try_zeroed_bytes(tail_len, "moov tail buffer")?;
    let _ = reader.read_at(tail_offset, &mut tail_buf).await?;
 
    if let Some((pos, size)) = find_moov_pattern(&tail_buf, tail_offset, file_size) {
@@ -105,11 +105,11 @@ async fn read_moov_at(
    if let Some(local_end) = local_start.checked_add(size_usize)
       && local_end <= buf.len()
    {
-      return Ok(buf[local_start..local_end].to_vec());
+      return try_copy_bytes(&buf[local_start..local_end], "moov buffered copy");
    }
 
    // Read directly
-   let mut moov_buf = vec![0u8; size_usize];
+   let mut moov_buf = allocate_moov_buffer(size_usize)?;
    let read = reader.read_at(pos, &mut moov_buf).await?;
    if read != size_usize {
       return Err(crate::errors::MediaParserError::InvalidFormat(format!(
@@ -118,6 +118,10 @@ async fn read_moov_at(
       )));
    }
    Ok(moov_buf)
+}
+
+fn allocate_moov_buffer(len: usize) -> Result<Vec<u8>> {
+   try_zeroed_bytes(len, "moov buffer")
 }
 
 /// Find moov by iterating aligned boxes (for head).
@@ -212,6 +216,16 @@ mod tests {
       buf.extend_from_slice(fourcc);
       buf.extend_from_slice(&vec![0u8; payload_size]);
       buf
+   }
+
+   #[test]
+   fn moov_buffer_reports_capacity_overflow() {
+      let error = allocate_moov_buffer(usize::MAX)
+         .expect_err("usize::MAX cannot be represented as a moov allocation");
+
+      assert!(
+         matches!(error, MediaParserError::Other(message) if message.contains("moov buffer allocation failed"))
+      );
    }
 
    /// Create a moov box with a valid mvhd child inside.
