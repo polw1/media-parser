@@ -1245,7 +1245,8 @@ mod tests {
       let path =
          std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bframes_video.mp4");
       let reader = crate::stream::FileStreamReader::new(path).unwrap();
-      let index = ThumbnailIndex::read(&reader, 0).await.unwrap();
+      let moov = find_and_read_moov_box(&reader).await.unwrap();
+      let index = ThumbnailIndex::from_moov(&moov, 0).unwrap();
       let target =
          keyframe_target(&index.track, &index.tables, &index.timeline, Duration::ZERO).unwrap();
       let mut budget = SampleReadBudget::default();

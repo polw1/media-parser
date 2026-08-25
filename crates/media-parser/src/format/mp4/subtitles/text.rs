@@ -53,7 +53,7 @@ fn decode_supported_sample(
    output: &mut TextBuilder,
 ) -> std::result::Result<(), DecodeSampleError> {
    match codec {
-      "tx3g" => {
+      "tx3g" | "text" => {
          let length_bytes = data.get(..2).ok_or_else(invalid_subtitle)?;
          let declared_length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
          let text_end = 2_usize
@@ -63,7 +63,7 @@ fn decode_supported_sample(
          output.append_decoded(text)?;
       }
       "wvtt" => decode_wvtt(data, output)?,
-      "stpp" | "text" => {
+      "stpp" => {
          output.append_decoded(data)?;
       }
       _ => unreachable!("unsupported codecs return before sample text allocation"),
@@ -347,7 +347,7 @@ mod tests {
       data
    }
 
-   fn tx3g(text: &[u8], trailing: &[u8]) -> Vec<u8> {
+   fn length_prefixed_text(text: &[u8], trailing: &[u8]) -> Vec<u8> {
       let mut data = Vec::new();
       data.extend_from_slice(&u16::try_from(text.len()).unwrap().to_be_bytes());
       data.extend_from_slice(text);
@@ -372,7 +372,7 @@ mod tests {
    #[test]
    fn tx3g_decodes_strict_utf8() {
       assert_eq!(
-         decode_sample("tx3g", &tx3g(" café ".as_bytes(), &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(" café ".as_bytes(), &[]),).unwrap(),
          Some("café".into())
       );
    }
@@ -381,7 +381,7 @@ mod tests {
    fn tx3g_decodes_bom_utf16_big_endian() {
       let bytes = [0xfe, 0xff, 0x00, b' ', 0x00, b'O', 0x00, b'K', 0x00, b' '];
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&bytes, &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&bytes, &[])).unwrap(),
          Some("OK".into())
       );
    }
@@ -390,7 +390,7 @@ mod tests {
    fn tx3g_decodes_bom_utf16_little_endian() {
       let bytes = [0xff, 0xfe, b' ', 0x00, b'O', 0x00, b'K', 0x00, b' ', 0x00];
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&bytes, &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&bytes, &[])).unwrap(),
          Some("OK".into())
       );
    }
@@ -398,11 +398,11 @@ mod tests {
    #[test]
    fn tx3g_treats_a_utf16_bom_without_text_as_a_gap() {
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&[0xfe, 0xff], &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&[0xfe, 0xff], &[])).unwrap(),
          None
       );
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&[0xff, 0xfe], &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&[0xff, 0xfe], &[])).unwrap(),
          None
       );
    }
@@ -411,18 +411,24 @@ mod tests {
    fn tx3g_decodes_a_utf16_supplementary_plane_character() {
       let bytes = [0xfe, 0xff, 0xd8, 0x3d, 0xde, 0x00];
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&bytes, &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&bytes, &[])).unwrap(),
          Some("😀".into())
       );
    }
 
    #[test]
    fn tx3g_rejects_isolated_or_unpaired_utf16_surrogates() {
-      assert_subtitle_error(decode_sample("tx3g", &tx3g(&[0xfe, 0xff, 0xdc, 0x00], &[])));
-      assert_subtitle_error(decode_sample("tx3g", &tx3g(&[0xfe, 0xff, 0xd8, 0x00], &[])));
       assert_subtitle_error(decode_sample(
          "tx3g",
-         &tx3g(&[0xfe, 0xff, 0xd8, 0x00, 0x00, b'A'], &[]),
+         &length_prefixed_text(&[0xfe, 0xff, 0xdc, 0x00], &[]),
+      ));
+      assert_subtitle_error(decode_sample(
+         "tx3g",
+         &length_prefixed_text(&[0xfe, 0xff, 0xd8, 0x00], &[]),
+      ));
+      assert_subtitle_error(decode_sample(
+         "tx3g",
+         &length_prefixed_text(&[0xfe, 0xff, 0xd8, 0x00, 0x00, b'A'], &[]),
       ));
    }
 
@@ -430,7 +436,7 @@ mod tests {
    fn tx3g_falls_back_to_bomless_utf16_big_endian() {
       let bytes = [0x00, 0x20, 0x00, 0xe9, 0x00, 0x20];
       assert_eq!(
-         decode_sample("tx3g", &tx3g(&bytes, &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(&bytes, &[])).unwrap(),
          Some("é".into())
       );
    }
@@ -444,7 +450,7 @@ mod tests {
 
    #[test]
    fn tx3g_ignores_trailing_style_records() {
-      let data = tx3g(b"caption", &[0xff, 0xfe, 0xfd, 0xfc]);
+      let data = length_prefixed_text(b"caption", &[0xff, 0xfe, 0xfd, 0xfc]);
       assert_eq!(
          decode_sample("tx3g", &data).unwrap(),
          Some("caption".into())
@@ -453,16 +459,22 @@ mod tests {
 
    #[test]
    fn tx3g_rejects_invalid_utf8_and_utf16() {
-      assert_subtitle_error(decode_sample("tx3g", &tx3g(&[0xff], &[])));
-      assert_subtitle_error(decode_sample("tx3g", &tx3g(&[0xd8, 0x00], &[])));
-      assert_subtitle_error(decode_sample("tx3g", &tx3g(&[0xfe, 0xff, 0x00], &[])));
+      assert_subtitle_error(decode_sample("tx3g", &length_prefixed_text(&[0xff], &[])));
+      assert_subtitle_error(decode_sample(
+         "tx3g",
+         &length_prefixed_text(&[0xd8, 0x00], &[]),
+      ));
+      assert_subtitle_error(decode_sample(
+         "tx3g",
+         &length_prefixed_text(&[0xfe, 0xff, 0x00], &[]),
+      ));
    }
 
    #[test]
    fn tx3g_empty_or_trimmed_empty_is_a_gap() {
       assert_eq!(decode_sample("tx3g", &[0, 0]).unwrap(), None);
       assert_eq!(
-         decode_sample("tx3g", &tx3g(b" \t\r\n\0 ", &[])).unwrap(),
+         decode_sample("tx3g", &length_prefixed_text(b" \t\r\n\0 ", &[])).unwrap(),
          None
       );
    }
@@ -554,19 +566,46 @@ mod tests {
          Some("<p>cue</p>".into())
       );
       assert_eq!(
-         decode_sample("text", &[0xff, 0xfe, b'O', 0, b'K', 0]).unwrap(),
+         decode_sample(
+            "text",
+            &length_prefixed_text(&[0xff, 0xfe, b'O', 0, b'K', 0], &[]),
+         )
+         .unwrap(),
          Some("OK".into())
       );
-      assert_eq!(decode_sample("text", b" \n\0\t").unwrap(), None);
+      assert_eq!(
+         decode_sample("text", &length_prefixed_text(b" \n\0\t", &[])).unwrap(),
+         None
+      );
       assert_subtitle_error(decode_sample("stpp", &[0xff]));
    }
 
    #[test]
    fn text_trims_multibyte_unicode_whitespace_at_both_boundaries() {
       assert_eq!(
-         decode_sample("text", "\u{2003}é\u{3000}".as_bytes()).unwrap(),
+         decode_sample(
+            "text",
+            &length_prefixed_text("\u{2003}é\u{3000}".as_bytes(), &[]),
+         )
+         .unwrap(),
          Some("é".into())
       );
+   }
+
+   #[test]
+   fn text_ignores_a_trailing_style_atom_with_non_utf8_bytes() {
+      let style = mp4_box(b"styl", &[0x80]);
+      let sample = length_prefixed_text(b"Fourteen bytes", &style);
+
+      assert_eq!(
+         decode_sample("text", &sample).unwrap(),
+         Some("Fourteen bytes".into())
+      );
+   }
+
+   #[test]
+   fn text_requires_a_complete_declared_text_slice() {
+      assert_subtitle_error(decode_sample("text", &[0, 3, b'a', b'b']));
    }
 
    #[test]
@@ -586,10 +625,14 @@ mod tests {
 
    #[test]
    fn capacity_refusal_is_fatal_for_utf8_utf16_and_wvtt_joining() {
-      assert_fatal(decode_sample_with_limit("text", b"valid", 4));
       assert_fatal(decode_sample_with_limit(
          "text",
-         &[0xfe, 0xff, 0x4f, 0x60],
+         &length_prefixed_text(b"valid", &[]),
+         4,
+      ));
+      assert_fatal(decode_sample_with_limit(
+         "text",
+         &length_prefixed_text(&[0xfe, 0xff, 0x4f, 0x60], &[]),
          2,
       ));
 
