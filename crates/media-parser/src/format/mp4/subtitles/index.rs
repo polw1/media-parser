@@ -8,7 +8,7 @@ use crate::format::mp4::atoms::{
    Mp4Nav, SampleDescriptionEntry, SampleSizes, SampleTiming, SampleTimingTable, StscEntry,
    TableParseError, TableResult, find_and_read_moov_box, iter_boxes, parse_chunk_offsets_bounded,
    parse_hdlr, parse_mdhd, parse_moov_payload, parse_sample_sizes_bounded, parse_stsc_bounded,
-   parse_stsd_entries_bounded, parse_tkhd, ticks_to_duration, track_presentation_offset,
+   parse_stsd_entries_bounded, parse_tkhd, read_box, ticks_to_duration, track_presentation_offset,
    validate_sample_tables,
 };
 use crate::format::mp4::sample_io::{
@@ -18,6 +18,7 @@ use crate::format::validate_subtitle_range;
 use crate::helpers::read_u32_be;
 use crate::stream::StreamReader;
 use crate::types::{BaseTrackMeta, SubtitleCue, SubtitleTrack, TrackFilter};
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub const MAX_SUBTITLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -165,21 +166,13 @@ impl SubtitleIndex {
       let payload = parse_moov_payload(&moov)?;
       let mut budget = IndexBudget::new(max_samples, max_retained_bytes);
       let mut tracks = Vec::new();
-      let mut trak_count = 0usize;
+      let chapter_track_ids = disabled_chapter_track_ids(payload, max_traks)?;
 
       for (fourcc, trak) in iter_boxes(payload) {
          if &fourcc != b"trak" {
             continue;
          }
-         trak_count = trak_count
-            .checked_add(1)
-            .ok_or_else(|| MediaParserError::InvalidFormat("MP4 trak count overflow".to_owned()))?;
-         if trak_count > max_traks {
-            return Err(MediaParserError::InvalidFormat(format!(
-               "track count exceeds limit of {max_traks}"
-            )));
-         }
-         match parse_track(trak, &mut budget)? {
+         match parse_track(trak, &chapter_track_ids, &mut budget)? {
             TrackParse::Skip => {}
             TrackParse::Ready(track) => {
                push_track(&mut tracks, IndexedTrackState::Ready(track), &mut budget)?
@@ -413,11 +406,146 @@ fn retained<T>(result: TableResult<T>) -> std::result::Result<T, TrackReject> {
    }
 }
 
-fn parse_track(trak: &[u8], budget: &mut IndexBudget) -> Result<TrackParse> {
+fn disabled_chapter_track_ids(payload: &[u8], max_traks: usize) -> Result<HashSet<u32>> {
+   let mut disabled_track_ids = HashSet::new();
+   let mut trak_count = 0usize;
+   for (fourcc, trak) in iter_boxes(payload) {
+      if &fourcc != b"trak" {
+         continue;
+      }
+      trak_count = trak_count
+         .checked_add(1)
+         .ok_or_else(|| MediaParserError::InvalidFormat("MP4 trak count overflow".to_owned()))?;
+      if trak_count > max_traks {
+         return Err(MediaParserError::InvalidFormat(format!(
+            "track count exceeds limit of {max_traks}"
+         )));
+      }
+      if let Some(header) = trak.nav(&[*b"tkhd"]).and_then(parse_tkhd)
+         && !header.track_enabled
+      {
+         try_push_unique_track_id(&mut disabled_track_ids, header.id)?;
+      }
+   }
+
+   let mut chapter_track_ids = HashSet::new();
+   for (fourcc, trak) in iter_boxes(payload) {
+      if &fourcc != b"trak" {
+         continue;
+      }
+      let Some(source) = trak.nav(&[*b"tkhd"]).and_then(parse_tkhd) else {
+         continue;
+      };
+      if !source.track_enabled {
+         continue;
+      }
+      collect_enabled_chapter_references(
+         trak,
+         source.id,
+         &disabled_track_ids,
+         &mut chapter_track_ids,
+      )?;
+   }
+   Ok(chapter_track_ids)
+}
+
+fn collect_enabled_chapter_references(
+   trak: &[u8],
+   source_track_id: u32,
+   disabled_track_ids: &HashSet<u32>,
+   chapter_track_ids: &mut HashSet<u32>,
+) -> Result<()> {
+   let mut offset = 0usize;
+   while offset < trak.len() {
+      let Some(child) = read_box(trak, offset) else {
+         if trak
+            .get(offset.saturating_add(4)..offset.saturating_add(8))
+            .is_some_and(|fourcc| fourcc == b"tref")
+         {
+            tracing::warn!(
+               track_id = source_track_id,
+               "ignoring malformed MP4 tref framing"
+            );
+         }
+         break;
+      };
+      offset += child.total_size;
+      if &child.fourcc != b"tref" {
+         continue;
+      }
+      collect_tref_chapter_ids(
+         child.payload,
+         source_track_id,
+         disabled_track_ids,
+         chapter_track_ids,
+      )?;
+   }
+   Ok(())
+}
+
+fn collect_tref_chapter_ids(
+   tref: &[u8],
+   source_track_id: u32,
+   disabled_track_ids: &HashSet<u32>,
+   chapter_track_ids: &mut HashSet<u32>,
+) -> Result<()> {
+   let mut offset = 0usize;
+   while offset < tref.len() {
+      let Some(reference) = read_box(tref, offset) else {
+         tracing::warn!(
+            track_id = source_track_id,
+            "ignoring malformed MP4 tref/chap framing"
+         );
+         break;
+      };
+      offset += reference.total_size;
+      if &reference.fourcc != b"chap" {
+         continue;
+      }
+      if !reference
+         .payload
+         .len()
+         .is_multiple_of(std::mem::size_of::<u32>())
+      {
+         tracing::warn!(
+            track_id = source_track_id,
+            "ignoring MP4 tref/chap with malformed track ID payload"
+         );
+         continue;
+      }
+      for id in reference.payload.chunks_exact(std::mem::size_of::<u32>()) {
+         let id = u32::from_be_bytes(id.try_into().expect("chunks_exact yields four bytes"));
+         if id != 0 && disabled_track_ids.contains(&id) {
+            try_push_unique_track_id(chapter_track_ids, id)?;
+         }
+      }
+   }
+   Ok(())
+}
+
+fn try_push_unique_track_id(ids: &mut HashSet<u32>, id: u32) -> Result<()> {
+   if ids.contains(&id) {
+      return Ok(());
+   }
+   ids.try_reserve(1).map_err(|_| {
+      MediaParserError::Other("MP4 chapter track classification allocation failed".to_owned())
+   })?;
+   ids.insert(id);
+   Ok(())
+}
+
+fn parse_track(
+   trak: &[u8],
+   chapter_track_ids: &HashSet<u32>,
+   budget: &mut IndexBudget,
+) -> Result<TrackParse> {
    let Some(tkhd) = trak.nav(&[*b"tkhd"]).and_then(parse_tkhd) else {
       tracing::warn!("skipping MP4 trak whose header is too damaged to recover its ID");
       return Ok(TrackParse::Skip);
    };
+   if !tkhd.track_enabled && chapter_track_ids.contains(&tkhd.id) {
+      return Ok(TrackParse::Skip);
+   }
    let id = tkhd.id;
    match indexed_track(trak, id, budget) {
       Ok(track) => Ok(TrackParse::Ready(track)),
@@ -709,11 +837,23 @@ mod tests {
       mp4_box(fourcc, &[&[0, 0, 0, 0], body].concat())
    }
 
-   fn index_track(id: u32, sample_count: u32, codec: &[u8; 4]) -> Vec<u8> {
+   fn track_header(id: u32, duration: u32, enabled: bool) -> Vec<u8> {
       let mut tkhd = vec![0u8; 80];
       tkhd[8..12].copy_from_slice(&id.to_be_bytes());
-      tkhd[16..20].copy_from_slice(&(sample_count * 1000).to_be_bytes());
-      let tkhd = full_box(b"tkhd", &tkhd);
+      tkhd[16..20].copy_from_slice(&duration.to_be_bytes());
+      mp4_box(
+         b"tkhd",
+         &[&[0, 0, 0, u8::from(enabled)], tkhd.as_slice()].concat(),
+      )
+   }
+
+   fn index_track_with_enabled(
+      id: u32,
+      sample_count: u32,
+      codec: &[u8; 4],
+      enabled: bool,
+   ) -> Vec<u8> {
+      let tkhd = track_header(id, sample_count * 1000, enabled);
 
       let mut mdhd = vec![0u8; 20];
       mdhd[8..12].copy_from_slice(&1000u32.to_be_bytes());
@@ -767,6 +907,40 @@ mod tests {
       let minf = mp4_box(b"minf", &stbl);
       let mdia = mp4_box(b"mdia", &[mdhd, hdlr, minf].concat());
       mp4_box(b"trak", &[tkhd, mdia].concat())
+   }
+
+   fn index_track(id: u32, sample_count: u32, codec: &[u8; 4]) -> Vec<u8> {
+      index_track_with_enabled(id, sample_count, codec, false)
+   }
+
+   fn chapter_reference(ids: &[u32]) -> Vec<u8> {
+      let payload = ids
+         .iter()
+         .flat_map(|id| id.to_be_bytes())
+         .collect::<Vec<_>>();
+      mp4_box(b"chap", &payload)
+   }
+
+   fn chapter_source_track(id: u32, enabled: bool, tref_payload: &[u8]) -> Vec<u8> {
+      let mut hdlr = vec![0u8; 8];
+      hdlr[4..8].copy_from_slice(b"vide");
+      let mdia = mp4_box(b"mdia", &full_box(b"hdlr", &hdlr));
+      let tref = mp4_box(b"tref", tref_payload);
+      mp4_box(
+         b"trak",
+         &[track_header(id, 1000, enabled), tref, mdia].concat(),
+      )
+   }
+
+   fn ready_track_ids(index: &SubtitleIndex) -> Vec<u32> {
+      index
+         .tracks
+         .iter()
+         .filter_map(|track| match track {
+            IndexedTrackState::Ready(track) => Some(track.id),
+            IndexedTrackState::Rejected { .. } => None,
+         })
+         .collect()
    }
 
    fn index_fixture(tracks: &[Vec<u8>]) -> BytesReader {
@@ -838,6 +1012,85 @@ mod tests {
             chunk_offsets: vec![0],
          })],
       }
+   }
+
+   #[tokio::test]
+   async fn enabled_chapter_source_excludes_only_a_disabled_target() {
+      let source = chapter_source_track(10, true, &chapter_reference(&[1]));
+      let target = index_track_with_enabled(1, 1, b"text", false);
+      let index = SubtitleIndex::read(&index_fixture(&[source, target]))
+         .await
+         .unwrap();
+
+      assert!(ready_track_ids(&index).is_empty());
+   }
+
+   #[tokio::test]
+   async fn enabled_chapter_target_remains_a_subtitle_track() {
+      let source = chapter_source_track(10, true, &chapter_reference(&[1]));
+      let target = index_track_with_enabled(1, 1, b"text", true);
+      let index = SubtitleIndex::read(&index_fixture(&[source, target]))
+         .await
+         .unwrap();
+
+      assert_eq!(ready_track_ids(&index), vec![1]);
+   }
+
+   #[tokio::test]
+   async fn disabled_chapter_source_does_not_classify_its_target() {
+      let source = chapter_source_track(10, false, &chapter_reference(&[1]));
+      let target = index_track_with_enabled(1, 1, b"text", false);
+      let index = SubtitleIndex::read(&index_fixture(&[source, target]))
+         .await
+         .unwrap();
+
+      assert_eq!(ready_track_ids(&index), vec![1]);
+   }
+
+   #[tokio::test]
+   async fn zero_chapter_reference_id_is_ignored() {
+      let source = chapter_source_track(10, true, &chapter_reference(&[0]));
+      let target = index_track_with_enabled(0, 1, b"text", false);
+      let index = SubtitleIndex::read(&index_fixture(&[source, target]))
+         .await
+         .unwrap();
+
+      assert_eq!(ready_track_ids(&index), vec![0]);
+   }
+
+   #[tokio::test]
+   async fn malformed_chapter_payload_is_ignored_without_accepting_its_prefix() {
+      let mut malformed_payload = 1u32.to_be_bytes().to_vec();
+      malformed_payload.push(0xff);
+      let tref = [
+         mp4_box(b"chap", &malformed_payload),
+         chapter_reference(&[2]),
+      ]
+      .concat();
+      let source = chapter_source_track(10, true, &tref);
+      let first_target = index_track_with_enabled(1, 1, b"text", false);
+      let second_target = index_track_with_enabled(2, 1, b"text", false);
+      let index = SubtitleIndex::read(&index_fixture(&[source, first_target, second_target]))
+         .await
+         .unwrap();
+
+      assert_eq!(ready_track_ids(&index), vec![1]);
+   }
+
+   #[tokio::test]
+   async fn malformed_chapter_framing_is_ignored_and_other_valid_atoms_still_apply() {
+      let mut malformed = chapter_reference(&[1]);
+      let oversized = malformed.len() as u32 + 1;
+      malformed[0..4].copy_from_slice(&oversized.to_be_bytes());
+      let tref = [chapter_reference(&[2]), malformed].concat();
+      let source = chapter_source_track(10, true, &tref);
+      let first_target = index_track_with_enabled(1, 1, b"text", false);
+      let second_target = index_track_with_enabled(2, 1, b"text", false);
+      let index = SubtitleIndex::read(&index_fixture(&[source, first_target, second_target]))
+         .await
+         .unwrap();
+
+      assert_eq!(ready_track_ids(&index), vec![1]);
    }
 
    #[test]

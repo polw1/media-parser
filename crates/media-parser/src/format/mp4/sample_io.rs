@@ -4,9 +4,9 @@
 //! and every configured limit are validated before the shared budget changes.
 //! A successful plan commits its aggregate sample, logical-byte,
 //! physical-byte, and region charges. Later read or result-allocation failures
-//! do not refund those charges. The error text still refers to thumbnails for
-//! compatibility with the original caller; replacing those legacy messages is
-//! outside this internal refactor.
+//! do not refund those charges. Some track-local error text still refers to
+//! thumbnails for compatibility with the original caller, while aggregate
+//! region-limit errors use terminology shared by every caller.
 //!
 //! Each [`SampleData`] is a checked view into a shared physical read region.
 //! The region remains alive through consumer clones, including decode jobs,
@@ -400,7 +400,7 @@ fn validate_physical_plan(
    let total_regions = budget
       .regions
       .checked_add(regions)
-      .ok_or_else(|| fatal_error("too many thumbnail read batches"))?;
+      .ok_or_else(|| fatal_error("too many sample read regions"))?;
    Ok((total_physical, total_regions, regions))
 }
 
@@ -444,12 +444,12 @@ fn validate_region_charge(
       .ok_or_else(|| fatal_error("coalesced thumbnail reads are too large"))?;
    let next_regions = regions
       .checked_add(1)
-      .ok_or_else(|| fatal_error("too many thumbnail read batches"))?;
+      .ok_or_else(|| fatal_error("too many sample read regions"))?;
    budget
       .regions
       .checked_add(next_regions)
       .filter(|total| *total <= limits.max_regions)
-      .ok_or_else(|| fatal_error("too many thumbnail read batches"))?;
+      .ok_or_else(|| fatal_error("too many sample read regions"))?;
    *physical_bytes = next_physical;
    *regions = next_regions;
    Ok(())
@@ -734,11 +734,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(
-         error
-            .to_string()
-            .contains("too many thumbnail read batches")
-      );
+      assert!(error.to_string().contains("too many sample read regions"));
    }
 
    #[test]
@@ -902,6 +898,51 @@ mod tests {
             "a rejected call must not refund prior charges"
          );
       }
+   }
+
+   #[test]
+   fn representative_multitrack_subtitle_fixture_reaches_the_aggregate_region_ceiling() {
+      const SAMPLES_PER_TRACK: u32 = 2_050;
+      const COALESCE_GAP: usize = 64 * 1_024;
+      let limits = SampleReadLimits {
+         max_samples: 4_100,
+         max_sample_bytes: 1,
+         max_logical_bytes: 4_100,
+         max_physical_bytes: 4_100,
+         max_regions: 4_096,
+         max_region_bytes: 1,
+         max_coalesce_gap_bytes: COALESCE_GAP,
+      };
+      let sample_indices = (1..=SAMPLES_PER_TRACK).collect::<Vec<_>>();
+      // Each one-byte subtitle sample is separated by more than the 64 KiB
+      // coalescing gap, representing intervening audio/video payload in an
+      // interleaved mux while keeping logical and physical subtitle bytes low.
+      let chunk_offsets = offsets(SAMPLES_PER_TRACK, COALESCE_GAP as u64 + 2);
+      let sizes = fixed_samples(SAMPLES_PER_TRACK, 1);
+      let mut request_budget = SampleReadBudget::default();
+
+      let first_track = plan(
+         &sample_indices,
+         &sizes,
+         &chunk_offsets,
+         limits,
+         &mut request_budget,
+      )
+      .expect("the first track is below every aggregate request ceiling");
+      assert_eq!(first_track.len(), SAMPLES_PER_TRACK as usize);
+      drop(first_track);
+
+      let error = plan(
+         &sample_indices,
+         &sizes,
+         &chunk_offsets,
+         limits,
+         &mut request_budget,
+      )
+      .expect_err("the second track takes the shared request over 4,096 regions");
+
+      assert!(error.to_string().contains("too many sample read regions"));
+      assert_eq!(request_budget.regions, SAMPLES_PER_TRACK as usize);
    }
 
    struct RecordingReader {

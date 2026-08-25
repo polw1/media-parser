@@ -7,6 +7,7 @@ use crate::helpers::{read_u16_be, read_u32_be, read_u64_be};
 #[derive(Debug, Clone, Copy)]
 pub struct TrackHeader {
    pub id: u32,
+   pub track_enabled: bool,
    pub duration: u64,
    pub width: u32,
    pub height: u32,
@@ -83,6 +84,7 @@ pub fn parse_tkhd(tkhd: &[u8]) -> Option<TrackHeader> {
 
    Some(TrackHeader {
       id: read_u32_be(tkhd, track_id_offset)?,
+      track_enabled: read_u32_be(tkhd, 0)? & 1 != 0,
       duration,
       width: read_fixed_16_16(tkhd, width_offset).unwrap_or(0),
       height: read_fixed_16_16(tkhd, height_offset).unwrap_or(0),
@@ -263,6 +265,7 @@ mod tests {
       // test is an independent oracle for the v0 field layout.
       let mut tkhd = vec![0u8; 84];
       tkhd[0] = 0; // version 0
+      tkhd[3] = 1; // track_enabled flag
       tkhd[12..16].copy_from_slice(&3u32.to_be_bytes()); // track_ID
       tkhd[20..24].copy_from_slice(&1000u32.to_be_bytes()); // duration (32-bit)
       tkhd[76..80].copy_from_slice(&(640u32 << 16).to_be_bytes()); // width 16.16
@@ -270,6 +273,7 @@ mod tests {
 
       let parsed = parse_tkhd(&tkhd).unwrap();
       assert_eq!(parsed.id, 3);
+      assert!(parsed.track_enabled);
       assert_eq!(parsed.duration, 1000);
       assert_eq!(parsed.width, 640);
       assert_eq!(parsed.height, 480);
@@ -289,6 +293,7 @@ mod tests {
 
       let parsed = parse_tkhd(&tkhd).unwrap();
       assert_eq!(parsed.id, 7);
+      assert!(!parsed.track_enabled);
       assert_eq!(parsed.duration, 5_000_000_000);
       assert_eq!(parsed.width, 1920);
       assert_eq!(parsed.height, 1080);
