@@ -15,7 +15,6 @@ use crate::format::mp4::sample_io::{
    SampleReadBudget, SampleReadError, SampleReadLimits, read_samples_coalesced_classified,
 };
 use crate::format::validate_subtitle_range;
-use crate::helpers::read_u32_be;
 use crate::stream::StreamReader;
 use crate::types::{BaseTrackMeta, SubtitleCue, SubtitleTrack, TrackFilter};
 use std::collections::HashSet;
@@ -204,6 +203,38 @@ impl SubtitleIndex {
          .await
    }
 
+   /// Returns the first valid subtitle track in physical file order.
+   ///
+   /// Recoverably malformed or unsupported tracks are skipped while searching.
+   pub async fn subtitles_first(
+      &self,
+      reader: &dyn StreamReader,
+      range: Option<(Duration, Duration)>,
+   ) -> Result<Vec<SubtitleTrack>> {
+      validate_subtitle_range(range)?;
+      self
+         .subtitles_first_with_limits(reader, range, REQUEST_LIMITS)
+         .await
+   }
+
+   async fn subtitles_first_with_limits(
+      &self,
+      reader: &dyn StreamReader,
+      range: Option<(Duration, Duration)>,
+      limits: RequestLimits,
+   ) -> Result<Vec<SubtitleTrack>> {
+      self
+         .subtitles_with_request_and_read_limits(
+            reader,
+            None,
+            range,
+            limits,
+            SUBTITLE_READ_LIMITS,
+            true,
+         )
+         .await
+   }
+
    async fn subtitles_with_limits(
       &self,
       reader: &dyn StreamReader,
@@ -218,6 +249,7 @@ impl SubtitleIndex {
             range,
             limits,
             SUBTITLE_READ_LIMITS,
+            false,
          )
          .await
    }
@@ -229,6 +261,7 @@ impl SubtitleIndex {
       range: Option<(Duration, Duration)>,
       limits: RequestLimits,
       sample_read_limits: SampleReadLimits,
+      first_track_only: bool,
    ) -> Result<Vec<SubtitleTrack>> {
       let mut output = Vec::new();
       let mut sample_read_budget = SampleReadBudget::default();
@@ -343,6 +376,9 @@ impl SubtitleIndex {
             },
             cues,
          });
+         if first_track_only {
+            break;
+         }
       }
       Ok(output)
    }
@@ -587,12 +623,6 @@ fn indexed_track(
    let stsz = stbl
       .nav(&[*b"stsz"])
       .ok_or(Reason("subtitle track missing stsz"))?;
-   let raw_sample_count =
-      read_u32_be(stsz, 8).ok_or(Reason("subtitle track has malformed stsz"))?;
-   budget.charge_samples(usize::try_from(raw_sample_count).map_err(|_| {
-      MediaParserError::InvalidFormat("subtitle sample count is too large".to_owned())
-   })?)?;
-
    let stsd = stbl
       .nav(&[*b"stsd"])
       .ok_or(Reason("subtitle track missing stsd"))?;
@@ -622,6 +652,9 @@ fn indexed_track(
    {
       return Err(Reason("invalid subtitle sample tables"));
    }
+   budget.charge_samples(usize::try_from(sizes.sample_count).map_err(|_| {
+      MediaParserError::InvalidFormat("subtitle sample count is too large".to_owned())
+   })?)?;
 
    let first_description = stsc
       .first()
@@ -983,34 +1016,38 @@ mod tests {
       bytes
    }
 
-   fn one_cue_index() -> SubtitleIndex {
+   fn one_cue_track(id: u32, chunk_offset: u64) -> IndexedTrackState {
       let mut stts = vec![0u8; 8];
       stts[4..8].copy_from_slice(&1u32.to_be_bytes());
       stts.extend_from_slice(&1u32.to_be_bytes());
       stts.extend_from_slice(&1000u32.to_be_bytes());
       let mut retained = RetainedBudget::new(1024);
       let timing = SampleTimingTable::parse(&stts, &mut retained).unwrap();
+      IndexedTrackState::Ready(IndexedTrack {
+         id,
+         descriptions: vec![SampleDescriptionEntry {
+            codec: "tx3g".to_owned(),
+         }],
+         codec_description_index: 0,
+         language: Some("eng".to_owned()),
+         timescale: 1000,
+         duration: 1000,
+         handler: *b"sbtl",
+         presentation_offset: 0,
+         timing,
+         sizes: SampleSizes::fixed(1, 3).unwrap(),
+         stsc: vec![StscEntry {
+            first_chunk: 1,
+            samples_per_chunk: 1,
+            sample_description_index: 1,
+         }],
+         chunk_offsets: vec![chunk_offset],
+      })
+   }
+
+   fn one_cue_index() -> SubtitleIndex {
       SubtitleIndex {
-         tracks: vec![IndexedTrackState::Ready(IndexedTrack {
-            id: 1,
-            descriptions: vec![SampleDescriptionEntry {
-               codec: "tx3g".to_owned(),
-            }],
-            codec_description_index: 0,
-            language: Some("eng".to_owned()),
-            timescale: 1000,
-            duration: 1000,
-            handler: *b"sbtl",
-            presentation_offset: 0,
-            timing,
-            sizes: SampleSizes::fixed(1, 3).unwrap(),
-            stsc: vec![StscEntry {
-               first_chunk: 1,
-               samples_per_chunk: 1,
-               sample_description_index: 1,
-            }],
-            chunk_offsets: vec![0],
-         })],
+         tracks: vec![one_cue_track(1, 0)],
       }
    }
 
@@ -1138,6 +1175,36 @@ mod tests {
          .await
          .unwrap();
 
+      assert_eq!(tracks[0].cues[0].text, "x");
+   }
+
+   #[tokio::test]
+   async fn first_track_limit_stops_before_aggregate_request_budget_is_exhausted() {
+      let index = SubtitleIndex {
+         tracks: vec![one_cue_track(1, 0), one_cue_track(2, 3)],
+      };
+      let reader = BytesReader(vec![0, 1, b'x', 0, 1, b'y']);
+      let limits = RequestLimits {
+         max_samples: 1,
+         max_cues: 1,
+         max_decoded_text_bytes: 1,
+         max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES
+            + SUBTITLE_TRACK_PROJECTION_BYTES
+            + SUBTITLE_CUE_PROJECTION_BYTES
+            + 1,
+      };
+
+      index
+         .subtitles_with_limits(&reader, None, None, limits)
+         .await
+         .expect_err("decoding both tracks should exhaust the aggregate budget");
+      let tracks = index
+         .subtitles_first_with_limits(&reader, None, limits)
+         .await
+         .expect("the first track fits the same budget by itself");
+
+      assert_eq!(tracks.len(), 1);
+      assert_eq!(tracks[0].base.id, 1);
       assert_eq!(tracks[0].cues[0].text, "x");
    }
 
@@ -1290,6 +1357,7 @@ mod tests {
             None,
             REQUEST_LIMITS,
             limits,
+            false,
          )
          .await
          .expect_err("real request forwards subtitle sample limit");

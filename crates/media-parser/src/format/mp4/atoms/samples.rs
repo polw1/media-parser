@@ -250,17 +250,12 @@ pub(in crate::format::mp4) fn parse_sample_sizes_bounded(
 ) -> TableResult<SampleSizes> {
    let (fixed_size, sample_count) =
       sample_size_header(stsz).ok_or(TableParseError::Invalid("malformed stsz table"))?;
-   let count = usize::try_from(sample_count).map_err(|_| TableParseError::BudgetExceeded)?;
-   let mut sizes = if fixed_size == 0 {
-      budgeted_vec(count, budget)?
-   } else {
-      Vec::new()
-   };
    let expected_len = if fixed_size == 0 {
-      count
+      usize::try_from(sample_count)
+         .map_err(|_| TableParseError::Invalid("malformed stsz entry count"))?
          .checked_mul(4)
          .and_then(|bytes| bytes.checked_add(12))
-         .ok_or(TableParseError::BudgetExceeded)?
+         .ok_or(TableParseError::Invalid("malformed stsz entry count"))?
    } else {
       12
    };
@@ -268,6 +263,12 @@ pub(in crate::format::mp4) fn parse_sample_sizes_bounded(
       return Err(TableParseError::Invalid("malformed stsz entry count"));
    }
 
+   let count = usize::try_from(sample_count).map_err(|_| TableParseError::BudgetExceeded)?;
+   let mut sizes = if fixed_size == 0 {
+      budgeted_vec(count, budget)?
+   } else {
+      Vec::new()
+   };
    if fixed_size == 0 {
       for index in 0..count {
          sizes.push(
@@ -751,14 +752,14 @@ mod tests {
    }
 
    #[test]
-   fn bounded_stsz_precharges_declared_entries_before_framing_validation() {
+   fn bounded_stsz_validates_framing_before_charging_declared_entries() {
       let mut stsz = vec![0u8; 12];
       stsz[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
       let mut budget = RetainedBudget::new(8);
 
       assert_eq!(
          parse_sample_sizes_bounded(&stsz, &mut budget).unwrap_err(),
-         TableParseError::BudgetExceeded
+         TableParseError::Invalid("malformed stsz entry count")
       );
    }
 

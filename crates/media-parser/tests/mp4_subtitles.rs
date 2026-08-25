@@ -195,6 +195,17 @@ fn stsz(samples: &[Vec<u8>]) -> Vec<u8> {
    full_box(b"stsz", &body)
 }
 
+fn fixed_stsz(sample_size: u32, sample_count: u32) -> Vec<u8> {
+   full_box(
+      b"stsz",
+      &[
+         sample_size.to_be_bytes().as_slice(),
+         sample_count.to_be_bytes().as_slice(),
+      ]
+      .concat(),
+   )
+}
+
 fn stco(marker: u32) -> Vec<u8> {
    stco_markers(&[marker])
 }
@@ -308,6 +319,36 @@ fn subtitle_track_with_timing_and_duration(
    mp4_box(b"trak", &children.concat())
 }
 
+fn fixed_size_subtitle_track(
+   track_id: u32,
+   language: &[u8; 3],
+   samples: &[Vec<u8>],
+   declared_sample_count: u32,
+   offset_marker: u32,
+) -> Vec<u8> {
+   let sample_size = u32::try_from(samples[0].len()).expect("test sample size fits u32");
+   assert!(
+      samples
+         .iter()
+         .all(|sample| sample.len() == sample_size as usize)
+   );
+   let duration = u32::try_from(samples.len()).unwrap() * 1000;
+   let stbl = mp4_box(
+      b"stbl",
+      &[
+         stsd(),
+         stts(samples.len() as u32),
+         stsc(samples.len() as u32),
+         fixed_stsz(sample_size, declared_sample_count),
+         stco(offset_marker),
+      ]
+      .concat(),
+   );
+   let minf = mp4_box(b"minf", &stbl);
+   let mdia = mp4_box(b"mdia", &[mdhd(language, duration), hdlr(), minf].concat());
+   mp4_box(b"trak", &[tkhd(track_id, duration), mdia].concat())
+}
+
 fn tx3g(text: &str) -> Vec<u8> {
    let bytes = text.as_bytes();
    [
@@ -340,6 +381,37 @@ fn subtitle_mp4_with_edit(presentation_offset: Option<i32>) -> Vec<u8> {
       b"moov",
       &[
          subtitle_track(1, b"eng", &english, ENGLISH_OFFSET, presentation_offset),
+         subtitle_track(2, b"spa", &spanish, SPANISH_OFFSET, None),
+      ]
+      .concat(),
+   );
+   let english_payload = english.concat();
+   let spanish_payload = spanish.concat();
+   let mdat = mp4_box(
+      b"mdat",
+      &[english_payload.as_slice(), spanish_payload.as_slice()].concat(),
+   );
+   let mut file = [ftyp, moov, mdat].concat();
+   let mdat_payload = file.len() - english_payload.len() - spanish_payload.len();
+   patch_marker(&mut file, ENGLISH_OFFSET, mdat_payload as u32);
+   patch_marker(
+      &mut file,
+      SPANISH_OFFSET,
+      (mdat_payload + english_payload.len()) as u32,
+   );
+   file
+}
+
+fn fixed_stsz_count_mismatch_mp4() -> Vec<u8> {
+   const ENGLISH_OFFSET: u32 = 0xa7a8_a9aa;
+   const SPANISH_OFFSET: u32 = 0xb7b8_b9ba;
+   let english = [tx3g("One"), tx3g("Two")];
+   let spanish = [tx3g("Hola")];
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+   let moov = mp4_box(
+      b"moov",
+      &[
+         fixed_size_subtitle_track(1, b"eng", &english, u32::MAX, ENGLISH_OFFSET),
          subtitle_track(2, b"spa", &spanish, SPANISH_OFFSET, None),
       ]
       .concat(),
@@ -862,6 +934,39 @@ async fn hardening_unsupported_codec_is_skipped_broadly_and_errors_explicitly() 
 }
 
 #[tokio::test]
+async fn subtitles_first_returns_only_the_first_track_in_physical_order() {
+   let reader = BytesReader(subtitle_mp4());
+   let index = SubtitleIndex::read(&reader).await.expect("index subtitles");
+
+   let tracks = index
+      .subtitles_first(&reader, None)
+      .await
+      .expect("extract first subtitle track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].base.id, 1);
+}
+
+#[tokio::test]
+async fn subtitles_first_skips_a_rejected_track_before_returning() {
+   let mut bytes = subtitle_mp4();
+   let codec = find_bytes(&bytes, b"tx3g");
+   bytes[codec..codec + 4].copy_from_slice(b"junk");
+   let reader = BytesReader(bytes);
+   let index = SubtitleIndex::read(&reader)
+      .await
+      .expect("index rejected first track");
+
+   let tracks = index
+      .subtitles_first(&reader, None)
+      .await
+      .expect("skip rejected track and extract next valid track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].base.id, 2);
+}
+
+#[tokio::test]
 async fn hardening_malformed_table_is_retained_as_a_track_rejection() {
    let mut bytes = subtitle_mp4();
    let stsz = find_bytes(&bytes, b"stsz");
@@ -880,6 +985,42 @@ async fn hardening_malformed_table_is_retained_as_a_track_rejection() {
       .await
       .expect_err("explicit malformed track errors");
    assert!(error.to_string().contains("stsz"), "{error}");
+}
+
+#[tokio::test]
+async fn hardening_variable_stsz_count_above_limit_is_a_track_rejection() {
+   let mut bytes = subtitle_mp4();
+   let stsz = find_bytes(&bytes, b"stsz");
+   let sample_count = stsz + 12;
+   bytes[sample_count..sample_count + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+   let reader = BytesReader(bytes);
+   let index = SubtitleIndex::read(&reader)
+      .await
+      .expect("oversized malformed stsz should reject only its track");
+
+   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   assert_eq!(broad.len(), 1);
+   assert_eq!(broad[0].base.id, 2);
+   index
+      .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
+      .await
+      .expect_err("explicit malformed variable-size track errors");
+}
+
+#[tokio::test]
+async fn hardening_fixed_stsz_count_mismatch_is_a_track_rejection() {
+   let reader = BytesReader(fixed_stsz_count_mismatch_mp4());
+   let index = SubtitleIndex::read(&reader)
+      .await
+      .expect("inconsistent fixed stsz should reject only its track");
+
+   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   assert_eq!(broad.len(), 1);
+   assert_eq!(broad[0].base.id, 2);
+   index
+      .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
+      .await
+      .expect_err("explicit malformed fixed-size track errors");
 }
 
 #[tokio::test]

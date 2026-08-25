@@ -109,14 +109,16 @@ async fn subtitle_tracks(
 ) -> Result<Vec<SubtitleTrack>> {
    let request = prepare_subtitle_request(track_id, language, start_ms, end_ms)?;
    let session = subtitle_session(sessions, source, headers).await?;
-   let mut tracks = session
+   if request.first_track_only {
+      return Ok(session
+         .index
+         .subtitles_first(session.reader.as_ref(), request.range)
+         .await?);
+   }
+   Ok(session
       .index
       .subtitles(session.reader.as_ref(), request.filter, request.range)
-      .await?;
-   if request.first_track_only {
-      tracks.truncate(1);
-   }
-   Ok(tracks)
+      .await?)
 }
 
 #[allow(clippy::too_many_arguments)]
