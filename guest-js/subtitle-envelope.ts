@@ -1,41 +1,9 @@
 import { parseEnvelopeHeader } from './envelope';
-
-interface SubtitleCueEnvelopeEntry {
-   cueId: unknown;
-   startSec: unknown;
-   endSec: unknown;
-   offset: unknown;
-   length: unknown;
-}
-
-interface SubtitleEnvelopeEntry {
-   id: unknown;
-   codec: unknown;
-   language?: unknown;
-   timescale: unknown;
-   duration: unknown;
-   cues: unknown;
-}
-
-export interface DecodedSubtitleCue {
-   cueId: number;
-   startSec: number;
-   endSec: number;
-   text: string;
-}
-
-export interface DecodedSubtitleTrack {
-   id: number;
-   codec: string;
-   language?: string;
-   timescale: number;
-   duration: number;
-   cues: DecodedSubtitleCue[];
-}
+import type { SubtitleCueInfo, SubtitleInfo } from './types';
 
 export function decodeSubtitleEnvelope(
    raw: ArrayBuffer | Uint8Array,
-): DecodedSubtitleTrack[] {
+): SubtitleInfo[] {
    const parsed = parseEnvelopeHeader<unknown>(raw);
    if (parsed.version !== 1) {
       throw new TypeError(`Unsupported subtitle envelope version: ${String(parsed.version)}.`);
@@ -54,7 +22,7 @@ function decodeTrack(
    buffer: Uint8Array,
    payloadStart: number,
    payloadLength: number,
-): DecodedSubtitleTrack {
+): SubtitleInfo {
    const entry = requireObject(value, 'Subtitle envelope track');
    const id = requireSafeInteger(entry.id, 'Subtitle track id');
    const timescale = requireSafeInteger(entry.timescale, 'Subtitle track timescale');
@@ -76,7 +44,7 @@ function decodeTrack(
       payloadStart,
       payloadLength,
    ));
-   const decoded: DecodedSubtitleTrack = {
+   const decoded: SubtitleInfo = {
       id,
       codec: entry.codec,
       timescale,
@@ -94,7 +62,7 @@ function decodeCue(
    buffer: Uint8Array,
    payloadStart: number,
    payloadLength: number,
-): DecodedSubtitleCue {
+): SubtitleCueInfo {
    const entry = requireObject(value, 'Subtitle envelope cue');
    const cueId = requireSafeInteger(entry.cueId, 'Subtitle cue id');
    const offset = requireSafeInteger(entry.offset, 'Subtitle cue offset');

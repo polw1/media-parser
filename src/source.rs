@@ -98,42 +98,6 @@ mod tests {
    use std::collections::HashMap;
    use std::time::Duration;
 
-   #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-   struct ThumbnailSessionKey {
-      source: MediaSourceKey,
-      track_id: u32,
-   }
-
-   #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-   struct SubtitleSessionKey {
-      source: MediaSourceKey,
-   }
-
-   #[tokio::test]
-   async fn one_media_source_key_backs_track_specific_thumbnails_and_source_wide_subtitles() {
-      let source = source_key("https://example.com/video.mp4", None).await;
-
-      let thumbnail = ThumbnailSessionKey {
-         source: source.clone(),
-         track_id: 7,
-      };
-      let other_thumbnail_track = ThumbnailSessionKey {
-         source: source.clone(),
-         track_id: 8,
-      };
-      let subtitle = SubtitleSessionKey {
-         source: source.clone(),
-      };
-      let same_subtitle_source = SubtitleSessionKey {
-         source: source.clone(),
-      };
-
-      assert!(thumbnail.source == source);
-      assert!(subtitle.source == source);
-      assert_ne!(thumbnail, other_thumbnail_track);
-      assert_eq!(subtitle, same_subtitle_source);
-   }
-
    #[tokio::test]
    async fn remote_source_key_normalizes_header_names_and_order() {
       let first_headers = HashMap::from([

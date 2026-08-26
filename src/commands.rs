@@ -332,6 +332,21 @@ mod tests {
          .into_owned()
    }
 
+   #[tokio::test]
+   async fn thumbnail_session_key_distinguishes_track_ids() {
+      let source = source_key("https://example.com/video.mp4", None).await;
+      let first = ThumbnailSessionKey {
+         source: source.clone(),
+         track_id: 7,
+      };
+      let second = ThumbnailSessionKey {
+         source,
+         track_id: 8,
+      };
+
+      assert!(first != second);
+   }
+
    #[test]
    fn omitted_thumbnail_quality_keeps_the_default() {
       let options = thumbnail_options(None, None, None).expect("omitted options are valid");
