@@ -73,6 +73,49 @@ test('decodes nested subtitle metadata and accepts duplicate payload ranges', ()
    assert.equal(Object.prototype.hasOwnProperty.call(subtitles[1], 'language'), false);
 });
 
+test('reuses one fatal UTF-8 decoder across subtitle cues', () => {
+   const NativeTextDecoder = TextDecoder;
+   const originalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'TextDecoder');
+   let fatalDecoderConstructions = 0;
+   class CountingTextDecoder extends NativeTextDecoder {
+      constructor(label?: string, options?: TextDecoderOptions) {
+         super(label, options);
+         if (options?.fatal === true) {
+            fatalDecoderConstructions += 1;
+         }
+      }
+   }
+
+   Object.defineProperty(globalThis, 'TextDecoder', {
+      configurable: true,
+      writable: true,
+      value: CountingTextDecoder,
+   });
+   const modulePath = require.resolve('./subtitle-envelope');
+   delete require.cache[modulePath];
+
+   try {
+      const reloadedModule = require('./subtitle-envelope') as typeof import('./subtitle-envelope');
+      const header = {
+         version: 1,
+         entries: [track({ cues: [cue(), cue({ cueId: 2 }), cue({ cueId: 3 })] })],
+      };
+
+      reloadedModule.decodeSubtitleEnvelope(
+         buildEnvelope(header, [...Buffer.from('hello')]),
+      );
+
+      assert.equal(fatalDecoderConstructions, 1);
+   } finally {
+      delete require.cache[modulePath];
+      if (originalDescriptor === undefined) {
+         delete (globalThis as { TextDecoder?: typeof TextDecoder }).TextDecoder;
+      } else {
+         Object.defineProperty(globalThis, 'TextDecoder', originalDescriptor);
+      }
+   }
+});
+
 test('rejects legacy and unknown subtitle envelope versions', () => {
    assert.throws(
       () => decodeSubtitleEnvelope(buildEnvelope([], [])),

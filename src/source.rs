@@ -9,6 +9,7 @@ use crate::Result;
 
 const REMOTE_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_SESSION_TTL: Duration = Duration::from_secs(60);
+pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MediaSourceKey {
@@ -156,6 +157,11 @@ mod tests {
 
       assert_eq!(session_ttl(&local), Duration::from_secs(60));
       assert_eq!(session_ttl(&remote), Duration::from_secs(5 * 60));
+   }
+
+   #[test]
+   fn shared_session_reaper_interval_is_one_second() {
+      assert_eq!(SESSION_REAPER_INTERVAL, Duration::from_secs(1));
    }
 
    #[test]

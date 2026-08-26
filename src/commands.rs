@@ -11,10 +11,11 @@ use media_parser::{
 use crate::Result;
 use crate::envelope::{cover_envelope, encode_thumbnail_envelope, run_envelope_task};
 use crate::session_cache::SessionPool;
-use crate::source::{MediaSourceKey, open_reader, session_ttl, source_key};
+use crate::source::{
+   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_ttl, source_key,
+};
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
-const SESSION_CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -35,7 +36,7 @@ pub(crate) struct ThumbnailSessions {
 impl Default for ThumbnailSessions {
    fn default() -> Self {
       Self {
-         pool: SessionPool::new(MAX_THUMBNAIL_SESSIONS, SESSION_CACHE_REAPER_INTERVAL),
+         pool: SessionPool::new(MAX_THUMBNAIL_SESSIONS, SESSION_REAPER_INTERVAL),
       }
    }
 }

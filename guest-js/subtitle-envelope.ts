@@ -1,6 +1,8 @@
 import { parseEnvelopeHeader } from './envelope';
 import type { SubtitleCueInfo, SubtitleInfo } from './types';
 
+const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
+
 export function decodeSubtitleEnvelope(
    raw: ArrayBuffer | Uint8Array,
 ): SubtitleInfo[] {
@@ -83,7 +85,7 @@ function decodeCue(
    );
    let text: string;
    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+      text = UTF8_DECODER.decode(bytes);
    } catch {
       throw new TypeError('Subtitle cue text is not valid UTF-8.');
    }

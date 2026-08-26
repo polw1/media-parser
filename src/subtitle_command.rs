@@ -11,7 +11,9 @@ use crate::envelope::{
    JS_MAX_SAFE_INTEGER, MAX_SUBTITLE_OUTPUT_BYTES, encode_subtitle_envelope, run_envelope_task,
 };
 use crate::session_cache::SessionPool;
-use crate::source::{MediaSourceKey, open_reader, session_ttl, source_key};
+use crate::source::{
+   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_ttl, source_key,
+};
 
 const MAX_SUBTITLE_SESSIONS: usize = 8;
 
@@ -27,7 +29,7 @@ pub(crate) struct SubtitleSessions {
 impl Default for SubtitleSessions {
    fn default() -> Self {
       Self {
-         pool: SessionPool::new(MAX_SUBTITLE_SESSIONS, Duration::from_secs(1)),
+         pool: SessionPool::new(MAX_SUBTITLE_SESSIONS, SESSION_REAPER_INTERVAL),
       }
    }
 }
