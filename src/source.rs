@@ -24,7 +24,7 @@ struct LocalSourceVersion {
    modified_nanos: Option<u128>,
 }
 
-pub(crate) fn is_http_source(source: &str) -> bool {
+fn is_http_source(source: &str) -> bool {
    Url::parse(source)
       .map(|url| matches!(url.scheme(), "http" | "https"))
       .unwrap_or(false)
