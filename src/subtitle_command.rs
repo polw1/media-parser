@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use media_parser::format::mp4::{MAX_SUBTITLE_OUTPUT_BYTES, SubtitleIndex};
+use media_parser::format::mp4::SubtitleIndex;
 use media_parser::{StreamReader, SubtitleTrack, TrackFilter};
 use tauri::{State, command};
 
 use crate::Result;
-use crate::envelope::{JS_MAX_SAFE_INTEGER, encode_subtitle_envelope, run_envelope_task};
+use crate::envelope::{
+   JS_MAX_SAFE_INTEGER, MAX_SUBTITLE_OUTPUT_BYTES, encode_subtitle_envelope, run_envelope_task,
+};
 use crate::session_cache::SessionPool;
 use crate::source::{MediaSourceKey, open_reader, session_ttl, source_key};
 

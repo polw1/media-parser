@@ -10,10 +10,6 @@
 //! entries so decoders can reject a header they don't understand instead of
 //! misreading it; bump it whenever an entry's fields change shape.
 
-use media_parser::format::mp4::{
-   MAX_SUBTITLE_OUTPUT_BYTES, SUBTITLE_CUE_PROJECTION_BYTES,
-   SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES, SUBTITLE_TRACK_PROJECTION_BYTES,
-};
 use media_parser::{CoverArt, Frame, PixelFormat, SubtitleTrack};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -39,6 +35,13 @@ fn envelope_task_error(label: &str, error: impl std::fmt::Display) -> crate::Err
 /// `version` they don't recognize rather than guessing at its shape.
 const ENVELOPE_VERSION: u32 = 1;
 const ENVELOPE_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+const SUBTITLE_ENVELOPE_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
+const SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES: usize = br#"{"version":1,"entries":[]}"#.len();
+const SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES: usize =
+   SUBTITLE_ENVELOPE_PREFIX_BYTES + SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES;
+pub(crate) const MAX_SUBTITLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+const SUBTITLE_TRACK_PROJECTION_BYTES: usize = 512;
+const SUBTITLE_CUE_PROJECTION_BYTES: usize = 160;
 
 /// Largest integer that JavaScript can represent without losing precision.
 pub(crate) const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -465,9 +468,6 @@ fn writer_limit_error() -> io::Error {
 #[cfg(test)]
 mod tests {
    use super::*;
-   use media_parser::format::mp4::{
-      MAX_SUBTITLE_OUTPUT_BYTES, SUBTITLE_CUE_PROJECTION_BYTES, SUBTITLE_TRACK_PROJECTION_BYTES,
-   };
    use media_parser::{BaseTrackMeta, PixelFormat, SubtitleCue, SubtitleTrack};
    use serde::ser::SerializeSeq;
    use std::collections::HashMap;

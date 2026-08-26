@@ -26,14 +26,14 @@ mod tests {
    #[test]
    fn media_parser_invalid_format_serialization_preserves_reason_and_guidance() {
       let error = Error::MediaParser(media_parser::MediaParserError::InvalidFormat(
-         "too many sample read regions; select by track ID or language, or request a narrower time range"
+         "too many sample read batches; select by track ID or language, or request a narrower time range"
             .to_owned(),
       ));
 
       assert_eq!(
          serde_json::to_value(error).expect("the plugin error should serialize"),
          serde_json::json!(
-            "Media parser error: Invalid MP4 format: too many sample read regions; select by track ID or language, or request a narrower time range"
+            "Media parser error: Invalid MP4 format: too many sample read batches; select by track ID or language, or request a narrower time range"
          )
       );
    }

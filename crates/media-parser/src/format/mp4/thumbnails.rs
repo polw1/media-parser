@@ -11,10 +11,7 @@ use super::atoms::{
 };
 #[cfg(test)]
 use super::index_build_parallelism;
-use super::sample_io::{
-   MAX_SAMPLES_PER_THUMBNAIL_BATCH, SampleData, SampleReadBudget, SampleReadLimits,
-   read_samples_coalesced,
-};
+use super::sample_io::{SampleData, SampleReadBudget, SampleReadLimits, read_samples_coalesced};
 use crate::decoders::h264::{
    AvcConfig, DecodedImage, JpegQuality, OutputBudget, ThumbnailSize, decode_frames_to_jpeg,
 };
@@ -28,6 +25,7 @@ use std::time::Duration;
 
 pub const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
+const MAX_SAMPLES_PER_THUMBNAIL_BATCH: usize = 16_384;
 const THUMBNAIL_SAMPLE_READ_LIMITS: SampleReadLimits = SampleReadLimits {
    max_samples: MAX_SAMPLES_PER_THUMBNAIL_BATCH,
    max_sample_bytes: 64 * 1024 * 1024,

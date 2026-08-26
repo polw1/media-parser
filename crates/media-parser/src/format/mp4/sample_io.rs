@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-pub(super) const MAX_SAMPLES_PER_THUMBNAIL_BATCH: usize = 16_384;
 const MAX_CONCURRENT_READS: usize = 4;
 
 /// Stateless limits applied to one sample-read plan plus aggregate ceilings
@@ -408,7 +407,7 @@ fn validate_physical_plan(
    let total_regions = budget
       .regions
       .checked_add(regions)
-      .ok_or_else(|| fatal_error("too many sample read regions"))?;
+      .ok_or_else(|| fatal_error("too many sample read batches"))?;
    Ok((total_physical, total_regions, regions))
 }
 
@@ -454,13 +453,13 @@ fn validate_region_charge(
    }
    let next_regions = regions
       .checked_add(1)
-      .ok_or_else(|| fatal_error("too many sample read regions"))?;
+      .ok_or_else(|| fatal_error("too many sample read batches"))?;
    let total_regions = budget
       .regions
       .checked_add(next_regions)
-      .ok_or_else(|| fatal_error("too many sample read regions"))?;
+      .ok_or_else(|| fatal_error("too many sample read batches"))?;
    if total_regions > limits.max_regions {
-      return Err(limit_error("too many sample read regions"));
+      return Err(limit_error("too many sample read batches"));
    }
    *physical_bytes = next_physical;
    *regions = next_regions;
@@ -671,7 +670,7 @@ mod tests {
       )
       .expect_err("region count above its configured limit must fail");
 
-      assert_limit(error, "too many sample read regions");
+      assert_limit(error, "too many sample read batches");
    }
 
    #[test]
@@ -853,7 +852,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(error.to_string().contains("too many sample read regions"));
+      assert!(error.to_string().contains("too many sample read batches"));
    }
 
    #[test]
@@ -1056,7 +1055,7 @@ mod tests {
       )
       .expect_err("the second track takes the shared request over 4,096 regions");
 
-      assert!(error.to_string().contains("too many sample read regions"));
+      assert!(error.to_string().contains("too many sample read batches"));
       assert_eq!(request_budget.regions, SAMPLES_PER_TRACK as usize);
    }
 

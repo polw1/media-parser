@@ -89,10 +89,9 @@
 //! 200,000 subtitle samples, and retains at most 32 MiB. Each extraction
 //! request selects at most 200,000 samples and cues, accepts at most 1 MiB per
 //! sample, reads at most 64 MiB of logical sample data and 96 MiB physically,
-//! decodes at most 32 MiB of text, and projects at most
-//! [`MAX_SUBTITLE_OUTPUT_BYTES`] (64 MiB) of output. Coalesced reads are limited
-//! to 4,096 regions of at most 8 MiB each, with at most a 64 KiB gap joined into
-//! a region. Budgets are aggregate across all selected tracks and use checked,
+//! and decodes at most 32 MiB of text. Coalesced reads are limited to 4,096
+//! regions of at most 8 MiB each, with at most a 64 KiB gap joined into a
+//! region. Budgets are aggregate across all selected tracks and use checked,
 //! fallible allocation paths.
 //!
 //! ## Box Structure for Subtitles
@@ -117,13 +116,4 @@ mod index;
 mod output;
 mod text;
 
-const SUBTITLE_ENVELOPE_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
-const SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES: usize = br#"{"version":1,"entries":[]}"#.len();
-/// Conservative projection charged before any subtitle track or cue is retained.
-pub const SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES: usize =
-   SUBTITLE_ENVELOPE_PREFIX_BYTES + SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES;
-
-pub use index::{
-   MAX_SUBTITLE_OUTPUT_BYTES, SUBTITLE_CUE_PROJECTION_BYTES, SUBTITLE_TRACK_PROJECTION_BYTES,
-   SubtitleIndex, read_subtitles, read_subtitles_in_range,
-};
+pub use index::{SubtitleIndex, read_subtitles, read_subtitles_in_range};

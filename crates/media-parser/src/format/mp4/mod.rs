@@ -130,11 +130,7 @@ pub async fn read_cover(reader: &dyn StreamReader) -> Result<Option<CoverArt>> {
 // Re-export for direct access
 pub use crate::decoders::h264::ThumbnailSize;
 pub use metadata::read_metadata;
-pub use subtitles::{
-   MAX_SUBTITLE_OUTPUT_BYTES, SUBTITLE_CUE_PROJECTION_BYTES,
-   SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES, SUBTITLE_TRACK_PROJECTION_BYTES, SubtitleIndex,
-   read_subtitles, read_subtitles_in_range,
-};
+pub use subtitles::{SubtitleIndex, read_subtitles, read_subtitles_in_range};
 pub use thumbnails::{
    MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions, read_frame, read_frames, read_keyframes,
 };

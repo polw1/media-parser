@@ -1,5 +1,3 @@
-#[cfg(test)]
-use super::SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES;
 use super::budget::{IndexBudget, RequestBudget, RequestLimits};
 use super::output::{output_string, track_properties};
 use super::text::{DecodeSampleError, decode_sample};
@@ -22,10 +20,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub const MAX_SUBTITLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
-pub const SUBTITLE_TRACK_PROJECTION_BYTES: usize = 512;
-pub const SUBTITLE_CUE_PROJECTION_BYTES: usize = 160;
-
 const MAX_TRAKS: usize = 1000;
 const MAX_INDEXED_SUBTITLE_SAMPLES: usize = 200_000;
 const MAX_RETAINED_INDEX_BYTES: usize = 32 * 1024 * 1024;
@@ -47,7 +41,6 @@ const REQUEST_LIMITS: RequestLimits = RequestLimits {
    max_samples: MAX_SELECTED_SUBTITLE_SAMPLES,
    max_cues: MAX_SUBTITLE_CUES,
    max_decoded_text_bytes: MAX_DECODED_TEXT_BYTES,
-   max_output_bytes: MAX_SUBTITLE_OUTPUT_BYTES,
 };
 
 // A ceiling ordered below the one it contains would reject every request
@@ -61,9 +54,7 @@ const _: () =
    assert!(SUBTITLE_READ_LIMITS.max_logical_bytes <= SUBTITLE_READ_LIMITS.max_physical_bytes);
 const _: () = assert!(SUBTITLE_READ_LIMITS.max_regions <= SUBTITLE_READ_LIMITS.max_samples);
 const _: () = assert!(SUBTITLE_READ_LIMITS.max_samples == REQUEST_LIMITS.max_samples);
-const _: () = assert!(REQUEST_LIMITS.max_decoded_text_bytes <= REQUEST_LIMITS.max_output_bytes);
 const _: () = assert!(REQUEST_LIMITS.max_cues <= REQUEST_LIMITS.max_samples);
-const _: () = assert!(REQUEST_LIMITS.max_output_bytes == MAX_SUBTITLE_OUTPUT_BYTES);
 
 #[derive(Debug)]
 pub struct SubtitleIndex {
@@ -287,7 +278,7 @@ impl SubtitleIndex {
    ) -> Result<Vec<SubtitleTrack>> {
       let mut output = Vec::new();
       let mut sample_read_budget = SampleReadBudget::default();
-      let mut request = RequestBudget::new(limits)?;
+      let mut request = RequestBudget::new(limits);
 
       for indexed in &self.tracks {
          let track = match indexed {
@@ -310,7 +301,6 @@ impl SubtitleIndex {
             continue;
          }
 
-         request.charge_projection(SUBTITLE_TRACK_PROJECTION_BYTES)?;
          let selected = match select_cues(track, range, &mut request) {
             Ok(selected) => selected,
             Err(SelectCuesError::Track(error)) => {
@@ -376,8 +366,6 @@ impl SubtitleIndex {
             };
             request.charge_decoded_text(text.len())?;
             request.charge_cue(1)?;
-            request.charge_projection(SUBTITLE_CUE_PROJECTION_BYTES)?;
-            request.charge_projection(text.len())?;
             cues.push(SubtitleCue {
                cue_id: selected_cue.sample_index,
                start_time: selected_cue.start_time,
@@ -1214,9 +1202,7 @@ mod tests {
          max_samples: 0,
          max_cues: 1,
          max_decoded_text_bytes: 16,
-         max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES + 1024,
-      })
-      .unwrap();
+      });
 
       assert!(matches!(
          select_cues(track, None, &mut request),
@@ -1240,10 +1226,6 @@ mod tests {
                max_samples: 1,
                max_cues: 1,
                max_decoded_text_bytes: 1,
-               max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES
-                  + SUBTITLE_TRACK_PROJECTION_BYTES
-                  + SUBTITLE_CUE_PROJECTION_BYTES
-                  + 1,
             },
          )
          .await
@@ -1262,10 +1244,6 @@ mod tests {
          max_samples: 1,
          max_cues: 1,
          max_decoded_text_bytes: 1,
-         max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES
-            + SUBTITLE_TRACK_PROJECTION_BYTES
-            + SUBTITLE_CUE_PROJECTION_BYTES
-            + 1,
       };
 
       index
@@ -1290,10 +1268,6 @@ mod tests {
          max_samples: 1,
          max_cues: 1,
          max_decoded_text_bytes: 1,
-         max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES
-            + SUBTITLE_TRACK_PROJECTION_BYTES
-            + SUBTITLE_CUE_PROJECTION_BYTES
-            + 1,
       };
       for limits in [
          RequestLimits {
@@ -1308,47 +1282,12 @@ mod tests {
             max_decoded_text_bytes: 0,
             ..baseline
          },
-         RequestLimits {
-            max_output_bytes: baseline.max_output_bytes - 1,
-            ..baseline
-         },
       ] {
          index
             .subtitles_with_limits(&reader, None, None, limits)
             .await
             .expect_err("one-over request boundary");
       }
-   }
-
-   #[tokio::test]
-   async fn empty_result_requires_the_complete_projected_envelope_base() {
-      let index = SubtitleIndex { tracks: Vec::new() };
-      let limits = RequestLimits {
-         max_samples: 0,
-         max_cues: 0,
-         max_decoded_text_bytes: 0,
-         max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES,
-      };
-
-      let tracks = index
-         .subtitles_with_limits(&BytesReader(Vec::new()), None, None, limits)
-         .await
-         .expect("the exact empty-envelope base should be accepted");
-      assert!(tracks.is_empty());
-
-      let error = index
-         .subtitles_with_limits(
-            &BytesReader(Vec::new()),
-            None,
-            None,
-            RequestLimits {
-               max_output_bytes: SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES - 1,
-               ..limits
-            },
-         )
-         .await
-         .expect_err("one byte below the empty-envelope base must fail");
-      assert!(error.to_string().contains("output budget exceeded"));
    }
 
    #[tokio::test]
@@ -1505,9 +1444,9 @@ mod tests {
          )
          .await
          .expect_err("the second track exceeds the shared one-region budget");
-      let reason = invalid_format_reason(error, "too many sample read regions");
+      let reason = invalid_format_reason(error, "too many sample read batches");
 
-      assert!(reason.contains("too many sample read regions"));
+      assert!(reason.contains("too many sample read batches"));
       assert!(reason.contains("track ID"));
       assert!(reason.contains("language"));
       assert!(reason.contains("narrower time range"));
