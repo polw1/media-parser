@@ -136,8 +136,8 @@ fn hdlr() -> Vec<u8> {
    full_box(b"hdlr", &body)
 }
 
-fn stsd() -> Vec<u8> {
-   stsd_entries(&[*b"tx3g"])
+fn stsd(codec: &[u8; 4]) -> Vec<u8> {
+   stsd_entries(&[*codec])
 }
 
 fn stsd_entries(codecs: &[[u8; 4]]) -> Vec<u8> {
@@ -229,7 +229,7 @@ fn subtitle_track(
       track_id,
       language,
       samples,
-      stsd(),
+      stsd(b"tx3g"),
       stsc(samples.len() as u32),
       stco(offset_marker),
       presentation_offset,
@@ -336,7 +336,7 @@ fn fixed_size_subtitle_track(
    let stbl = mp4_box(
       b"stbl",
       &[
-         stsd(),
+         stsd(b"tx3g"),
          stts(samples.len() as u32),
          stsc(samples.len() as u32),
          fixed_stsz(sample_size, declared_sample_count),
@@ -369,6 +369,30 @@ fn patch_marker(bytes: &mut [u8], marker: u32, replacement: u32) {
 
 fn subtitle_mp4() -> Vec<u8> {
    subtitle_mp4_with_edit(None)
+}
+
+fn single_codec_subtitle_mp4(codec: &[u8; 4], sample: Vec<u8>) -> Vec<u8> {
+   const OFFSET: u32 = 0xc1c2_c3c4;
+   let samples = [sample];
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+   let moov = mp4_box(
+      b"moov",
+      &subtitle_track_with_tables(
+         1,
+         b"eng",
+         &samples,
+         stsd(codec),
+         stsc(1),
+         stco(OFFSET),
+         None,
+      ),
+   );
+   let payload = samples.concat();
+   let mdat = mp4_box(b"mdat", &payload);
+   let mut file = [ftyp, moov, mdat].concat();
+   let payload_offset = file.len() - payload.len();
+   patch_marker(&mut file, OFFSET, payload_offset as u32);
+   file
 }
 
 fn subtitle_mp4_with_edit(presentation_offset: Option<i32>) -> Vec<u8> {
@@ -502,7 +526,7 @@ fn zero_delta_subtitle_mp4() -> Vec<u8> {
       1,
       b"eng",
       &samples,
-      stsd(),
+      stsd(b"tx3g"),
       stts_entries(&[(1, 1_000), (1, 0), (1, 1_000)]),
       stsc(3),
       stco(OFFSET),
@@ -550,6 +574,37 @@ async fn high_level_subtitles_dispatches_synthetic_mp4() {
    assert_eq!(tracks[0].cues[0].text, "First");
    assert_eq!(tracks[1].base.id, 2);
    assert_eq!(tracks[1].cues[0].text, "Hola");
+}
+
+#[tokio::test]
+async fn high_level_subtitles_decodes_wvtt_vttc_payload() {
+   let sample = mp4_box(b"vttc", &mp4_box(b"payl", b"WebVTT cue"));
+   let parser = MediaParser::new(BytesReader(single_codec_subtitle_mp4(b"wvtt", sample)));
+
+   let tracks = parser.subtitles(None).await.expect("extract WebVTT track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].base.codec, "wvtt");
+   assert_eq!(tracks[0].cues.len(), 1);
+   assert_eq!(tracks[0].cues[0].text, "WebVTT cue");
+}
+
+#[tokio::test]
+async fn high_level_subtitles_decodes_length_prefixed_quicktime_text() {
+   let parser = MediaParser::new(BytesReader(single_codec_subtitle_mp4(
+      b"text",
+      tx3g("QuickTime cue"),
+   )));
+
+   let tracks = parser
+      .subtitles(None)
+      .await
+      .expect("extract QuickTime text track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].base.codec, "text");
+   assert_eq!(tracks[0].cues.len(), 1);
+   assert_eq!(tracks[0].cues[0].text, "QuickTime cue");
 }
 
 #[tokio::test]

@@ -62,10 +62,20 @@ use crate::stream::StreamReader;
 use crate::types::{CoverArt, Metadata, SubtitleTrack, TrackFilter, TrackType};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 
 /// MP4 format signature for detection.
 pub use crate::format::signatures::MP4 as SIGNATURE;
+
+/// Limits CPU-bound index builds to the process's available parallelism.
+static INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
+   LazyLock::new(|| Arc::new(Semaphore::new(index_build_parallelism())));
+
+fn index_build_parallelism() -> usize {
+   std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get())
+}
 
 /// Parser entry point for the registry.
 fn parse(reader: &dyn StreamReader) -> Pin<Box<dyn Future<Output = Result<Metadata>> + Send + '_>> {

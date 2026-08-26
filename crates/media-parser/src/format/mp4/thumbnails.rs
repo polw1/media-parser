@@ -1,5 +1,6 @@
 //! MP4 thumbnail extraction from H.264 video tracks.
 
+use super::INDEX_BUILD_PERMITS;
 use super::atoms::{
    CompositionOffset, Mp4Nav, PresentationTimeline, SampleSizes, StscEntry, duration_to_ticks,
    find_and_read_moov_box, iter_boxes, nearest_sync_sample, next_sync_sample, parse_avc_config,
@@ -8,6 +9,8 @@ use super::atoms::{
    stts_duration_ticks, table_entries, ticks_to_duration, track_presentation_offset,
    validate_sample_tables,
 };
+#[cfg(test)]
+use super::index_build_parallelism;
 use super::sample_io::{
    MAX_SAMPLES_PER_THUMBNAIL_BATCH, SampleData, SampleReadBudget, SampleReadLimits,
    read_samples_coalesced,
@@ -20,9 +23,8 @@ use crate::stream::StreamReader;
 use crate::types::{Frame, PixelFormat};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 
 pub const MAX_THUMBNAIL_OUTPUTS: usize = 4_096;
 const MAX_CONCURRENT_DECODES: usize = 4;
@@ -35,14 +37,6 @@ const THUMBNAIL_SAMPLE_READ_LIMITS: SampleReadLimits = SampleReadLimits {
    max_region_bytes: 64 * 1024 * 1024,
    max_coalesce_gap_bytes: 32 * 1024,
 };
-
-/// Limits CPU-bound index builds to the process's available parallelism.
-static INDEX_BUILD_PERMITS: LazyLock<Arc<Semaphore>> =
-   LazyLock::new(|| Arc::new(Semaphore::new(index_build_parallelism())));
-
-fn index_build_parallelism() -> usize {
-   std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get())
-}
 
 /// Encoding options for extracted thumbnails.
 ///
@@ -901,8 +895,9 @@ mod tests {
    #[tokio::test]
    async fn index_builds_wait_for_a_permit_and_return_it() {
       let total = index_build_parallelism();
+      let total_permits = u32::try_from(total).expect("parallelism fits u32");
       let held = Arc::clone(&INDEX_BUILD_PERMITS)
-         .acquire_many_owned(u32::try_from(total).expect("parallelism fits u32"))
+         .acquire_many_owned(total_permits)
          .await
          .expect("the index-build semaphore is never closed");
       assert_eq!(INDEX_BUILD_PERMITS.available_permits(), 0);
@@ -911,12 +906,22 @@ mod tests {
          let reader = InMemoryReader(empty_moov_file());
          ThumbnailIndex::read(&reader, 0).await
       });
+      let mut subtitle_build = tokio::spawn(async move {
+         let reader = InMemoryReader(empty_moov_file());
+         crate::format::mp4::SubtitleIndex::read(&reader).await
+      });
 
       assert!(
          tokio::time::timeout(Duration::from_millis(100), &mut build)
             .await
             .is_err(),
-         "the index build ran while every permit was held"
+         "the thumbnail index build ran while every permit was held"
+      );
+      assert!(
+         tokio::time::timeout(Duration::from_millis(100), &mut subtitle_build)
+            .await
+            .is_err(),
+         "the subtitle index build ran while every permit was held"
       );
 
       drop(held);
@@ -925,7 +930,18 @@ mod tests {
          .expect("the index build task did not panic")
          .expect_err("an empty moov describes no video track");
       assert!(matches!(error, MediaParserError::TrackNotFound(_)));
-      assert_eq!(INDEX_BUILD_PERMITS.available_permits(), total);
+      subtitle_build
+         .await
+         .expect("the subtitle index build task did not panic")
+         .expect("an empty moov describes no subtitle tracks");
+      let returned = tokio::time::timeout(
+         Duration::from_secs(5),
+         Arc::clone(&INDEX_BUILD_PERMITS).acquire_many_owned(total_permits),
+      )
+      .await
+      .expect("all index-build permits were not returned")
+      .expect("the index-build semaphore is never closed");
+      assert_eq!(returned.num_permits(), total);
    }
 
    fn test_track() -> VideoTrack {

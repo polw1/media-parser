@@ -4,6 +4,7 @@ use super::budget::{IndexBudget, RequestBudget, RequestLimits};
 use super::output::{output_string, track_properties};
 use super::text::{DecodeSampleError, decode_sample};
 use crate::errors::{MediaParserError, Result};
+use crate::format::mp4::INDEX_BUILD_PERMITS;
 use crate::format::mp4::atoms::{
    Mp4Nav, SampleDescriptionEntry, SampleSizes, SampleTiming, SampleTimingTable, StscEntry,
    TableParseError, TableResult, find_and_read_moov_box, iter_boxes, parse_chunk_offsets_bounded,
@@ -18,6 +19,7 @@ use crate::format::validate_subtitle_range;
 use crate::stream::StreamReader;
 use crate::types::{BaseTrackMeta, SubtitleCue, SubtitleTrack, TrackFilter};
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub const MAX_SUBTITLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
@@ -162,7 +164,28 @@ impl SubtitleIndex {
       max_retained_bytes: usize,
    ) -> Result<(Self, IndexUsage)> {
       let moov = find_and_read_moov_box(reader).await?;
-      let payload = parse_moov_payload(&moov)?;
+      // Keep the permit until parsing finishes, even if the caller is aborted.
+      let permit = Arc::clone(&INDEX_BUILD_PERMITS)
+         .acquire_owned()
+         .await
+         .expect("the index-build semaphore is never closed");
+      tokio::task::spawn_blocking(move || {
+         let _permit = permit;
+         Self::from_moov_with_limits(&moov, max_traks, max_samples, max_retained_bytes)
+      })
+      .await
+      .map_err(|error| {
+         MediaParserError::BlockingTask(format!("subtitle index task failed: {error}"))
+      })?
+   }
+
+   fn from_moov_with_limits(
+      moov: &[u8],
+      max_traks: usize,
+      max_samples: usize,
+      max_retained_bytes: usize,
+   ) -> Result<(Self, IndexUsage)> {
+      let payload = parse_moov_payload(moov)?;
       let mut budget = IndexBudget::new(max_samples, max_retained_bytes);
       let mut tracks = Vec::new();
       let chapter_track_ids = disabled_chapter_track_ids(payload, max_traks)?;
@@ -183,7 +206,6 @@ impl SubtitleIndex {
             )?,
          }
       }
-      drop(moov);
       let usage = IndexUsage {
          samples: budget.samples(),
          retained_bytes: budget.retained.used_bytes(),
