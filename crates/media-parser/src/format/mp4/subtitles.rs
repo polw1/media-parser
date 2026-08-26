@@ -89,7 +89,7 @@
 //! 200,000 subtitle samples, and retains at most 32 MiB. Each extraction
 //! request selects at most 200,000 samples and cues, accepts at most 1 MiB per
 //! sample, reads at most 64 MiB of logical sample data and 96 MiB physically,
-//! and decodes at most 32 MiB of text. Coalesced reads are limited to 4,096
+//! and decodes at most 32 MiB of text. Coalesced reads are limited to 16,384
 //! regions of at most 8 MiB each, with at most a 64 KiB gap joined into a
 //! region. Budgets are aggregate across all selected tracks and use checked,
 //! fallible allocation paths.

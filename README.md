@@ -269,6 +269,11 @@ inside video samples. This Tauri command is MP4-family-only; a non-MP4 source,
 including MP3, returns a parsing error. The lower-level Rust `MediaParser`
 registry instead returns an empty subtitle vector for MP3.
 
+For `stpp`, `cue.text` contains the decoded TTML markup without XML
+interpretation or separation of `<p>` elements. Each decoded sample that
+remains non-empty after trimming whitespace and NUL characters produces one
+cue with its original interval.
+
 ```typescript
 import { getSubtitles } from '@silvermine/tauri-plugin-media-parser';
 
@@ -318,19 +323,22 @@ integers with `startMs < endMs`. Use them to narrow a track that is individually
 too dense even after selecting it with `trackId`. Subtitle work is bounded per
 request: at most 200,000 selected samples and cues, 1 MiB per sample, 64 MiB of
 logical sample data, 96 MiB of physical reads, 32 MiB of decoded UTF-8 text, and
-a 64 MiB binary response envelope. Reads are further capped at 4,096 coalesced
+a 64 MiB binary response envelope. Reads are further capped at 16,384 coalesced
 regions of at most 8 MiB each, with at most a 64 KiB gap joined into a region.
 Exceeding a budget rejects the complete request with an explicit error;
 `getSubtitles` never returns a partial track prefix or silently selects fewer
 tracks.
 
-The plugin caches at most eight source-wide subtitle sessions separately from
-the thumbnail cache. All filters and ranges for a source reuse the same parsed
-index; concurrent cold requests share its construction. Local sessions expire
-after one minute and remote sessions after five minutes. The source bytes must
-remain unchanged while a session is reused. Local path keys include file size
-and modification time; remote content served by the same URL and headers may
-remain cached until its TTL expires.
+The plugin caches at most eight source-wide subtitle sessions, and therefore at
+most eight subtitle indices, separately from the thumbnail cache. Each index
+accounts for at most 32 MiB of retained bytes, so up to 256 MiB of index data
+may remain cached, in addition to readers, cache overhead, and references held
+by in-progress requests. All filters and ranges for a source reuse the same
+parsed index; concurrent cold requests share its construction. Local sessions
+expire after one minute and remote sessions after five minutes. The source
+bytes must remain unchanged while a session is reused. Local path keys include
+file size and modification time; remote content served by the same URL and
+headers may remain cached until its TTL expires.
 
 Clients making repeated range requests should retain one core `SubtitleIndex`
 across those requests. Its cues keep absolute source times, so callers remain

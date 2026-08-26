@@ -94,6 +94,11 @@ sample entries. It does not decode CEA-608/708 data embedded in video samples.
 Formats without a subtitle implementation, including MP3, return an empty
 vector.
 
+For `stpp`, `cue.text` contains the decoded TTML markup without XML
+interpretation or separation of `<p>` elements. Each decoded sample that
+remains non-empty after trimming whitespace and NUL characters produces one
+cue with its original interval.
+
 With no `TrackFilter`, all valid supported tracks are returned only when their
 combined work fits the aggregate request budgets. `TrackFilter::TrackId` is the
 narrowest selector; `TrackFilter::Language` may select a group of tracks and
@@ -154,7 +159,7 @@ Index construction scans at most 1,000 MP4 tracks, accounts at most 200,000
 subtitle samples, and retains at most 32 MiB of index data. A request selects at
 most 200,000 samples/cues, reads at most 1 MiB per sample, 64 MiB logically and
 96 MiB physically, decodes at most 32 MiB of text, and projects at most 64 MiB
-of output. Coalesced I/O is limited to 4,096 regions of at most 8 MiB, with at
+of output. Coalesced I/O is limited to 16,384 regions of at most 8 MiB, with at
 most a 64 KiB gap joined into a region. These aggregate limits are shared across
 every selected track and overflow or allocation failures return errors instead
 of permitting unbounded growth. A budget failure never returns the tracks that
