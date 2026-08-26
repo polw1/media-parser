@@ -200,6 +200,15 @@ mod tests {
       assert!(!request.first_track_only);
    }
 
+   #[test]
+   fn subtitle_track_id_zero_prepares_the_first_track_core_request() {
+      let request = prepare_subtitle_request(Some(0), Some("spa".to_string()), None, None)
+         .expect("track zero is valid");
+
+      assert!(request.filter.is_none());
+      assert!(request.first_track_only);
+   }
+
    #[tokio::test]
    async fn subtitle_track_id_zero_selects_the_first_valid_supported_track() {
       let sessions = SubtitleSessions::default();

@@ -14,12 +14,16 @@
 //! ## Selection and timing
 //!
 //! Passing no [`TrackFilter`](crate::TrackFilter) returns every valid supported
-//! track. Language matching is ASCII case-insensitive, and an exact track ID
-//! selects that track. A filter with no match returns an empty vector.
+//! track only when their combined work fits the aggregate request budgets.
+//! [`TrackFilter::TrackId`](crate::TrackFilter::TrackId) is the narrowest
+//! selector. [`TrackFilter::Language`](crate::TrackFilter::Language) may select
+//! a group of tracks and matches ASCII case-insensitively. A filter with no
+//! match returns an empty vector.
 //! Unfiltered and language-filtered requests skip recoverably malformed or
 //! unsupported tracks; explicitly selecting such a track by ID returns an
-//! error. Container-wide, I/O, and aggregate-budget failures always fail the
-//! complete request.
+//! error. Container-wide, I/O, and aggregate-budget failures reject the
+//! complete request explicitly; extraction never returns a partial track
+//! prefix or silently selects fewer tracks.
 //! [`TrackFilter::TrackId(0)`](crate::TrackFilter::TrackId) is an ordinary,
 //! literal track ID in this core API; the Tauri command alone uses zero as a
 //! request for the first valid supported subtitle track.
@@ -34,6 +38,8 @@
 //! and ranged requests. [`SubtitleTrack::base`](crate::SubtitleTrack::base)
 //! carries a raw media duration in timescale ticks, while cue times are
 //! [`Duration`](std::time::Duration) values.
+//! Use a range to narrow extraction when even one selected track is
+//! individually too dense for the request budgets.
 //!
 //! ## Reusing an index
 //!

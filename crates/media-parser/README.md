@@ -94,14 +94,20 @@ sample entries. It does not decode CEA-608/708 data embedded in video samples.
 Formats without a subtitle implementation, including MP3, return an empty
 vector.
 
-With no `TrackFilter`, all valid supported tracks are returned. Language
-matching is ASCII case-insensitive, an exact track ID selects that track, and a
-filter with no match returns an empty vector. `TrackFilter::TrackId(0)` is a
-literal ID in the Rust API; only the Tauri/TypeScript layer treats zero as
-"first valid supported track". An explicitly selected recoverably malformed or
-unsupported track returns an error, while unfiltered or language-filtered
-extraction skips it. Container-wide, I/O, and aggregate-budget failures still
-fail the complete request.
+With no `TrackFilter`, all valid supported tracks are returned only when their
+combined work fits the aggregate request budgets. `TrackFilter::TrackId` is the
+narrowest selector; `TrackFilter::Language` may select a group of tracks and
+matches ASCII case-insensitively. Use `subtitles_in_range` or the range argument
+to `SubtitleIndex::subtitles` when even one selected track is individually too
+dense. A filter with no match returns an empty vector.
+
+`TrackFilter::TrackId(0)` is a literal ID in the Rust API; only the
+Tauri/TypeScript layer treats zero as "first valid supported track". An
+explicitly selected recoverably malformed or unsupported track returns an
+error, while unfiltered or language-filtered extraction skips it.
+Container-wide, I/O, and aggregate-budget failures reject the complete request
+explicitly: extraction never returns a partial track prefix or silently chooses
+fewer tracks.
 
 #### Reusing an MP4 subtitle index
 
@@ -151,7 +157,8 @@ most 200,000 samples/cues, reads at most 1 MiB per sample, 64 MiB logically and
 of output. Coalesced I/O is limited to 4,096 regions of at most 8 MiB, with at
 most a 64 KiB gap joined into a region. These aggregate limits are shared across
 every selected track and overflow or allocation failures return errors instead
-of permitting unbounded growth.
+of permitting unbounded growth. A budget failure never returns the tracks that
+happened to finish before the limit was reached.
 
 ### 4) Frames
 

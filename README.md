@@ -299,12 +299,14 @@ or non-1× edit lists degrade to a zero offset.
 Subtitle filters behave as follows:
 
    * With neither `trackId` nor `language`, every valid supported track is
-     returned.
+     returned, but only when their combined work fits the aggregate request
+     budgets.
    * Language matching is ASCII case-insensitive. An empty language is a valid
-     filter and normally returns no matches.
+     filter and normally returns no matches. A `language` filter may still
+     select a group of tracks with the same language.
    * `trackId` takes precedence when both selectors are present. `trackId: 0`
      selects only the first valid supported track; a positive value selects
-     that exact track.
+     that exact track and is the narrowest track selector.
    * A selector with no match returns an empty array.
 
 Unfiltered and language-filtered requests skip recoverably malformed or
@@ -312,11 +314,15 @@ unsupported tracks. Selecting one of those tracks explicitly by a positive
 `trackId` returns an error instead of a partial result.
 
 `startMs` and `endMs` must either both be absent or both be non-negative safe
-integers with `startMs < endMs`. Subtitle work is bounded per request: at most
-200,000 selected samples and cues, 1 MiB per sample, 64 MiB of logical sample
-data, 96 MiB of physical reads, 32 MiB of decoded UTF-8 text, and a 64 MiB
-binary response envelope. Reads are further capped at 4,096 coalesced regions
-of at most 8 MiB each, with at most a 64 KiB gap joined into a region.
+integers with `startMs < endMs`. Use them to narrow a track that is individually
+too dense even after selecting it with `trackId`. Subtitle work is bounded per
+request: at most 200,000 selected samples and cues, 1 MiB per sample, 64 MiB of
+logical sample data, 96 MiB of physical reads, 32 MiB of decoded UTF-8 text, and
+a 64 MiB binary response envelope. Reads are further capped at 4,096 coalesced
+regions of at most 8 MiB each, with at most a 64 KiB gap joined into a region.
+Exceeding a budget rejects the complete request with an explicit error;
+`getSubtitles` never returns a partial track prefix or silently selects fewer
+tracks.
 
 The plugin caches at most eight source-wide subtitle sessions separately from
 the thumbnail cache. All filters and ranges for a source reuse the same parsed

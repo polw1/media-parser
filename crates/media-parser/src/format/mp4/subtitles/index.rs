@@ -36,7 +36,7 @@ const SUBTITLE_READ_LIMITS: SampleReadLimits = SampleReadLimits {
    max_sample_bytes: 1024 * 1024,
    max_logical_bytes: 64 * 1024 * 1024,
    max_physical_bytes: 96 * 1024 * 1024,
-   max_regions: 4096,
+   max_regions: 16_384,
    max_region_bytes: 8 * 1024 * 1024,
    max_coalesce_gap_bytes: 64 * 1024,
 };
@@ -320,6 +320,13 @@ impl SubtitleIndex {
                handle_track_failure(filter.as_ref(), track.id, error)?;
                continue;
             }
+            Err(SampleReadError::Limit(reason)) => {
+               return Err(subtitle_limit_error(
+                  filter.as_ref(),
+                  first_track_only,
+                  reason,
+               ));
+            }
             Err(SampleReadError::Fatal(error)) => return Err(error),
          };
 
@@ -382,6 +389,21 @@ impl SubtitleIndex {
       }
       Ok(output)
    }
+}
+
+fn subtitle_limit_error(
+   filter: Option<&TrackFilter>,
+   first_track_only: bool,
+   reason: String,
+) -> MediaParserError {
+   let guidance = match (first_track_only, filter) {
+      (true, _) | (false, Some(TrackFilter::TrackId(_))) => "request a narrower time range",
+      (false, Some(TrackFilter::Language(_))) => {
+         "select an exact track ID or request a narrower time range"
+      }
+      (false, None) => "select by track ID or language, or request a narrower time range",
+   };
+   MediaParserError::InvalidFormat(format!("{reason}; {guidance}"))
 }
 
 fn handle_track_failure(
@@ -1051,6 +1073,36 @@ mod tests {
       }
    }
 
+   async fn one_cue_sample_size_limit_error(
+      filter: Option<TrackFilter>,
+      first_track_only: bool,
+   ) -> MediaParserError {
+      let mut limits = SUBTITLE_READ_LIMITS;
+      limits.max_sample_bytes = 2;
+      one_cue_index()
+         .subtitles_with_request_and_read_limits(
+            &BytesReader(vec![0, 1, b'x']),
+            filter,
+            None,
+            REQUEST_LIMITS,
+            limits,
+            first_track_only,
+         )
+         .await
+         .expect_err("the three-byte sample exceeds the injected limit")
+   }
+
+   fn invalid_format_reason(error: MediaParserError, original_reason: &str) -> String {
+      let MediaParserError::InvalidFormat(reason) = error else {
+         panic!("sample-read limits remain public InvalidFormat errors")
+      };
+      assert!(
+         reason.starts_with(&format!("{original_reason}; ")),
+         "the original limit reason must be retained: {reason}"
+      );
+      reason
+   }
+
    #[tokio::test]
    async fn enabled_chapter_source_excludes_only_a_disabled_target() {
       let source = chapter_source_track(10, true, &chapter_reference(&[1]));
@@ -1361,5 +1413,81 @@ mod tests {
          )
          .await
          .expect_err("real request forwards subtitle sample limit");
+   }
+
+   #[tokio::test]
+   async fn unfiltered_limit_suggests_track_id_language_or_narrower_range() {
+      let reason = invalid_format_reason(
+         one_cue_sample_size_limit_error(None, false).await,
+         "invalid sample size: 3 bytes",
+      );
+
+      assert!(reason.contains("track ID"));
+      assert!(reason.contains("language"));
+      assert!(reason.contains("narrower time range"));
+   }
+
+   #[tokio::test]
+   async fn language_filtered_limit_suggests_exact_track_id_or_narrower_range() {
+      let reason = invalid_format_reason(
+         one_cue_sample_size_limit_error(Some(TrackFilter::Language("eng".to_owned())), false)
+            .await,
+         "invalid sample size: 3 bytes",
+      );
+
+      assert!(reason.contains("exact track ID"));
+      assert!(reason.contains("narrower time range"));
+      assert!(!reason.contains("select by language"));
+   }
+
+   #[tokio::test]
+   async fn track_id_filtered_limit_suggests_only_a_narrower_range() {
+      let reason = invalid_format_reason(
+         one_cue_sample_size_limit_error(Some(TrackFilter::TrackId(1)), false).await,
+         "invalid sample size: 3 bytes",
+      );
+
+      assert!(reason.contains("narrower time range"));
+      assert!(!reason.contains("track ID"));
+      assert!(!reason.contains("language"));
+   }
+
+   #[tokio::test]
+   async fn first_track_limit_suggests_only_a_narrower_range() {
+      let reason = invalid_format_reason(
+         one_cue_sample_size_limit_error(None, true).await,
+         "invalid sample size: 3 bytes",
+      );
+
+      assert!(reason.contains("narrower time range"));
+      assert!(!reason.contains("track ID"));
+      assert!(!reason.contains("language"));
+   }
+
+   #[tokio::test]
+   async fn shared_region_budget_failure_never_returns_a_partial_track_prefix() {
+      let index = SubtitleIndex {
+         tracks: vec![one_cue_track(1, 0), one_cue_track(2, 3)],
+      };
+      let mut limits = SUBTITLE_READ_LIMITS;
+      limits.max_regions = 1;
+
+      let error = index
+         .subtitles_with_request_and_read_limits(
+            &BytesReader(vec![0, 1, b'x', 0, 1, b'y']),
+            None,
+            None,
+            REQUEST_LIMITS,
+            limits,
+            false,
+         )
+         .await
+         .expect_err("the second track exceeds the shared one-region budget");
+      let reason = invalid_format_reason(error, "too many sample read regions");
+
+      assert!(reason.contains("too many sample read regions"));
+      assert!(reason.contains("track ID"));
+      assert!(reason.contains("language"));
+      assert!(reason.contains("narrower time range"));
    }
 }

@@ -4,9 +4,8 @@
 //! and every configured limit are validated before the shared budget changes.
 //! A successful plan commits its aggregate sample, logical-byte,
 //! physical-byte, and region charges. Later read or result-allocation failures
-//! do not refund those charges. Some track-local error text still refers to
-//! thumbnails for compatibility with the original caller, while aggregate
-//! region-limit errors use terminology shared by every caller.
+//! do not refund those charges. Limit and validation errors use terminology
+//! shared by every caller.
 //!
 //! Each [`SampleData`] is a checked view into a shared physical read region.
 //! The region remains alive through consumer clones, including decode jobs,
@@ -97,6 +96,7 @@ struct ReadBatch {
 
 #[derive(Debug)]
 pub(super) enum SampleReadError {
+   Limit(String),
    Track(MediaParserError),
    Fatal(MediaParserError),
 }
@@ -104,6 +104,7 @@ pub(super) enum SampleReadError {
 impl SampleReadError {
    pub(super) fn into_media_error(self) -> MediaParserError {
       match self {
+         Self::Limit(reason) => MediaParserError::InvalidFormat(reason),
          Self::Track(error) | Self::Fatal(error) => error,
       }
    }
@@ -117,6 +118,10 @@ fn track_error(message: impl Into<String>) -> SampleReadError {
 
 fn fatal_error(message: impl Into<String>) -> SampleReadError {
    SampleReadError::Fatal(MediaParserError::InvalidFormat(message.into()))
+}
+
+fn limit_error(message: impl Into<String>) -> SampleReadError {
+   SampleReadError::Limit(message.into())
 }
 
 fn allocate_located_samples(capacity: usize) -> SampleReadResult<Vec<LocatedSample>> {
@@ -183,7 +188,7 @@ pub(super) async fn read_samples_coalesced_classified(
          let end = sample
             .offset
             .checked_add(sample.size)
-            .ok_or_else(|| track_error("sample slice overflow"))?;
+            .ok_or_else(|| fatal_error("sample slice overflow"))?;
          data
             .get(sample.offset..end)
             .ok_or_else(|| track_error("sample is outside its read batch"))?;
@@ -206,7 +211,11 @@ pub(super) async fn read_samples_coalesced_classified(
       batch_results.push(batch?);
    }
 
-   let sample_count = batch_results.iter().map(Vec::len).sum();
+   let sample_count = batch_results.iter().try_fold(0usize, |count, batch| {
+      count
+         .checked_add(batch.len())
+         .ok_or_else(|| fatal_error("sample result count overflow"))
+   })?;
    let mut samples = HashMap::new();
    samples
       .try_reserve(sample_count)
@@ -233,15 +242,15 @@ fn plan_read_batches(
       .windows(2)
       .any(|indices| indices[0] >= indices[1])
    {
-      return Err(track_error(
-         "thumbnail sample indices must be strictly increasing",
-      ));
+      return Err(track_error("sample indices must be strictly increasing"));
    }
    let total_samples = budget
       .samples
       .checked_add(sample_indices.len())
-      .filter(|total| *total <= limits.max_samples)
-      .ok_or_else(|| fatal_error("too many thumbnail samples"))?;
+      .ok_or_else(|| fatal_error("sample count overflow"))?;
+   if total_samples > limits.max_samples {
+      return Err(limit_error("too many samples"));
+   }
    if sample_indices.is_empty() {
       return Ok(Vec::new());
    }
@@ -262,22 +271,21 @@ fn plan_read_batches(
       checked_sample_end(offset, size)?;
       logical_bytes = logical_bytes
          .checked_add(size)
-         .ok_or_else(|| track_error("thumbnail sample batch byte count overflow"))?;
-      budget
+         .ok_or_else(|| fatal_error("sample batch byte count overflow"))?;
+      let total = budget
          .logical_bytes
          .checked_add(logical_bytes)
-         .filter(|total| *total <= limits.max_logical_bytes)
-         .ok_or_else(|| {
-            fatal_error(format!(
-               "thumbnail sample batch is too large: {} bytes",
-               budget.logical_bytes.saturating_add(logical_bytes)
-            ))
-         })?;
+         .ok_or_else(|| fatal_error("sample batch byte count overflow"))?;
+      if total > limits.max_logical_bytes {
+         return Err(limit_error(format!(
+            "sample batch is too large: {total} bytes"
+         )));
+      }
    }
    let total_logical = budget
       .logical_bytes
       .checked_add(logical_bytes)
-      .ok_or_else(|| track_error("thumbnail sample batch byte count overflow"))?;
+      .ok_or_else(|| fatal_error("sample batch byte count overflow"))?;
 
    // Phase 2: one compact descriptor per already-counted sample is the
    // bounded exception needed to restore physical order without an O(n²)
@@ -324,7 +332,7 @@ fn plan_read_batches(
                .offset
                .checked_sub(batch.offset)
                .and_then(|offset| usize::try_from(offset).ok())
-               .ok_or_else(|| track_error("sample offset is too large"))?,
+               .ok_or_else(|| fatal_error("sample offset is too large"))?,
             size: sample.size,
          });
          batch.size = merged_size;
@@ -364,7 +372,7 @@ fn validate_physical_plan(
    let mut current_region: Option<(u64, usize)> = None;
    for sample in samples {
       if sample.size > limits.max_region_bytes {
-         return Err(fatal_error("sample batch is too large"));
+         return Err(limit_error("sample batch is too large"));
       }
       if let Some((region_offset, region_size)) = current_region {
          if let Some(merged_size) =
@@ -396,7 +404,7 @@ fn validate_physical_plan(
    let total_physical = budget
       .physical_bytes
       .checked_add(physical_bytes)
-      .ok_or_else(|| fatal_error("coalesced thumbnail reads are too large"))?;
+      .ok_or_else(|| fatal_error("coalesced sample reads are too large"))?;
    let total_regions = budget
       .regions
       .checked_add(regions)
@@ -413,17 +421,17 @@ fn merged_region_size(
 ) -> SampleReadResult<Option<usize>> {
    let region_end = checked_region_end(region_offset, region_size)?;
    if sample.offset < region_end {
-      return Err(track_error("overlapping video samples"));
+      return Err(track_error("overlapping samples"));
    }
    let sample_end = checked_sample_end(sample.offset, sample.size)?;
    let merged_size = sample_end
       .checked_sub(region_offset)
       .and_then(|size| usize::try_from(size).ok())
-      .ok_or_else(|| track_error("sample batch size overflow"))?;
+      .ok_or_else(|| fatal_error("sample batch size overflow"))?;
    let gap = sample
       .offset
       .checked_sub(region_end)
-      .ok_or_else(|| track_error("overlapping video samples"))?;
+      .ok_or_else(|| track_error("overlapping samples"))?;
    Ok((gap <= coalesce_gap && merged_size <= limits.max_region_bytes).then_some(merged_size))
 }
 
@@ -436,20 +444,24 @@ fn validate_region_charge(
 ) -> SampleReadResult<()> {
    let next_physical = physical_bytes
       .checked_add(region_size)
-      .ok_or_else(|| fatal_error("coalesced thumbnail reads are too large"))?;
-   budget
+      .ok_or_else(|| fatal_error("coalesced sample reads are too large"))?;
+   let total_physical = budget
       .physical_bytes
       .checked_add(next_physical)
-      .filter(|total| *total <= limits.max_physical_bytes)
-      .ok_or_else(|| fatal_error("coalesced thumbnail reads are too large"))?;
+      .ok_or_else(|| fatal_error("coalesced sample reads are too large"))?;
+   if total_physical > limits.max_physical_bytes {
+      return Err(limit_error("coalesced sample reads are too large"));
+   }
    let next_regions = regions
       .checked_add(1)
       .ok_or_else(|| fatal_error("too many sample read regions"))?;
-   budget
+   let total_regions = budget
       .regions
       .checked_add(next_regions)
-      .filter(|total| *total <= limits.max_regions)
       .ok_or_else(|| fatal_error("too many sample read regions"))?;
+   if total_regions > limits.max_regions {
+      return Err(limit_error("too many sample read regions"));
+   }
    *physical_bytes = next_physical;
    *regions = next_regions;
    Ok(())
@@ -464,28 +476,26 @@ fn checked_sample_size(
       sample_size(sample_index, sizes)
          .ok_or_else(|| track_error(format!("could not read sample {sample_index} size")))?,
    )
-   .map_err(|_| track_error("sample size exceeds usize"))?;
+   .map_err(|_| fatal_error("sample size exceeds usize"))?;
    if size == 0 {
-      return Err(track_error("invalid thumbnail sample size: 0 bytes"));
+      return Err(track_error("invalid sample size: 0 bytes"));
    }
    if size > limits.max_sample_bytes {
-      return Err(fatal_error(format!(
-         "invalid thumbnail sample size: {size} bytes"
-      )));
+      return Err(limit_error(format!("invalid sample size: {size} bytes")));
    }
    Ok(size)
 }
 
 fn checked_sample_end(offset: u64, size: usize) -> SampleReadResult<u64> {
    offset
-      .checked_add(u64::try_from(size).map_err(|_| track_error("sample size exceeds u64"))?)
-      .ok_or_else(|| track_error("sample offset overflow"))
+      .checked_add(u64::try_from(size).map_err(|_| fatal_error("sample size exceeds u64"))?)
+      .ok_or_else(|| fatal_error("sample offset overflow"))
 }
 
 fn checked_region_end(offset: u64, size: usize) -> SampleReadResult<u64> {
    offset
-      .checked_add(u64::try_from(size).map_err(|_| track_error("sample batch size exceeds u64"))?)
-      .ok_or_else(|| track_error("sample batch offset overflow"))
+      .checked_add(u64::try_from(size).map_err(|_| fatal_error("sample batch size exceeds u64"))?)
+      .ok_or_else(|| fatal_error("sample batch offset overflow"))
 }
 
 #[cfg(test)]
@@ -539,8 +549,19 @@ mod tests {
       .map_err(SampleReadError::into_media_error)
    }
 
+   fn assert_limit(error: SampleReadError, expected_reason: &str) {
+      assert!(
+         matches!(&error, SampleReadError::Limit(reason) if reason == expected_reason),
+         "expected limit error {expected_reason:?}, got {error:?}"
+      );
+      assert!(matches!(
+         error.into_media_error(),
+         MediaParserError::InvalidFormat(reason) if reason == expected_reason
+      ));
+   }
+
    #[test]
-   fn classified_sample_budget_failure_is_fatal() {
+   fn max_samples_failure_is_a_limit_error() {
       let mut budget = SampleReadBudget::default();
       let error = plan_read_batches(
          &[1],
@@ -553,13 +574,104 @@ mod tests {
          },
          &mut budget,
       )
-      .expect_err("sample budget is request-fatal");
+      .expect_err("sample count above its configured limit must fail");
 
-      assert!(matches!(error, SampleReadError::Fatal(_)));
-      assert!(matches!(
-         error.into_media_error(),
-         MediaParserError::InvalidFormat(_)
-      ));
+      assert_limit(error, "too many samples");
+   }
+
+   #[test]
+   fn max_sample_bytes_failure_is_a_limit_error() {
+      let mut budget = SampleReadBudget::default();
+      let error = plan_read_batches(
+         &[1],
+         &fixed_samples(1, 4),
+         &one_sample_per_chunk(),
+         &[0],
+         SampleReadLimits {
+            max_sample_bytes: 3,
+            ..TEST_LIMITS
+         },
+         &mut budget,
+      )
+      .expect_err("sample size above its configured limit must fail");
+
+      assert_limit(error, "invalid sample size: 4 bytes");
+   }
+
+   #[test]
+   fn max_logical_bytes_failure_is_a_limit_error() {
+      let mut budget = SampleReadBudget::default();
+      let error = plan_read_batches(
+         &[1],
+         &fixed_samples(1, 4),
+         &one_sample_per_chunk(),
+         &[0],
+         SampleReadLimits {
+            max_logical_bytes: 3,
+            ..TEST_LIMITS
+         },
+         &mut budget,
+      )
+      .expect_err("logical bytes above their configured limit must fail");
+
+      assert_limit(error, "sample batch is too large: 4 bytes");
+   }
+
+   #[test]
+   fn max_physical_bytes_failure_is_a_limit_error() {
+      let mut budget = SampleReadBudget::default();
+      let error = plan_read_batches(
+         &[1],
+         &fixed_samples(1, 4),
+         &one_sample_per_chunk(),
+         &[0],
+         SampleReadLimits {
+            max_physical_bytes: 3,
+            ..TEST_LIMITS
+         },
+         &mut budget,
+      )
+      .expect_err("physical bytes above their configured limit must fail");
+
+      assert_limit(error, "coalesced sample reads are too large");
+   }
+
+   #[test]
+   fn max_region_bytes_failure_is_a_limit_error() {
+      let mut budget = SampleReadBudget::default();
+      let error = plan_read_batches(
+         &[1],
+         &fixed_samples(1, 4),
+         &one_sample_per_chunk(),
+         &[0],
+         SampleReadLimits {
+            max_region_bytes: 3,
+            ..TEST_LIMITS
+         },
+         &mut budget,
+      )
+      .expect_err("region bytes above their configured limit must fail");
+
+      assert_limit(error, "sample batch is too large");
+   }
+
+   #[test]
+   fn max_regions_failure_is_a_limit_error() {
+      let mut budget = SampleReadBudget::default();
+      let error = plan_read_batches(
+         &[1],
+         &fixed_samples(1, 4),
+         &one_sample_per_chunk(),
+         &[0],
+         SampleReadLimits {
+            max_regions: 0,
+            ..TEST_LIMITS
+         },
+         &mut budget,
+      )
+      .expect_err("region count above its configured limit must fail");
+
+      assert_limit(error, "too many sample read regions");
    }
 
    #[test]
@@ -576,6 +688,17 @@ mod tests {
       .expect_err("invalid tables are local to the selected track");
 
       assert!(matches!(error, SampleReadError::Track(_)));
+   }
+
+   #[test]
+   fn sample_end_arithmetic_overflow_is_fatal() {
+      let error = checked_sample_end(u64::MAX, 1).expect_err("sample end must not wrap");
+
+      assert!(matches!(
+         error,
+         SampleReadError::Fatal(MediaParserError::InvalidFormat(reason))
+            if reason == "sample offset overflow"
+      ));
    }
 
    #[test]
@@ -611,7 +734,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(error.to_string().contains("too many thumbnail samples"));
+      assert!(error.to_string().contains("too many samples"));
    }
 
    #[test]
@@ -625,7 +748,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(error.to_string().contains("invalid thumbnail sample size"));
+      assert!(error.to_string().contains("invalid sample size"));
    }
 
    /// Four contiguous 1 KiB samples sit exactly on three ceilings at once:
@@ -662,11 +785,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(
-         error
-            .to_string()
-            .contains("thumbnail sample batch is too large")
-      );
+      assert!(error.to_string().contains("sample batch is too large"));
    }
 
    #[test]
@@ -705,7 +824,7 @@ mod tests {
       assert!(
          error
             .to_string()
-            .contains("coalesced thumbnail reads are too large")
+            .contains("coalesced sample reads are too large")
       );
    }
 
@@ -813,7 +932,7 @@ mod tests {
 
       assert!(matches!(
          error,
-         MediaParserError::InvalidFormat(message) if message == "overlapping video samples"
+         MediaParserError::InvalidFormat(message) if message == "overlapping samples"
       ));
    }
 
@@ -847,11 +966,7 @@ mod tests {
       )
       .unwrap_err();
 
-      assert!(
-         error
-            .to_string()
-            .contains("invalid thumbnail sample size: 0 bytes")
-      );
+      assert!(error.to_string().contains("invalid sample size: 0 bytes"));
    }
 
    #[test]
