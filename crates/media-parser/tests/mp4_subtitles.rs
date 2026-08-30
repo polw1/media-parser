@@ -1078,6 +1078,47 @@ async fn hardening_fixed_stsz_count_mismatch_is_a_track_rejection() {
       .expect_err("explicit malformed fixed-size track errors");
 }
 
+async fn assert_oversized_table_count_is_track_local(fourcc: [u8; 4]) {
+   let mut bytes = subtitle_mp4();
+   let table_fourcc = if fourcc == *b"co64" { *b"stco" } else { fourcc };
+   let table = find_bytes(&bytes, &table_fourcc);
+   bytes[table..table + 4].copy_from_slice(&fourcc);
+   bytes[table + 8..table + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+   let reader = BytesReader(bytes);
+
+   let index = SubtitleIndex::read(&reader)
+      .await
+      .expect("oversized malformed table should reject only its track");
+   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   assert_eq!(broad.len(), 1);
+   assert_eq!(broad[0].base.id, 2);
+}
+
+#[tokio::test]
+async fn hardening_oversized_stsd_count_is_track_local() {
+   assert_oversized_table_count_is_track_local(*b"stsd").await;
+}
+
+#[tokio::test]
+async fn hardening_oversized_stts_count_is_track_local() {
+   assert_oversized_table_count_is_track_local(*b"stts").await;
+}
+
+#[tokio::test]
+async fn hardening_oversized_stsc_count_is_track_local() {
+   assert_oversized_table_count_is_track_local(*b"stsc").await;
+}
+
+#[tokio::test]
+async fn hardening_oversized_stco_count_is_track_local() {
+   assert_oversized_table_count_is_track_local(*b"stco").await;
+}
+
+#[tokio::test]
+async fn hardening_oversized_co64_count_is_track_local() {
+   assert_oversized_table_count_is_track_local(*b"co64").await;
+}
+
 #[tokio::test]
 async fn hardening_invalid_sample_description_reference_is_track_local() {
    let mut bytes = subtitle_mp4();

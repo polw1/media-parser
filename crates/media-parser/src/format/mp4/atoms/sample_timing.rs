@@ -35,15 +35,15 @@ impl SampleTimingTable {
       )
       .map_err(|_| TableParseError::BudgetExceeded)?;
 
-      let mut entries = budgeted_vec(entry_count, budget)?;
-
       let expected_len = entry_count
          .checked_mul(8)
          .and_then(|bytes| bytes.checked_add(8))
-         .ok_or(TableParseError::BudgetExceeded)?;
+         .ok_or(TableParseError::Invalid("malformed stts table"))?;
       if expected_len != stts.len() {
          return Err(TableParseError::Invalid("malformed stts table"));
       }
+
+      let mut entries = budgeted_vec(entry_count, budget)?;
 
       let mut sample_count = 0u32;
       for index in 0..entry_count {

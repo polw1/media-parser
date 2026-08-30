@@ -618,6 +618,14 @@ impl StreamReader for HttpStreamReader {
       self.read_at_uncached(offset, buf).await
    }
 
+   /// Reads directly into a new buffer without populating the navigation read-ahead window.
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      let mut buf = try_zeroed_bytes(len, "HTTP read buffer")?;
+      let read = self.read_at_uncached(offset, &mut buf).await?;
+      buf.truncate(read);
+      Ok(buf)
+   }
+
    /// Returns the total size of the HTTP stream.
    async fn size(&self) -> Result<u64> {
       if let Some(size) = self.cached_size.get() {
@@ -755,6 +763,33 @@ mod tests {
 
       assert_eq!(bytes_read, expected.len());
       assert_eq!(&buffer[..bytes_read], expected);
+   }
+
+   #[tokio::test]
+   async fn test_http_read_vec_requests_only_the_requested_range() {
+      let mock_server = MockServer::start().await;
+      let offset = 8u64;
+      let len = 4usize;
+      let range_end = offset + len as u64 - 1;
+      let requested_range = format!("bytes={offset}-{range_end}");
+      let content_range = format!("bytes {offset}-{range_end}/{}", TEST_CONTENT.len());
+      Mock::given(method("GET"))
+         .and(header("Range", requested_range.as_str()))
+         .respond_with(
+            ResponseTemplate::new(206)
+               .set_body_bytes(&TEST_CONTENT[offset as usize..=range_end as usize])
+               .insert_header("Content-Range", content_range.as_str()),
+         )
+         .expect(1)
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let reader: &dyn StreamReader = &reader;
+
+      let bytes = reader.read_vec(offset, len).await.unwrap();
+
+      assert_eq!(bytes, TEST_CONTENT[offset as usize..=range_end as usize]);
    }
 
    #[tokio::test]

@@ -304,8 +304,8 @@ pub(in crate::format::mp4) fn parse_stsc_bounded(
    budget: &mut RetainedBudget,
 ) -> TableResult<Vec<StscEntry>> {
    let entry_count = raw_table_entries(stsc, "malformed stsc table")?;
-   let mut entries = budgeted_vec(entry_count, budget)?;
    validate_exact_table_len(stsc, entry_count, 12, "malformed stsc table")?;
+   let mut entries = budgeted_vec(entry_count, budget)?;
    for index in 0..entry_count {
       let entry =
          parse_stsc_entry(stsc, index).ok_or(TableParseError::Invalid("malformed stsc entry"))?;
@@ -351,13 +351,13 @@ pub(in crate::format::mp4) fn parse_chunk_offsets_bounded(
    let (table, entry_size, is_64) =
       chunk_offset_table(stbl).ok_or(TableParseError::Invalid("missing stco/co64 table"))?;
    let entry_count = raw_table_entries(table, "malformed chunk offset table")?;
-   let mut offsets = budgeted_vec(entry_count, budget)?;
    validate_exact_table_len(
       table,
       entry_count,
       entry_size,
       "malformed chunk offset table",
    )?;
+   let mut offsets = budgeted_vec(entry_count, budget)?;
    for index in 0..entry_count {
       offsets.push(
          read_chunk_offset(table, index, entry_size, is_64)
@@ -397,7 +397,7 @@ fn validate_exact_table_len(
    let expected_len = entry_count
       .checked_mul(entry_size)
       .and_then(|bytes| bytes.checked_add(8))
-      .ok_or(TableParseError::BudgetExceeded)?;
+      .ok_or(TableParseError::Invalid(message))?;
    if expected_len != table.len() {
       return Err(TableParseError::Invalid(message));
    }
@@ -787,6 +787,27 @@ mod tests {
          parse_chunk_offsets_bounded(&stbl, &mut retained),
          Err(TableParseError::Invalid(_))
       ));
+   }
+
+   #[test]
+   fn exact_table_length_overflow_is_invalid() {
+      assert_eq!(
+         validate_exact_table_len(&[], usize::MAX, 2, "overflowed table"),
+         Err(TableParseError::Invalid("overflowed table"))
+      );
+   }
+
+   #[test]
+   fn bounded_stsc_rejects_a_false_small_count_without_charging_budget() {
+      let mut stsc = vec![0u8; 8];
+      stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+      let mut budget = RetainedBudget::new(1024);
+
+      assert!(matches!(
+         parse_stsc_bounded(&stsc, &mut budget),
+         Err(TableParseError::Invalid("malformed stsc table"))
+      ));
+      assert_eq!(budget.used_bytes(), 0);
    }
 
    #[test]

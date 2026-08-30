@@ -149,10 +149,10 @@ pub(in crate::format::mp4) fn parse_stsd_entries_bounded(
       stsd_header(stsd).ok_or(TableParseError::Invalid("malformed stsd table"))?;
    let entry_count =
       usize::try_from(raw_entry_count).map_err(|_| TableParseError::BudgetExceeded)?;
-   let mut entries = budgeted_vec(entry_count, budget)?;
    if entry_count > entries_bytes.len() / 8 {
       return Err(TableParseError::Invalid("malformed stsd entry count"));
    }
+   let mut entries = budgeted_vec(entry_count, budget)?;
 
    let mut offset = 0;
    for _ in 0..entry_count {
@@ -390,15 +390,16 @@ mod tests {
    }
 
    #[test]
-   fn bounded_stsd_precharges_declared_entries_before_framing_validation() {
+   fn bounded_stsd_validates_framing_before_charging_declared_entries() {
       let mut stsd = vec![0u8; 8];
       stsd[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
       let mut budget = RetainedBudget::new(8);
 
       assert_eq!(
          parse_stsd_entries_bounded(&stsd, &mut budget).unwrap_err(),
-         TableParseError::BudgetExceeded
+         TableParseError::Invalid("malformed stsd entry count")
       );
+      assert_eq!(budget.used_bytes(), 0);
    }
 
    #[test]
