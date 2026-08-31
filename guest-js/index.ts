@@ -152,12 +152,17 @@ export async function getThumbnails(
  *
  * `trackId` takes precedence over `language`. `trackId: 0` selects the first
  * valid supported subtitle track; without either filter, all valid supported
- * subtitle tracks are returned. A filter with no match returns an empty array.
+ * subtitle tracks are returned, but only when their combined work fits the
+ * aggregate request budgets. Unfiltered and language-filtered requests skip
+ * malformed or unsupported tracks; a selector that matches no track returns an
+ * empty array.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Optional track/language filter, paired range, and URL headers
  * @returns Subtitle tracks with absolute source cue times in seconds
  * @throws TypeError if the track ID or paired range cannot be represented
+ * @throws Error if an explicitly selected positive trackId is malformed or
+ * unsupported, or if aggregate request budgets are exceeded
  */
 export async function getSubtitles(
    source: string,
