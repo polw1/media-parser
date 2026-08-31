@@ -335,17 +335,26 @@ mod tests {
 
    #[tokio::test]
    async fn thumbnail_session_key_distinguishes_track_ids() {
-      let source = source_key("https://example.com/video.mp4", None).await;
-      let first = ThumbnailSessionKey {
-         source: source.clone(),
-         track_id: 7,
-      };
-      let second = ThumbnailSessionKey {
-         source,
-         track_id: 8,
+      // The fixture's track 1 is video and track 2 is audio, so the second
+      // request must build its own index and fail. Dropping `track_id` from the
+      // key would hand it the cached video session instead.
+      let sessions = ThumbnailSessions::default();
+      let source = video_fixture_source();
+
+      thumbnail_session(&sessions, &source, None, 1)
+         .await
+         .expect("the video track should build a session");
+      let Err(error) = thumbnail_session(&sessions, &source, None, 2).await else {
+         panic!("the audio track must not reuse the video session");
       };
 
-      assert!(first != second);
+      assert!(
+         matches!(
+            error,
+            crate::Error::MediaParser(media_parser::MediaParserError::TrackNotFound(2))
+         ),
+         "unexpected error for the audio track: {error:?}"
+      );
    }
 
    #[test]

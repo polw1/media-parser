@@ -55,6 +55,10 @@ const _: () =
 const _: () = assert!(SUBTITLE_READ_LIMITS.max_regions <= SUBTITLE_READ_LIMITS.max_samples);
 const _: () = assert!(SUBTITLE_READ_LIMITS.max_samples == REQUEST_LIMITS.max_samples);
 const _: () = assert!(REQUEST_LIMITS.max_cues <= REQUEST_LIMITS.max_samples);
+// The multi-track aggregate region test runs against its own local limits, so
+// only this assertion keeps the shipped ceiling from silently dropping back to
+// the value that rejected a representative multi-track file.
+const _: () = assert!(SUBTITLE_READ_LIMITS.max_regions == 16_384);
 
 #[derive(Debug)]
 pub struct SubtitleIndex {
