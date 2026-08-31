@@ -1,4 +1,4 @@
-use super::budget::{IndexBudget, RequestBudget, RequestLimits};
+use super::budget::{IndexBudget, IndexSampleChargeError, RequestBudget, RequestLimits};
 use super::output::{output_string, track_properties};
 use super::text::{DecodeSampleError, decode_sample};
 use crate::errors::{MediaParserError, Result};
@@ -684,9 +684,18 @@ fn indexed_track(
    {
       return Err(Reason("invalid subtitle sample tables"));
    }
-   budget.charge_samples(usize::try_from(sizes.sample_count).map_err(|_| {
+   let sample_count = usize::try_from(sizes.sample_count).map_err(|_| {
       MediaParserError::InvalidFormat("subtitle sample count is too large".to_owned())
-   })?)?;
+   })?;
+   match budget.charge_samples(sample_count) {
+      Ok(()) => {}
+      Err(IndexSampleChargeError::TrackTooLarge) => {
+         return Err(Reason("too many indexed subtitle samples"));
+      }
+      Err(IndexSampleChargeError::BudgetExhausted(error)) => {
+         return Err(TrackReject::Fatal(error));
+      }
+   }
 
    let first_description = stsc
       .first()
@@ -918,6 +927,16 @@ mod tests {
       codec: &[u8; 4],
       enabled: bool,
    ) -> Vec<u8> {
+      index_track_with_enabled_and_fixed_size(id, sample_count, codec, enabled, None)
+   }
+
+   fn index_track_with_enabled_and_fixed_size(
+      id: u32,
+      sample_count: u32,
+      codec: &[u8; 4],
+      enabled: bool,
+      fixed_sample_size: Option<u32>,
+   ) -> Vec<u8> {
       let tkhd = track_header(id, sample_count * 1000, enabled);
 
       let mut mdhd = vec![0u8; 20];
@@ -953,17 +972,27 @@ mod tests {
          ]
          .concat(),
       );
-      let stsz = full_box(
-         b"stsz",
-         &[
-            0u32.to_be_bytes().as_slice(),
-            sample_count.to_be_bytes().as_slice(),
-            vec![3u32.to_be_bytes(); usize::try_from(sample_count).unwrap()]
-               .concat()
-               .as_slice(),
-         ]
-         .concat(),
-      );
+      let stsz = match fixed_sample_size {
+         Some(sample_size) => full_box(
+            b"stsz",
+            &[
+               sample_size.to_be_bytes().as_slice(),
+               sample_count.to_be_bytes().as_slice(),
+            ]
+            .concat(),
+         ),
+         None => full_box(
+            b"stsz",
+            &[
+               0u32.to_be_bytes().as_slice(),
+               sample_count.to_be_bytes().as_slice(),
+               vec![3u32.to_be_bytes(); usize::try_from(sample_count).unwrap()]
+                  .concat()
+                  .as_slice(),
+            ]
+            .concat(),
+         ),
+      };
       let stco = full_box(
          b"stco",
          &[1u32.to_be_bytes().as_slice(), 0u32.to_be_bytes().as_slice()].concat(),
@@ -976,6 +1005,10 @@ mod tests {
 
    fn index_track(id: u32, sample_count: u32, codec: &[u8; 4]) -> Vec<u8> {
       index_track_with_enabled(id, sample_count, codec, false)
+   }
+
+   fn fixed_size_index_track(id: u32, sample_count: u32, codec: &[u8; 4]) -> Vec<u8> {
+      index_track_with_enabled_and_fixed_size(id, sample_count, codec, false, Some(3))
    }
 
    fn chapter_reference(ids: &[u32]) -> Vec<u8> {
@@ -1083,12 +1116,12 @@ mod tests {
       }
    }
 
-   async fn one_cue_sample_size_limit_error(
+   async fn one_cue_logical_limit_error(
       filter: Option<TrackFilter>,
       first_track_only: bool,
    ) -> MediaParserError {
       let mut limits = SUBTITLE_READ_LIMITS;
-      limits.max_sample_bytes = 2;
+      limits.max_logical_bytes = 2;
       one_cue_index()
          .subtitles_with_request_and_read_limits(
             &BytesReader(vec![0, 1, b'x']),
@@ -1301,9 +1334,14 @@ mod tests {
       SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usage.samples, usage.retained_bytes)
          .await
          .expect("exact measured index limits");
-      SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usage.samples - 1, usize::MAX)
-         .await
-         .expect_err("one-over aggregate sample work is fatal");
+      let individually_oversized =
+         SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usage.samples - 1, usize::MAX)
+            .await
+            .expect("one track above the sample ceiling is rejected locally");
+      assert!(matches!(
+         individually_oversized.tracks[0],
+         IndexedTrackState::Rejected { id: 1, .. }
+      ));
       SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usize::MAX, usage.retained_bytes - 1)
          .await
          .expect_err("one-over retained allocation is fatal");
@@ -1360,9 +1398,41 @@ mod tests {
    }
 
    #[tokio::test]
+   async fn fixed_stsz_track_above_individual_sample_ceiling_is_rejected_without_charge() {
+      let reader = index_fixture(&[
+         fixed_size_index_track(1, 2, b"tx3g"),
+         index_track(2, 1, b"tx3g"),
+      ]);
+
+      let (index, usage) = SubtitleIndex::build_with_limits(&reader, MAX_TRAKS, 1, usize::MAX)
+         .await
+         .expect("an individually oversized track must preserve its sibling");
+
+      assert!(matches!(
+         index.tracks[0],
+         IndexedTrackState::Rejected { id: 1, .. }
+      ));
+      assert_eq!(ready_track_ids(&index), vec![2]);
+      assert_eq!(usage.samples, 1, "the rejected track must not be charged");
+   }
+
+   #[tokio::test]
+   async fn individually_valid_tracks_that_exhaust_shared_sample_ceiling_are_fatal() {
+      let reader = index_fixture(&[index_track(1, 1, b"tx3g"), index_track(2, 1, b"tx3g")]);
+
+      let error = SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, 1, usize::MAX)
+         .await
+         .expect_err("cumulative sample exhaustion must remain request-fatal");
+
+      assert!(
+         matches!(error, MediaParserError::Other(reason) if reason == "too many indexed subtitle samples")
+      );
+   }
+
+   #[tokio::test]
    async fn real_request_uses_injected_subtitle_read_limits() {
       let mut limits = SUBTITLE_READ_LIMITS;
-      limits.max_sample_bytes = 2;
+      limits.max_logical_bytes = 2;
       one_cue_index()
          .subtitles_with_request_and_read_limits(
             &BytesReader(vec![0, 1, b'x']),
@@ -1379,8 +1449,8 @@ mod tests {
    #[tokio::test]
    async fn unfiltered_limit_suggests_track_id_language_or_narrower_range() {
       let reason = invalid_format_reason(
-         one_cue_sample_size_limit_error(None, false).await,
-         "invalid sample size: 3 bytes",
+         one_cue_logical_limit_error(None, false).await,
+         "sample batch is too large: 3 bytes",
       );
 
       assert!(reason.contains("track ID"));
@@ -1391,9 +1461,8 @@ mod tests {
    #[tokio::test]
    async fn language_filtered_limit_suggests_exact_track_id_or_narrower_range() {
       let reason = invalid_format_reason(
-         one_cue_sample_size_limit_error(Some(TrackFilter::Language("eng".to_owned())), false)
-            .await,
-         "invalid sample size: 3 bytes",
+         one_cue_logical_limit_error(Some(TrackFilter::Language("eng".to_owned())), false).await,
+         "sample batch is too large: 3 bytes",
       );
 
       assert!(reason.contains("exact track ID"));
@@ -1404,8 +1473,8 @@ mod tests {
    #[tokio::test]
    async fn track_id_filtered_limit_suggests_only_a_narrower_range() {
       let reason = invalid_format_reason(
-         one_cue_sample_size_limit_error(Some(TrackFilter::TrackId(1)), false).await,
-         "invalid sample size: 3 bytes",
+         one_cue_logical_limit_error(Some(TrackFilter::TrackId(1)), false).await,
+         "sample batch is too large: 3 bytes",
       );
 
       assert!(reason.contains("narrower time range"));
@@ -1416,8 +1485,8 @@ mod tests {
    #[tokio::test]
    async fn first_track_limit_suggests_only_a_narrower_range() {
       let reason = invalid_format_reason(
-         one_cue_sample_size_limit_error(None, true).await,
-         "invalid sample size: 3 bytes",
+         one_cue_logical_limit_error(None, true).await,
+         "sample batch is too large: 3 bytes",
       );
 
       assert!(reason.contains("narrower time range"));

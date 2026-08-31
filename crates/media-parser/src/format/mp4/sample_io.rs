@@ -480,7 +480,7 @@ fn checked_sample_size(
       return Err(track_error("invalid sample size: 0 bytes"));
    }
    if size > limits.max_sample_bytes {
-      return Err(limit_error(format!("invalid sample size: {size} bytes")));
+      return Err(track_error(format!("invalid sample size: {size} bytes")));
    }
    Ok(size)
 }
@@ -579,7 +579,7 @@ mod tests {
    }
 
    #[test]
-   fn max_sample_bytes_failure_is_a_limit_error() {
+   fn max_sample_bytes_failure_is_a_track_error() {
       let mut budget = SampleReadBudget::default();
       let error = plan_read_batches(
          &[1],
@@ -594,7 +594,11 @@ mod tests {
       )
       .expect_err("sample size above its configured limit must fail");
 
-      assert_limit(error, "invalid sample size: 4 bytes");
+      assert!(matches!(
+         error,
+         SampleReadError::Track(MediaParserError::InvalidFormat(reason))
+            if reason == "invalid sample size: 4 bytes"
+      ));
    }
 
    #[test]

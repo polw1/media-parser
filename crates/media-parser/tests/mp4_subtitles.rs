@@ -1063,6 +1063,35 @@ async fn hardening_variable_stsz_count_above_limit_is_a_track_rejection() {
 }
 
 #[tokio::test]
+async fn hardening_oversized_sample_preserves_sibling_unless_explicitly_selected() {
+   let mut bytes = subtitle_mp4();
+   let stsz = find_bytes(&bytes, b"stsz");
+   let first_sample_size = stsz + 16;
+   bytes[first_sample_size..first_sample_size + 4]
+      .copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
+   let reader = BytesReader(bytes);
+   let index = SubtitleIndex::read(&reader).await.expect("index subtitles");
+
+   let broad = index
+      .subtitles(&reader, None, None)
+      .await
+      .expect("an oversized sample must reject only its track");
+   assert_eq!(broad.len(), 1);
+   assert_eq!(broad[0].base.id, 2);
+
+   let error = index
+      .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
+      .await
+      .expect_err("an explicitly selected oversized track must fail");
+   assert!(
+      error
+         .to_string()
+         .contains("invalid sample size: 2097152 bytes"),
+      "{error}"
+   );
+}
+
+#[tokio::test]
 async fn hardening_fixed_stsz_count_mismatch_is_a_track_rejection() {
    let reader = BytesReader(fixed_stsz_count_mismatch_mp4());
    let index = SubtitleIndex::read(&reader)

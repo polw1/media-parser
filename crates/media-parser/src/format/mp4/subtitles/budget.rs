@@ -7,6 +7,12 @@ pub(super) struct IndexBudget {
    pub(super) retained: RetainedBudget,
 }
 
+#[derive(Debug)]
+pub(super) enum IndexSampleChargeError {
+   TrackTooLarge,
+   BudgetExhausted(MediaParserError),
+}
+
 impl IndexBudget {
    pub(super) fn new(max_samples: usize, max_retained_bytes: usize) -> Self {
       Self {
@@ -16,20 +22,22 @@ impl IndexBudget {
       }
    }
 
-   /// Charges indexed samples against the request-wide ceiling.
-   ///
-   /// Exhausting a budget is a request-fatal resource failure, not malformed
-   /// input, so it reports [`MediaParserError::Other`] like every other
-   /// overflow in this subsystem — `checked_charge` below and `table_fatal`'s
-   /// `BudgetExceeded` arm. `InvalidFormat` stays reserved for tracks whose
-   /// bytes are actually wrong, which callers may skip.
-   pub(super) fn charge_samples(&mut self, count: usize) -> Result<()> {
+   /// Charges indexed samples against the request-wide ceiling, distinguishing
+   /// a track that cannot fit by itself from cumulative budget exhaustion.
+   pub(super) fn charge_samples(
+      &mut self,
+      count: usize,
+   ) -> std::result::Result<(), IndexSampleChargeError> {
+      if count > self.max_samples {
+         return Err(IndexSampleChargeError::TrackTooLarge);
+      }
       self.samples = checked_charge(
          self.samples,
          count,
          self.max_samples,
          "too many indexed subtitle samples",
-      )?;
+      )
+      .map_err(IndexSampleChargeError::BudgetExhausted)?;
       Ok(())
    }
 
@@ -110,10 +118,21 @@ mod tests {
       budget.charge_samples(2).unwrap();
       let error = budget.charge_samples(1).unwrap_err();
 
-      // A budget ceiling is a resource failure, not malformed input, so it
-      // must not be reported as a skippable track defect.
-      assert!(matches!(error, MediaParserError::Other(_)));
+      assert!(matches!(
+         error,
+         IndexSampleChargeError::BudgetExhausted(MediaParserError::Other(_))
+      ));
       assert_eq!(budget.samples(), 2);
+   }
+
+   #[test]
+   fn individually_oversized_track_is_distinct_and_not_charged() {
+      let mut budget = IndexBudget::new(2, 16);
+
+      let error = budget.charge_samples(3).unwrap_err();
+
+      assert!(matches!(error, IndexSampleChargeError::TrackTooLarge));
+      assert_eq!(budget.samples(), 0);
    }
 
    #[test]
