@@ -325,9 +325,12 @@ request: at most 200,000 selected samples and cues, 1 MiB per sample, 64 MiB of
 logical sample data, 96 MiB of physical reads, 32 MiB of decoded UTF-8 text, and
 a 64 MiB binary response envelope. Reads are further capped at 16,384 coalesced
 regions of at most 8 MiB each, with at most a 64 KiB gap joined into a region.
-Exceeding a budget rejects the complete request with an explicit error;
-`getSubtitles` never returns a partial track prefix or silently selects fewer
-tracks.
+Container-wide, I/O, and aggregate-budget failures reject the complete request
+explicitly: `getSubtitles` never returns a partial track prefix or silently
+selects fewer tracks in those cases. `getTracks` can distinguish a media with no
+subtitles from a track that `getSubtitles` omitted, as long as that track's
+basic metadata remains readable; it does not diagnose every malformed-track
+case.
 
 The plugin caches at most eight source-wide subtitle sessions, and therefore at
 most eight subtitle indices, separately from the thumbnail cache. Each index

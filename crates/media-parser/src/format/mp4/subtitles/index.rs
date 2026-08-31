@@ -1,3 +1,11 @@
+//! Indexing and bounded extraction of MP4 subtitle tracks.
+//!
+//! The index is built once per source: every `trak` is parsed into either a
+//! ready sample index or a retained rejection, so a later request can skip a
+//! malformed track silently or fail it explicitly depending on how it was
+//! selected. Index construction and per-request extraction carry separate
+//! budgets, both charged before any work commits.
+
 use super::budget::{IndexBudget, IndexSampleChargeError, RequestBudget, RequestLimits};
 use super::output::{output_string, track_properties};
 use super::text::{DecodeSampleError, decode_sample};
@@ -60,6 +68,11 @@ const _: () = assert!(REQUEST_LIMITS.max_cues <= REQUEST_LIMITS.max_samples);
 // the value that rejected a representative multi-track file.
 const _: () = assert!(SUBTITLE_READ_LIMITS.max_regions == 16_384);
 
+/// A source-wide index of the MP4's subtitle tracks and their sample tables.
+///
+/// Build it once with [`SubtitleIndex::read`] and retain it across repeated
+/// [`subtitles`](SubtitleIndex::subtitles) calls: every filter and range for
+/// the same source reuses the parsed tables instead of re-reading the `moov`.
 #[derive(Debug)]
 pub struct SubtitleIndex {
    tracks: Vec<IndexedTrackState>,
@@ -131,6 +144,12 @@ enum TrackParse {
 }
 
 impl SubtitleIndex {
+   /// Reads and parses every subtitle track's sample index.
+   ///
+   /// Reads the `moov` asynchronously, then builds its CPU-bound index on the
+   /// blocking pool, limited to the process's available parallelism.
+   /// Recoverably malformed or unsupported tracks are retained as rejected and
+   /// only reported when selected by an exact track ID.
    pub async fn read(reader: &dyn StreamReader) -> Result<Self> {
       Self::read_with_limits(
          reader,
@@ -208,6 +227,14 @@ impl SubtitleIndex {
       Ok((Self { tracks }, usage))
    }
 
+   /// Reads the selected tracks' cues, optionally narrowed to a time range.
+   ///
+   /// Passing no filter returns every valid supported track. Unfiltered and
+   /// language-filtered requests skip recoverably malformed or unsupported
+   /// tracks; selecting such a track by an exact ID returns an error instead.
+   /// Ranges are half-open `[start, end)` and returned times stay absolute to
+   /// the source. Container-wide, I/O, and aggregate-budget failures reject the
+   /// whole request rather than returning a partial result.
    pub async fn subtitles(
       &self,
       reader: &dyn StreamReader,
@@ -435,6 +462,11 @@ fn handle_track_failure(
    Ok(())
 }
 
+/// Reads every cue of the selected subtitle tracks in one call.
+///
+/// A convenience over [`SubtitleIndex::read`] followed by
+/// [`SubtitleIndex::subtitles`]. Callers making repeated requests against the
+/// same source should build and retain a [`SubtitleIndex`] instead.
 pub async fn read_subtitles(
    reader: &dyn StreamReader,
    filter: Option<TrackFilter>,
@@ -442,6 +474,11 @@ pub async fn read_subtitles(
    read_subtitles_in_range(reader, filter, None).await
 }
 
+/// Reads the selected subtitle tracks' cues within a half-open range.
+///
+/// A convenience over [`SubtitleIndex::read`] followed by
+/// [`SubtitleIndex::subtitles`]. Callers making repeated range requests against
+/// the same source should build and retain a [`SubtitleIndex`] instead.
 pub async fn read_subtitles_in_range(
    reader: &dyn StreamReader,
    filter: Option<TrackFilter>,

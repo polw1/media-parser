@@ -1,3 +1,10 @@
+//! The two subtitle budgets: index construction and per-request extraction.
+//!
+//! `IndexBudget` bounds what a source-wide index may parse and retain, while
+//! `RequestBudget` bounds what one extraction may select and decode. Both are
+//! charged before the work they cover, so exhaustion rejects a request instead
+//! of truncating its result.
+
 use crate::errors::{MediaParserError, Result};
 use crate::format::mp4::atoms::RetainedBudget;
 

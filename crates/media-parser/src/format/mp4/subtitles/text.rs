@@ -1,3 +1,10 @@
+//! Decoding of raw subtitle samples into cue text.
+//!
+//! Each supported codec carries its text differently, so decoding is where a
+//! malformed sample is separated from a malformed file: a failure that only
+//! invalidates one track is reported apart from one that must fail the whole
+//! request.
+
 use super::super::atoms;
 use crate::MediaParserError;
 use std::char::decode_utf16;
