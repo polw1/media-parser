@@ -593,7 +593,7 @@ async fn high_level_subtitles_decodes_wvtt_vttc_payload() {
 async fn high_level_subtitles_decodes_length_prefixed_quicktime_text() {
    let parser = MediaParser::new(BytesReader(single_codec_subtitle_mp4(
       b"text",
-      tx3g("QuickTime cue"),
+      tx3g("QuickTime cue!"),
    )));
 
    let tracks = parser
@@ -604,7 +604,7 @@ async fn high_level_subtitles_decodes_length_prefixed_quicktime_text() {
    assert_eq!(tracks.len(), 1);
    assert_eq!(tracks[0].base.codec, "text");
    assert_eq!(tracks[0].cues.len(), 1);
-   assert_eq!(tracks[0].cues[0].text, "QuickTime cue");
+   assert_eq!(tracks[0].cues[0].text, "QuickTime cue!");
 }
 
 #[tokio::test]
