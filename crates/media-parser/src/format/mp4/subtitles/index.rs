@@ -413,7 +413,10 @@ fn subtitle_limit_error(
       }
       (false, None) => "select by track ID or language, or request a narrower time range",
    };
-   MediaParserError::InvalidFormat(format!("{reason}; {guidance}"))
+   // Exhausting a read budget is a request-fatal resource failure, not
+   // malformed input; `InvalidFormat` stays reserved for tracks whose bytes are
+   // actually wrong.
+   MediaParserError::Other(format!("{reason}; {guidance}"))
 }
 
 fn handle_track_failure(
@@ -1135,9 +1138,9 @@ mod tests {
          .expect_err("the three-byte sample exceeds the injected limit")
    }
 
-   fn invalid_format_reason(error: MediaParserError, original_reason: &str) -> String {
-      let MediaParserError::InvalidFormat(reason) = error else {
-         panic!("sample-read limits remain public InvalidFormat errors")
+   fn limit_reason(error: MediaParserError, original_reason: &str) -> String {
+      let MediaParserError::Other(reason) = error else {
+         panic!("sample-read limits are public resource errors, not InvalidFormat")
       };
       assert!(
          reason.starts_with(&format!("{original_reason}; ")),
@@ -1448,7 +1451,7 @@ mod tests {
 
    #[tokio::test]
    async fn unfiltered_limit_suggests_track_id_language_or_narrower_range() {
-      let reason = invalid_format_reason(
+      let reason = limit_reason(
          one_cue_logical_limit_error(None, false).await,
          "sample batch is too large: 3 bytes",
       );
@@ -1460,7 +1463,7 @@ mod tests {
 
    #[tokio::test]
    async fn language_filtered_limit_suggests_exact_track_id_or_narrower_range() {
-      let reason = invalid_format_reason(
+      let reason = limit_reason(
          one_cue_logical_limit_error(Some(TrackFilter::Language("eng".to_owned())), false).await,
          "sample batch is too large: 3 bytes",
       );
@@ -1472,7 +1475,7 @@ mod tests {
 
    #[tokio::test]
    async fn track_id_filtered_limit_suggests_only_a_narrower_range() {
-      let reason = invalid_format_reason(
+      let reason = limit_reason(
          one_cue_logical_limit_error(Some(TrackFilter::TrackId(1)), false).await,
          "sample batch is too large: 3 bytes",
       );
@@ -1484,7 +1487,7 @@ mod tests {
 
    #[tokio::test]
    async fn first_track_limit_suggests_only_a_narrower_range() {
-      let reason = invalid_format_reason(
+      let reason = limit_reason(
          one_cue_logical_limit_error(None, true).await,
          "sample batch is too large: 3 bytes",
       );
@@ -1513,7 +1516,7 @@ mod tests {
          )
          .await
          .expect_err("the second track exceeds the shared one-region budget");
-      let reason = invalid_format_reason(error, "too many sample read batches");
+      let reason = limit_reason(error, "too many sample read batches");
 
       assert!(reason.contains("too many sample read batches"));
       assert!(reason.contains("track ID"));

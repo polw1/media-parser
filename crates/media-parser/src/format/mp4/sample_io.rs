@@ -93,6 +93,11 @@ struct ReadBatch {
    samples: Vec<SampleSlice>,
 }
 
+/// Exhausting a limit or failing an allocation is a resource failure of the
+/// request, not evidence of malformed input, so both surface as
+/// [`MediaParserError::Other`]. [`MediaParserError::InvalidFormat`] stays
+/// reserved for bytes that are actually wrong, including arithmetic derived
+/// from them.
 #[derive(Debug)]
 pub(super) enum SampleReadError {
    Limit(String),
@@ -103,7 +108,7 @@ pub(super) enum SampleReadError {
 impl SampleReadError {
    pub(super) fn into_media_error(self) -> MediaParserError {
       match self {
-         Self::Limit(reason) => MediaParserError::InvalidFormat(reason),
+         Self::Limit(reason) => MediaParserError::Other(reason),
          Self::Track(error) | Self::Fatal(error) => error,
       }
    }
@@ -119,6 +124,10 @@ fn fatal_error(message: impl Into<String>) -> SampleReadError {
    SampleReadError::Fatal(MediaParserError::InvalidFormat(message.into()))
 }
 
+fn allocation_error(message: impl Into<String>) -> SampleReadError {
+   SampleReadError::Fatal(MediaParserError::Other(message.into()))
+}
+
 fn limit_error(message: impl Into<String>) -> SampleReadError {
    SampleReadError::Limit(message.into())
 }
@@ -127,7 +136,7 @@ fn allocate_located_samples(capacity: usize) -> SampleReadResult<Vec<LocatedSamp
    let mut samples = Vec::new();
    samples
       .try_reserve_exact(capacity)
-      .map_err(|_| fatal_error("sample planning allocation failed"))?;
+      .map_err(|_| allocation_error("sample planning allocation failed"))?;
    Ok(samples)
 }
 
@@ -182,7 +191,7 @@ pub(super) async fn read_samples_coalesced_classified(
       let mut samples = Vec::new();
       samples
          .try_reserve(batch.samples.len())
-         .map_err(|_| fatal_error("sample result allocation failed"))?;
+         .map_err(|_| allocation_error("sample result allocation failed"))?;
       for sample in batch.samples {
          let end = sample
             .offset
@@ -205,7 +214,7 @@ pub(super) async fn read_samples_coalesced_classified(
    let mut batch_results = Vec::new();
    batch_results
       .try_reserve_exact(batch_count)
-      .map_err(|_| fatal_error("sample read result allocation failed"))?;
+      .map_err(|_| allocation_error("sample read result allocation failed"))?;
    while let Some(batch) = pending.next().await {
       batch_results.push(batch?);
    }
@@ -218,7 +227,7 @@ pub(super) async fn read_samples_coalesced_classified(
    let mut samples = HashMap::new();
    samples
       .try_reserve(sample_count)
-      .map_err(|_| fatal_error("sample result map allocation failed"))?;
+      .map_err(|_| allocation_error("sample result map allocation failed"))?;
    for batch in batch_results {
       for (sample_index, data) in batch {
          if samples.insert(sample_index, data).is_some() {
@@ -315,7 +324,7 @@ fn plan_read_batches(
    let mut reads: Vec<ReadBatch> = Vec::new();
    reads
       .try_reserve_exact(region_count)
-      .map_err(|_| fatal_error("sample read batch allocation failed"))?;
+      .map_err(|_| allocation_error("sample read batch allocation failed"))?;
    for sample in located_samples {
       if let Some(batch) = reads.last_mut()
          && let Some(merged_size) =
@@ -324,7 +333,7 @@ fn plan_read_batches(
          batch
             .samples
             .try_reserve(1)
-            .map_err(|_| fatal_error("sample slice allocation failed"))?;
+            .map_err(|_| allocation_error("sample slice allocation failed"))?;
          batch.samples.push(SampleSlice {
             sample_index: sample.sample_index,
             offset: sample
@@ -340,7 +349,7 @@ fn plan_read_batches(
       let mut samples = Vec::new();
       samples
          .try_reserve_exact(1)
-         .map_err(|_| fatal_error("sample slice allocation failed"))?;
+         .map_err(|_| allocation_error("sample slice allocation failed"))?;
       samples.push(SampleSlice {
          sample_index: sample.sample_index,
          offset: 0,
@@ -555,7 +564,7 @@ mod tests {
       );
       assert!(matches!(
          error.into_media_error(),
-         MediaParserError::InvalidFormat(reason) if reason == expected_reason
+         MediaParserError::Other(reason) if reason == expected_reason
       ));
    }
 
@@ -701,6 +710,17 @@ mod tests {
          error,
          SampleReadError::Fatal(MediaParserError::InvalidFormat(reason))
             if reason == "sample offset overflow"
+      ));
+   }
+
+   #[test]
+   fn allocation_failure_is_a_fatal_resource_error() {
+      let error = allocation_error("sample planning allocation failed");
+
+      assert!(matches!(
+         error,
+         SampleReadError::Fatal(MediaParserError::Other(reason))
+            if reason == "sample planning allocation failed"
       ));
    }
 
