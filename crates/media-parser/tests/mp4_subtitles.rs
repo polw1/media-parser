@@ -218,6 +218,14 @@ fn stco_markers(markers: &[u32]) -> Vec<u8> {
    full_box(b"stco", &body)
 }
 
+fn co64_markers(markers: &[u64]) -> Vec<u8> {
+   let mut body = Vec::from(u32::try_from(markers.len()).unwrap().to_be_bytes());
+   for marker in markers {
+      body.extend_from_slice(&marker.to_be_bytes());
+   }
+   full_box(b"co64", &body)
+}
+
 fn subtitle_track(
    track_id: u32,
    language: &[u8; 3],
@@ -365,6 +373,15 @@ fn patch_marker(bytes: &mut [u8], marker: u32, replacement: u32) {
       .position(|window| window == marker)
       .expect("unique stco marker");
    bytes[position..position + 4].copy_from_slice(&replacement.to_be_bytes());
+}
+
+fn patch_marker_u64(bytes: &mut [u8], marker: u64, replacement: u64) {
+   let marker = marker.to_be_bytes();
+   let position = bytes
+      .windows(marker.len())
+      .position(|window| window == marker)
+      .expect("unique co64 marker");
+   bytes[position..position + 8].copy_from_slice(&replacement.to_be_bytes());
 }
 
 fn subtitle_mp4() -> Vec<u8> {
@@ -540,6 +557,77 @@ fn zero_delta_subtitle_mp4() -> Vec<u8> {
    let mut file = [ftyp, moov, mdat].concat();
    let payload_offset = file.len() - payload.len();
    patch_marker(&mut file, OFFSET, payload_offset as u32);
+   file
+}
+
+/// Two chunks holding one sample each, separated by real padding wider than the
+/// shipped `max_coalesce_gap_bytes`, so the pair cannot merge into one read
+/// batch. That ceiling is private to the subtitle module, hence the literal.
+/// Returns the file plus the absolute offset of each sample.
+fn multi_chunk_subtitle_mp4() -> (Vec<u8>, u64, u64) {
+   const FIRST_OFFSET: u32 = 0x9192_9394;
+   const SECOND_OFFSET: u32 = 0x8182_8384;
+   const CHUNK_GAP: usize = 64 * 1024 + 1;
+   let samples = [tx3g("First"), tx3g("Second")];
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+   let moov = mp4_box(
+      b"moov",
+      &subtitle_track_with_tables(
+         1,
+         b"eng",
+         &samples,
+         stsd(b"tx3g"),
+         stsc_runs(&[(1, 1, 1), (2, 1, 1)]),
+         stco_markers(&[FIRST_OFFSET, SECOND_OFFSET]),
+         None,
+      ),
+   );
+   let padding = vec![0u8; CHUNK_GAP];
+   let payload = [
+      samples[0].as_slice(),
+      padding.as_slice(),
+      samples[1].as_slice(),
+   ]
+   .concat();
+   let mdat = mp4_box(b"mdat", &payload);
+   let mut file = [ftyp, moov, mdat].concat();
+   let first_sample = file.len() - payload.len();
+   let second_sample = first_sample + samples[0].len() + CHUNK_GAP;
+   patch_marker(&mut file, FIRST_OFFSET, first_sample as u32);
+   patch_marker(&mut file, SECOND_OFFSET, second_sample as u32);
+   (file, first_sample as u64, second_sample as u64)
+}
+
+/// Two chunks addressed by a `co64` table whose small, real offsets are encoded
+/// as 64-bit entries, so the second entry is only reachable through the 8-byte
+/// stride and the 64-bit read.
+fn co64_subtitle_mp4() -> Vec<u8> {
+   const FIRST_OFFSET: u64 = 0xf1f2_f3f4_f5f6_f7f8;
+   const SECOND_OFFSET: u64 = 0xe1e2_e3e4_e5e6_e7e8;
+   let samples = [tx3g("First"), tx3g("Second")];
+   let ftyp = mp4_box(b"ftyp", b"isom\0\0\0\0isom");
+   let moov = mp4_box(
+      b"moov",
+      &subtitle_track_with_tables(
+         1,
+         b"eng",
+         &samples,
+         stsd(b"tx3g"),
+         stsc_runs(&[(1, 1, 1), (2, 1, 1)]),
+         co64_markers(&[FIRST_OFFSET, SECOND_OFFSET]),
+         None,
+      ),
+   );
+   let payload = samples.concat();
+   let mdat = mp4_box(b"mdat", &payload);
+   let mut file = [ftyp, moov, mdat].concat();
+   let first_sample = file.len() - payload.len();
+   patch_marker_u64(&mut file, FIRST_OFFSET, first_sample as u64);
+   patch_marker_u64(
+      &mut file,
+      SECOND_OFFSET,
+      (first_sample + samples[0].len()) as u64,
+   );
    file
 }
 
@@ -920,6 +1008,48 @@ async fn hardening_range_selection_reads_only_overlapping_samples() {
          .iter()
          .all(|(offset, _)| *offset != first_sample)
    );
+}
+
+#[tokio::test]
+async fn hardening_distant_chunks_are_read_as_separate_batches() {
+   let (bytes, first_sample, second_sample) = multi_chunk_subtitle_mp4();
+   let sizes = (tx3g("First").len(), tx3g("Second").len());
+   let reader = CountingReader::new(bytes);
+   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let reads_after_index = reader.ranges().len();
+
+   let tracks = index
+      .subtitles(&reader, None, None)
+      .await
+      .expect("extract both chunks");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].cues.len(), 2);
+   assert_eq!(tracks[0].cues[0].text, "First");
+   assert_eq!(tracks[0].cues[1].text, "Second");
+
+   // Batches complete out of order, so compare the reads by offset rather than
+   // by arrival.
+   let mut sample_reads = reader.ranges()[reads_after_index..].to_vec();
+   sample_reads.sort_by_key(|(offset, _)| *offset);
+   assert_eq!(
+      sample_reads,
+      vec![(first_sample, sizes.0), (second_sample, sizes.1)]
+   );
+}
+
+#[tokio::test]
+async fn hardening_co64_chunk_offsets_locate_every_chunk() {
+   let reader = BytesReader(co64_subtitle_mp4());
+
+   let tracks = read_subtitles(&reader, None)
+      .await
+      .expect("extract a co64-addressed track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].cues.len(), 2);
+   assert_eq!(tracks[0].cues[0].text, "First");
+   assert_eq!(tracks[0].cues[1].text, "Second");
 }
 
 #[tokio::test]
