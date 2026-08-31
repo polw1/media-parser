@@ -94,11 +94,9 @@ pub(crate) struct SessionPool<K, V> {
    build_locks: Mutex<HashMap<K, BuildEntry<V>>>,
 }
 
-type SharedBuildResult<V> = std::result::Result<Arc<V>, Arc<str>>;
-
 struct BuildSlot<V> {
    gate: tauri::async_runtime::Mutex<()>,
-   result: Mutex<Option<SharedBuildResult<V>>>,
+   result: Mutex<Option<Arc<V>>>,
 }
 
 impl<V> BuildSlot<V> {
@@ -109,7 +107,7 @@ impl<V> BuildSlot<V> {
       }
    }
 
-   fn result(&self) -> crate::Result<Option<SharedBuildResult<V>>> {
+   fn result(&self) -> crate::Result<Option<Arc<V>>> {
       self
          .result
          .lock()
@@ -117,7 +115,7 @@ impl<V> BuildSlot<V> {
          .map(|result| result.clone())
    }
 
-   fn complete(&self, result: SharedBuildResult<V>) -> crate::Result<()> {
+   fn complete(&self, value: Arc<V>) -> crate::Result<()> {
       let mut stored = self
          .result
          .lock()
@@ -127,7 +125,7 @@ impl<V> BuildSlot<V> {
             "session build state completed more than once".to_string(),
          ));
       }
-      *stored = Some(result);
+      *stored = Some(value);
       Ok(())
    }
 }
@@ -253,18 +251,9 @@ where
       Ok(())
    }
 
-   fn shared_result(result: SharedBuildResult<V>) -> crate::Result<Arc<V>> {
-      result.map_err(|error| crate::Error::Custom(error.to_string()))
-   }
-
    fn complete_value(slot: &BuildSlot<V>, value: Arc<V>) -> crate::Result<Arc<V>> {
-      slot.complete(Ok(Arc::clone(&value)))?;
+      slot.complete(Arc::clone(&value))?;
       Ok(value)
-   }
-
-   fn complete_error(slot: &BuildSlot<V>, error: crate::Error) -> crate::Error {
-      let shared_error: Arc<str> = Arc::from(error.to_string());
-      slot.complete(Err(shared_error)).err().unwrap_or(error)
    }
 
    pub(crate) async fn get_or_try_build<F, Fut>(
@@ -287,7 +276,7 @@ where
       let mut build_lock = self.build_lock(&key)?;
       let build_guard = build_lock.slot.gate.lock().await;
       let result = match build_lock.slot.result() {
-         Ok(Some(result)) => Self::shared_result(result),
+         Ok(Some(value)) => Ok(value),
          Ok(None) => match self.cached(&key) {
             Ok(Some(value)) => Self::complete_value(&build_lock.slot, value),
             Ok(None) => match build().await {
@@ -295,12 +284,12 @@ where
                   let value = Arc::new(value);
                   match self.insert_cached(key.clone(), Arc::clone(&value), ttl) {
                      Ok(()) => Self::complete_value(&build_lock.slot, value),
-                     Err(error) => Err(Self::complete_error(&build_lock.slot, error)),
+                     Err(error) => Err(error),
                   }
                }
-               Err(error) => Err(Self::complete_error(&build_lock.slot, error)),
+               Err(error) => Err(error),
             },
-            Err(error) => Err(Self::complete_error(&build_lock.slot, error)),
+            Err(error) => Err(error),
          },
          Err(error) => Err(error),
       };
@@ -472,7 +461,7 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn concurrent_failed_build_is_shared_by_the_joined_cohort_then_can_retry() {
+   async fn concurrent_leader_failure_is_retried_and_success_is_shared() {
       const REQUESTS: usize = 8;
       let pool = Arc::new(SessionPool::<&str, usize>::new(1, Duration::from_secs(60)));
       let builds = Arc::new(AtomicUsize::new(0));
@@ -486,11 +475,15 @@ mod tests {
          requests.push(tokio::spawn(async move {
             request_pool
                .get_or_try_build("shared", Duration::from_secs(60), || async move {
-                  request_builds.fetch_add(1, Ordering::SeqCst);
+                  let attempt = request_builds.fetch_add(1, Ordering::SeqCst);
                   while !request_release.load(Ordering::SeqCst) {
                      tokio::task::yield_now().await;
                   }
-                  Err(crate::Error::Custom("cohort failure".to_string()))
+                  if attempt == 0 {
+                     Err(crate::Error::Custom("leader failure".to_string()))
+                  } else {
+                     Ok(9)
+                  }
                })
                .await
          }));
@@ -515,17 +508,26 @@ mod tests {
       .expect("all requests should join the same in-flight build");
       release_failure.store(true, Ordering::SeqCst);
 
+      let mut failure_count = 0;
+      let mut successes = Vec::new();
       for request in requests {
-         let error = request
-            .await
-            .expect("request task should complete")
-            .expect_err("the cohort build should fail");
-         assert_eq!(error.to_string(), "cohort failure");
+         match request.await.expect("request task should complete") {
+            Ok(value) => successes.push(value),
+            Err(error) => {
+               failure_count += 1;
+               assert_eq!(error.to_string(), "leader failure");
+            }
+         }
       }
-      assert_eq!(
-         builds.load(Ordering::SeqCst),
-         1,
-         "one failing build must serve the whole joined cohort"
+      assert_eq!(failure_count, 1, "only the build leader should fail");
+      assert_eq!(successes.len(), REQUESTS - 1);
+      assert_eq!(builds.load(Ordering::SeqCst), 2);
+      assert!(successes.iter().all(|value| **value == 9));
+      assert!(
+         successes
+            .windows(2)
+            .all(|pair| Arc::ptr_eq(&pair[0], &pair[1])),
+         "the successor's successful build should be shared"
       );
       assert!(
          pool
@@ -533,7 +535,7 @@ mod tests {
             .lock()
             .expect("cache should remain available")
             .get(&"shared", Instant::now())
-            .is_none()
+            .is_some()
       );
       assert!(
          pool
@@ -542,12 +544,6 @@ mod tests {
             .expect("build-lock table should remain available")
             .is_empty()
       );
-
-      let recovered = pool
-         .get_or_try_build("shared", Duration::from_secs(60), || async { Ok(9) })
-         .await
-         .expect("an independent later request should retry");
-      assert_eq!(*recovered, 9);
    }
 
    #[test]
