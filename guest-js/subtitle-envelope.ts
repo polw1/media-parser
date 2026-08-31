@@ -3,13 +3,16 @@ import type { SubtitleCueInfo, SubtitleInfo } from './types';
 
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true });
 
+/** Envelope header shapes the subtitle decoder understands. */
+const SUPPORTED_SUBTITLE_ENVELOPE_VERSIONS = new Set([1]);
+
 export function decodeSubtitleEnvelope(
    raw: ArrayBuffer | Uint8Array,
 ): SubtitleInfo[] {
-   const parsed = parseEnvelopeHeader<unknown>(raw);
-   if (parsed.version !== 1) {
-      throw new TypeError(`Unsupported subtitle envelope version: ${String(parsed.version)}.`);
-   }
+   const parsed = parseEnvelopeHeader<unknown>(raw, {
+      supportedVersions: SUPPORTED_SUBTITLE_ENVELOPE_VERSIONS,
+      envelopeKind: 'subtitle',
+   });
 
    return parsed.entries.map((entry) => decodeTrack(
       entry,

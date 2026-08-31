@@ -1,12 +1,17 @@
 /**
- * Decodes binary envelopes returned by `get_cover` and `get_thumbnails`.
+ * Decodes binary envelopes returned by `get_cover`, `get_thumbnails`, and
+ * `get_subtitles`, the last through `subtitle-envelope.ts`.
  *
  * Layout: a 4-byte little-endian header length, a JSON header, then the
  * concatenated binary payloads. The JSON header is either a bare array of
  * entries (legacy, version 0) or `{ version, entries }` (version 1+).
+ *
+ * Every decoder reaches the payload through `parseEnvelopeHeader`, which takes
+ * the accepted versions as a required policy and rejects anything else before
+ * returning entries.
  */
 
-/** Envelope header shapes this decoder understands. Reject anything else. */
+/** Envelope header shapes the media (`get_cover`/`get_thumbnails`) decoder understands. */
 const SUPPORTED_ENVELOPE_VERSIONS = new Set([0, 1]);
 
 interface EnvelopeEntry {
@@ -22,12 +27,16 @@ export interface ParsedEnvelopeHeader<T> {
    payloadLength: number;
 }
 
-export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
-   const parsed = parseEnvelopeHeader<T & EnvelopeEntry>(raw);
+export interface EnvelopeVersionPolicy {
+   supportedVersions: ReadonlySet<number>;
+   envelopeKind: string;
+}
 
-   if (!SUPPORTED_ENVELOPE_VERSIONS.has(parsed.version)) {
-      throw new TypeError(`Unsupported media envelope version: ${String(parsed.version)}.`);
-   }
+export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
+   const parsed = parseEnvelopeHeader<T & EnvelopeEntry>(raw, {
+      supportedVersions: SUPPORTED_ENVELOPE_VERSIONS,
+      envelopeKind: 'media',
+   });
 
    return parsed.entries.map((entry) => decodeEnvelopeEntry(
       entry,
@@ -39,6 +48,7 @@ export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: U
 
 export function parseEnvelopeHeader<T>(
    raw: ArrayBuffer | Uint8Array,
+   policy: EnvelopeVersionPolicy,
 ): ParsedEnvelopeHeader<T> {
    const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
@@ -58,6 +68,13 @@ export function parseEnvelopeHeader<T>(
 
    const parsed: unknown = JSON.parse(new TextDecoder().decode(header));
    const { version, entries } = normalizeEnvelopeHeader<T>(parsed);
+
+   if (!policy.supportedVersions.has(version)) {
+      throw new TypeError(
+         `Unsupported ${policy.envelopeKind} envelope version: ${String(version)}.`,
+      );
+   }
+
    const payloadLength = buffer.byteLength - headerEnd;
 
    return {

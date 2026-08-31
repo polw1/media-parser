@@ -9,6 +9,8 @@ interface Entry {
    length: number;
 }
 
+const MEDIA_VERSION_POLICY = { supportedVersions: new Set([0, 1]), envelopeKind: 'media' };
+
 function buildEnvelope(header: unknown, payload: number[]): Uint8Array {
    const headerBytes = new TextEncoder().encode(JSON.stringify(header));
    const envelope = new Uint8Array(4 + headerBytes.length + payload.length);
@@ -50,7 +52,7 @@ test('parses the shared prefix, normalized header, and payload boundaries', () =
       [7, 8],
    );
 
-   const parsed = parseEnvelopeHeader<Entry>(envelope);
+   const parsed = parseEnvelopeHeader<Entry>(envelope, MEDIA_VERSION_POLICY);
 
    assert.equal(parsed.version, 1);
    assert.equal(parsed.entries[0].label, 'a');
@@ -65,6 +67,7 @@ test('parses the shared prefix, normalized header, and payload boundaries', () =
 test('shared header parsing normalizes a legacy bare array to version 0', () => {
    const parsed = parseEnvelopeHeader<Entry>(
       buildEnvelope([{ label: 'a', offset: 0, length: 0 }], []),
+      MEDIA_VERSION_POLICY,
    );
 
    assert.equal(parsed.version, 0);
@@ -83,6 +86,18 @@ test('rejects an unknown envelope version', () => {
    const envelope = buildEnvelope({ version: 99, entries: [] }, []);
 
    assert.throws(() => decodeEnvelope(envelope), /Unsupported media envelope version: 99/);
+});
+
+test('shared header parsing rejects a version outside the caller policy', () => {
+   const envelope = buildEnvelope({ version: 0, entries: [] }, []);
+
+   assert.throws(
+      () => parseEnvelopeHeader<Entry>(envelope, {
+         supportedVersions: new Set([1]),
+         envelopeKind: 'caption',
+      }),
+      /Unsupported caption envelope version: 0/,
+   );
 });
 
 test('rejects a version 1 header missing "entries"', () => {
