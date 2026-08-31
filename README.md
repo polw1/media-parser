@@ -249,8 +249,8 @@ with `new Uint8Array(thumbnail.data)` when it must outlive the rest of the
 batch.
 
 The plugin caches up to eight parsed thumbnail sessions. Remote sessions expire
-after five minutes and local sessions after one minute; concurrent requests for
-the same cold source share one index build.
+five minutes after they are built, and local sessions after one minute without
+reuse; concurrent requests for the same cold source share one index build.
 
 H.264 decoding and JPEG encoding are prohibitively slow when their dependencies
 use Cargo's unoptimized development profile. Add this to the Tauri
@@ -338,10 +338,12 @@ accounts for at most 32 MiB of retained bytes, so up to 256 MiB of index data
 may remain cached, in addition to readers, cache overhead, and references held
 by in-progress requests. All filters and ranges for a source reuse the same
 parsed index; concurrent cold requests share its construction. Local sessions
-expire after one minute and remote sessions after five minutes. The source
-bytes must remain unchanged while a session is reused. Local path keys include
-file size and modification time; remote content served by the same URL and
-headers may remain cached until its TTL expires.
+expire after one minute without reuse, and remote sessions five minutes after
+they are built. The source bytes must remain unchanged while a session is
+reused: a local session kept alive by repeated requests is never rebuilt on a
+schedule. Local path keys include file size and modification time; remote
+content served by the same URL and headers may remain cached until its TTL
+expires.
 
 Clients making repeated range requests should retain one core `SubtitleIndex`
 across those requests. Its cues keep absolute source times, so callers remain

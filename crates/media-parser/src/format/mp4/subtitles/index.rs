@@ -1511,7 +1511,7 @@ mod tests {
 
       assert!(reason.contains("exact track ID"));
       assert!(reason.contains("narrower time range"));
-      assert!(!reason.contains("select by language"));
+      assert!(!reason.contains("or language"));
    }
 
    #[tokio::test]

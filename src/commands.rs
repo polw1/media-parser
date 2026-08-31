@@ -12,7 +12,7 @@ use crate::Result;
 use crate::envelope::{cover_envelope, encode_thumbnail_envelope, run_envelope_task};
 use crate::session_cache::SessionPool;
 use crate::source::{
-   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_ttl, source_key,
+   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration, source_key,
 };
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
@@ -48,14 +48,14 @@ async fn thumbnail_session(
    track_id: u32,
 ) -> Result<Arc<ThumbnailSession>> {
    let media_source = source_key(source, headers).await;
-   let ttl = session_ttl(&media_source);
+   let expiration = session_expiration(&media_source);
    let key = ThumbnailSessionKey {
       source: media_source,
       track_id,
    };
    sessions
       .pool
-      .get_or_try_build(key, ttl, || async {
+      .get_or_try_build(key, expiration, || async {
          let reader = open_reader(source, headers).await?;
          let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
          Ok(ThumbnailSession { reader, index })

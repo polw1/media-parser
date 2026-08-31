@@ -6,6 +6,26 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use std::time::Instant;
 
+/// How a cached entry's deadline behaves once the entry is stored. The cache
+/// only executes the policy; deciding which one a source deserves belongs to
+/// the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExpirationPolicy {
+   /// The deadline is fixed when the entry is cached; reuse never moves it.
+   Absolute(Duration),
+   /// Every cache hit restarts the countdown, so the entry expires on
+   /// inactivity rather than on age.
+   Sliding(Duration),
+}
+
+impl ExpirationPolicy {
+   fn deadline(self, now: Instant) -> Option<Instant> {
+      match self {
+         Self::Absolute(ttl) | Self::Sliding(ttl) => now.checked_add(ttl),
+      }
+   }
+}
+
 struct SessionCache<K, V> {
    capacity: usize,
    entries: Vec<SessionCacheEntry<K, V>>,
@@ -14,6 +34,7 @@ struct SessionCache<K, V> {
 struct SessionCacheEntry<K, V> {
    key: K,
    value: V,
+   policy: ExpirationPolicy,
    expires_at: Option<Instant>,
 }
 
@@ -34,13 +55,16 @@ impl<K: PartialEq, V: Clone> SessionCache<K, V> {
    fn get(&mut self, key: &K, now: Instant) -> Option<V> {
       self.remove_expired(now);
       let index = self.entries.iter().position(|entry| &entry.key == key)?;
-      let entry = self.entries.remove(index);
+      let mut entry = self.entries.remove(index);
+      if matches!(entry.policy, ExpirationPolicy::Sliding(_)) {
+         entry.expires_at = entry.policy.deadline(now);
+      }
       let value = entry.value.clone();
       self.entries.push(entry);
       Some(value)
    }
 
-   fn insert(&mut self, key: K, value: V, expires_at: Option<Instant>) {
+   fn insert(&mut self, key: K, value: V, policy: ExpirationPolicy, now: Instant) {
       self.entries.retain(|entry| entry.key != key);
       if self.entries.len() >= self.capacity {
          self.entries.remove(0);
@@ -48,7 +72,8 @@ impl<K: PartialEq, V: Clone> SessionCache<K, V> {
       self.entries.push(SessionCacheEntry {
          key,
          value,
-         expires_at,
+         policy,
+         expires_at: policy.deadline(now),
       });
    }
 }
@@ -241,13 +266,17 @@ where
       })
    }
 
-   fn insert_cached(&self, key: K, value: Arc<V>, ttl: Duration) -> crate::Result<()> {
-      let expires_at = Instant::now().checked_add(ttl);
+   fn insert_cached(
+      &self,
+      key: K,
+      value: Arc<V>,
+      expiration: ExpirationPolicy,
+   ) -> crate::Result<()> {
       self
          .cache
          .lock()
          .map_err(|_| crate::Error::Custom("session cache is unavailable".to_string()))?
-         .insert(key, value, expires_at);
+         .insert(key, value, expiration, Instant::now());
       Ok(())
    }
 
@@ -259,7 +288,7 @@ where
    pub(crate) async fn get_or_try_build<F, Fut>(
       &self,
       key: K,
-      ttl: Duration,
+      expiration: ExpirationPolicy,
       build: F,
    ) -> crate::Result<Arc<V>>
    where
@@ -282,7 +311,7 @@ where
             Ok(None) => match build().await {
                Ok(value) => {
                   let value = Arc::new(value);
-                  match self.insert_cached(key.clone(), Arc::clone(&value), ttl) {
+                  match self.insert_cached(key.clone(), Arc::clone(&value), expiration) {
                      Ok(()) => Self::complete_value(&build_lock.slot, value),
                      Err(error) => Err(error),
                   }
@@ -307,15 +336,18 @@ mod tests {
    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
    use std::time::Duration;
 
+   const ABSOLUTE_MINUTE: ExpirationPolicy = ExpirationPolicy::Absolute(Duration::from_secs(60));
+   const SLIDING_MINUTE: ExpirationPolicy = ExpirationPolicy::Sliding(Duration::from_secs(60));
+
    #[test]
    fn session_cache_evicts_the_least_recently_used_entry() {
       let now = Instant::now();
       let mut cache = SessionCache::new(2);
-      cache.insert("first".to_string(), 1, None);
-      cache.insert("second".to_string(), 2, None);
+      cache.insert("first".to_string(), 1, ABSOLUTE_MINUTE, now);
+      cache.insert("second".to_string(), 2, ABSOLUTE_MINUTE, now);
 
       assert_eq!(cache.get(&"first".to_string(), now), Some(1));
-      cache.insert("third".to_string(), 3, None);
+      cache.insert("third".to_string(), 3, ABSOLUTE_MINUTE, now);
 
       assert_eq!(cache.get(&"second".to_string(), now), None);
       assert_eq!(cache.get(&"first".to_string(), now), Some(1));
@@ -325,12 +357,65 @@ mod tests {
    #[test]
    fn session_cache_drops_an_entry_at_its_expiration_deadline() {
       let now = Instant::now();
-      let deadline = now + Duration::from_secs(30);
+      let ttl = Duration::from_secs(30);
       let mut cache = SessionCache::new(1);
-      cache.insert("remote".to_string(), 1, Some(deadline));
+      cache.insert(
+         "remote".to_string(),
+         1,
+         ExpirationPolicy::Absolute(ttl),
+         now,
+      );
 
       assert_eq!(cache.get(&"remote".to_string(), now), Some(1));
+      assert_eq!(cache.get(&"remote".to_string(), now + ttl), None);
+   }
+
+   #[test]
+   fn a_hit_extends_the_deadline_of_a_sliding_entry() {
+      let now = Instant::now();
+      let mut cache = SessionCache::new(1);
+      cache.insert("local".to_string(), 1, SLIDING_MINUTE, now);
+
+      assert_eq!(
+         cache.get(&"local".to_string(), now + Duration::from_secs(45)),
+         Some(1)
+      );
+
+      assert_eq!(
+         cache.get(&"local".to_string(), now + Duration::from_secs(90)),
+         Some(1),
+         "the hit at 45 s must restart the one-minute countdown"
+      );
+   }
+
+   #[test]
+   fn a_hit_never_moves_the_deadline_of_an_absolute_entry() {
+      let now = Instant::now();
+      let mut cache = SessionCache::new(1);
+      cache.insert("remote".to_string(), 1, ABSOLUTE_MINUTE, now);
+
+      assert_eq!(
+         cache.get(&"remote".to_string(), now + Duration::from_secs(45)),
+         Some(1)
+      );
+
+      assert_eq!(
+         cache.get(&"remote".to_string(), now + Duration::from_secs(90)),
+         None,
+         "reuse must not postpone an absolute deadline"
+      );
+   }
+
+   #[test]
+   fn both_policies_expire_at_their_exact_deadline() {
+      let now = Instant::now();
+      let deadline = now + Duration::from_secs(60);
+      let mut cache = SessionCache::new(2);
+      cache.insert("remote".to_string(), 1, ABSOLUTE_MINUTE, now);
+      cache.insert("local".to_string(), 2, SLIDING_MINUTE, now);
+
       assert_eq!(cache.get(&"remote".to_string(), deadline), None);
+      assert_eq!(cache.get(&"local".to_string(), deadline), None);
    }
 
    #[tokio::test]
@@ -340,7 +425,7 @@ mod tests {
 
       for key in ["first", "second"] {
          pool
-            .get_or_try_build(key, Duration::from_secs(60), || async {
+            .get_or_try_build(key, ABSOLUTE_MINUTE, || async {
                builds.fetch_add(1, Ordering::SeqCst);
                Ok(key)
             })
@@ -348,28 +433,32 @@ mod tests {
             .expect("initial values should build");
       }
       pool
-         .get_or_try_build("first", Duration::from_secs(60), || async {
+         .get_or_try_build("first", ABSOLUTE_MINUTE, || async {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok("unexpected rebuild")
          })
          .await
          .expect("the first value should be cached");
       pool
-         .get_or_try_build("third", Duration::from_secs(60), || async {
+         .get_or_try_build("third", ABSOLUTE_MINUTE, || async {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok("third")
          })
          .await
          .expect("the third value should build");
       pool
-         .get_or_try_build("second", Duration::ZERO, || async {
-            builds.fetch_add(1, Ordering::SeqCst);
-            Ok("second rebuilt")
-         })
+         .get_or_try_build(
+            "second",
+            ExpirationPolicy::Absolute(Duration::ZERO),
+            || async {
+               builds.fetch_add(1, Ordering::SeqCst);
+               Ok("second rebuilt")
+            },
+         )
          .await
          .expect("the evicted second value should rebuild");
       pool
-         .get_or_try_build("second", Duration::from_secs(60), || async {
+         .get_or_try_build("second", ABSOLUTE_MINUTE, || async {
             builds.fetch_add(1, Ordering::SeqCst);
             Ok("second after expiry")
          })
@@ -383,7 +472,11 @@ mod tests {
    async fn session_pool_reaper_releases_expired_values_without_cache_access() {
       let pool = SessionPool::new(1, Duration::from_millis(2));
       let value = pool
-         .get_or_try_build("local", Duration::from_millis(10), || async { Ok(()) })
+         .get_or_try_build(
+            "local",
+            ExpirationPolicy::Absolute(Duration::from_millis(10)),
+            || async { Ok(()) },
+         )
          .await
          .expect("value should build");
       let weak = Arc::downgrade(&value);
@@ -405,7 +498,7 @@ mod tests {
 
       let request = |pool: Arc<SessionPool<&'static str, usize>>, builds: Arc<AtomicUsize>| async move {
          pool
-            .get_or_try_build("shared", Duration::from_secs(60), || async move {
+            .get_or_try_build("shared", ABSOLUTE_MINUTE, || async move {
                builds.fetch_add(1, Ordering::SeqCst);
                tokio::time::sleep(Duration::from_millis(20)).await;
                Ok(42)
@@ -431,7 +524,7 @@ mod tests {
       let pool = SessionPool::<&str, usize>::new(1, Duration::from_secs(60));
 
       let failed = pool
-         .get_or_try_build("shared", Duration::from_secs(60), || async {
+         .get_or_try_build("shared", ABSOLUTE_MINUTE, || async {
             Err(crate::Error::Custom("expected failure".to_string()))
          })
          .await;
@@ -454,7 +547,7 @@ mod tests {
       );
 
       let recovered = pool
-         .get_or_try_build("shared", Duration::from_secs(60), || async { Ok(7) })
+         .get_or_try_build("shared", ABSOLUTE_MINUTE, || async { Ok(7) })
          .await
          .expect("a later build should recover");
       assert_eq!(*recovered, 7);
@@ -474,7 +567,7 @@ mod tests {
          let request_release = Arc::clone(&release_failure);
          requests.push(tokio::spawn(async move {
             request_pool
-               .get_or_try_build("shared", Duration::from_secs(60), || async move {
+               .get_or_try_build("shared", ABSOLUTE_MINUTE, || async move {
                   let attempt = request_builds.fetch_add(1, Ordering::SeqCst);
                   while !request_release.load(Ordering::SeqCst) {
                      tokio::task::yield_now().await;
@@ -617,7 +710,7 @@ mod tests {
       let task_started = Arc::clone(&started);
       let task = tokio::spawn(async move {
          task_pool
-            .get_or_try_build("shared", Duration::from_secs(60), || async move {
+            .get_or_try_build("shared", ABSOLUTE_MINUTE, || async move {
                task_started.store(1, Ordering::SeqCst);
                std::future::pending::<crate::Result<usize>>().await
             })

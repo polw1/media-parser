@@ -6,6 +6,7 @@ use url::Url;
 use media_parser::{FileStreamReader, HttpStreamReader, StreamReader};
 
 use crate::Result;
+use crate::session_cache::ExpirationPolicy;
 
 const REMOTE_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_SESSION_TTL: Duration = Duration::from_secs(60);
@@ -85,11 +86,15 @@ pub(crate) async fn open_reader(
    }
 }
 
-pub(crate) fn session_ttl(source: &MediaSourceKey) -> Duration {
+/// Remote bytes can change behind an unchanged URL, so a remote session is
+/// capped by age. A local session is keyed by size and modification time and
+/// reused under the documented promise that the file stays unchanged, so it
+/// expires on inactivity instead.
+pub(crate) fn session_expiration(source: &MediaSourceKey) -> ExpirationPolicy {
    if is_http_source(&source.source) {
-      REMOTE_SESSION_TTL
+      ExpirationPolicy::Absolute(REMOTE_SESSION_TTL)
    } else {
-      LOCAL_SESSION_TTL
+      ExpirationPolicy::Sliding(LOCAL_SESSION_TTL)
    }
 }
 
@@ -151,12 +156,18 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn shared_session_ttl_is_one_minute_local_and_five_minutes_remote() {
+   async fn local_sessions_slide_for_one_minute_and_remote_sessions_end_after_five() {
       let local = source_key("/file/that/does/not/exist.mp4", None).await;
       let remote = source_key("https://example.com/video.mp4", None).await;
 
-      assert_eq!(session_ttl(&local), Duration::from_secs(60));
-      assert_eq!(session_ttl(&remote), Duration::from_secs(5 * 60));
+      assert_eq!(
+         session_expiration(&local),
+         ExpirationPolicy::Sliding(Duration::from_secs(60))
+      );
+      assert_eq!(
+         session_expiration(&remote),
+         ExpirationPolicy::Absolute(Duration::from_secs(5 * 60))
+      );
    }
 
    #[test]

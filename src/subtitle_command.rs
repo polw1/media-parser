@@ -12,7 +12,7 @@ use crate::envelope::{
 };
 use crate::session_cache::SessionPool;
 use crate::source::{
-   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_ttl, source_key,
+   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration, source_key,
 };
 
 const MAX_SUBTITLE_SESSIONS: usize = 8;
@@ -90,10 +90,10 @@ async fn subtitle_session(
    headers: Option<&HashMap<String, String>>,
 ) -> Result<Arc<SubtitleSession>> {
    let key = source_key(source, headers).await;
-   let ttl = session_ttl(&key);
+   let expiration = session_expiration(&key);
    sessions
       .pool
-      .get_or_try_build(key, ttl, || async {
+      .get_or_try_build(key, expiration, || async {
          let reader = open_reader(source, headers).await?;
          let index = Arc::new(SubtitleIndex::read(reader.as_ref()).await?);
          Ok(SubtitleSession { reader, index })
@@ -173,6 +173,7 @@ pub(crate) async fn get_subtitles(
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::session_cache::ExpirationPolicy;
    use std::sync::Arc;
    use std::sync::atomic::{AtomicUsize, Ordering};
    use std::time::Duration;
@@ -392,38 +393,56 @@ mod tests {
 
       for key in ["first", "second"] {
          pool
-            .get_or_try_build(key, Duration::from_secs(60), || async {
-               builds.fetch_add(1, Ordering::SeqCst);
-               Ok(key)
-            })
+            .get_or_try_build(
+               key,
+               ExpirationPolicy::Absolute(Duration::from_secs(60)),
+               || async {
+                  builds.fetch_add(1, Ordering::SeqCst);
+                  Ok(key)
+               },
+            )
             .await
             .expect("initial value should build");
       }
       pool
-         .get_or_try_build("first", Duration::from_secs(60), || async {
-            panic!("recent entry should be reused")
-         })
+         .get_or_try_build(
+            "first",
+            ExpirationPolicy::Absolute(Duration::from_secs(60)),
+            || async { panic!("recent entry should be reused") },
+         )
          .await
          .expect("recent entry should be cached");
       pool
-         .get_or_try_build("third", Duration::from_secs(60), || async {
-            builds.fetch_add(1, Ordering::SeqCst);
-            Ok("third")
-         })
+         .get_or_try_build(
+            "third",
+            ExpirationPolicy::Absolute(Duration::from_secs(60)),
+            || async {
+               builds.fetch_add(1, Ordering::SeqCst);
+               Ok("third")
+            },
+         )
          .await
          .expect("third value should build");
       pool
-         .get_or_try_build("second", Duration::ZERO, || async {
-            builds.fetch_add(1, Ordering::SeqCst);
-            Ok("second rebuilt")
-         })
+         .get_or_try_build(
+            "second",
+            ExpirationPolicy::Absolute(Duration::ZERO),
+            || async {
+               builds.fetch_add(1, Ordering::SeqCst);
+               Ok("second rebuilt")
+            },
+         )
          .await
          .expect("least-recently-used value should rebuild");
       pool
-         .get_or_try_build("second", Duration::from_secs(60), || async {
-            builds.fetch_add(1, Ordering::SeqCst);
-            Ok("second after expiry")
-         })
+         .get_or_try_build(
+            "second",
+            ExpirationPolicy::Absolute(Duration::from_secs(60)),
+            || async {
+               builds.fetch_add(1, Ordering::SeqCst);
+               Ok("second after expiry")
+            },
+         )
          .await
          .expect("zero-TTL value should expire");
 
@@ -456,14 +475,20 @@ mod tests {
    async fn subtitle_failed_session_build_cleans_the_lock_and_can_retry() {
       let pool = SessionPool::<&str, usize>::new(1, Duration::from_secs(60));
       let failed = pool
-         .get_or_try_build("source", Duration::from_secs(60), || async {
-            Err(crate::Error::Custom("expected failure".to_string()))
-         })
+         .get_or_try_build(
+            "source",
+            ExpirationPolicy::Absolute(Duration::from_secs(60)),
+            || async { Err(crate::Error::Custom("expected failure".to_string())) },
+         )
          .await;
       assert!(failed.is_err());
 
       let recovered = pool
-         .get_or_try_build("source", Duration::from_secs(60), || async { Ok(7) })
+         .get_or_try_build(
+            "source",
+            ExpirationPolicy::Absolute(Duration::from_secs(60)),
+            || async { Ok(7) },
+         )
          .await
          .expect("a failed source build must not retain or poison its lock");
 
