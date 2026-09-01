@@ -440,6 +440,15 @@ impl<'a> TimingWalker<'a> {
 /// to zero instead leaves such a track behaving exactly like one carrying no
 /// `edts` at all, which is the same degrade-rather-than-fail policy
 /// `resolve_gop_color` applies to the colour hint.
+///
+/// The two-entry `empty edit + real edit` delay idiom is rejected by the same
+/// rule even though it does reduce to a scalar: the real segment's
+/// `media_time` minus the empty edit's `segment_duration`. That subtraction
+/// needs a conversion this function cannot make, because `segment_duration`
+/// counts in the `mvhd` timescale while `media_time` counts in the `mdhd` one
+/// and only the track is in scope here. So a track delayed that way keeps a
+/// zero offset and every sample lands earlier than authored, by the length of
+/// the empty edit; modelling the idiom is left to a separate change.
 pub fn track_presentation_offset(trak: &[u8]) -> i64 {
    trak
       .nav(&[*b"edts", *b"elst"])
