@@ -309,9 +309,9 @@ Subtitle filters behave as follows:
    * Language matching is ASCII case-insensitive. An empty language is a valid
      filter and normally returns no matches. A `language` filter may still
      select a group of tracks with the same language.
-   * `trackId` takes precedence when both selectors are present. `trackId: 0`
-     selects only the first valid supported track; a positive value selects
-     that exact track and is the narrowest track selector.
+   * When `trackId` is present, `language` is ignored. `trackId: 0` selects
+     only the first valid supported track; a positive value selects that exact
+     track and is the narrowest track selector.
    * A selector with no match returns an empty array.
 
 Unfiltered and language-filtered requests skip recoverably malformed or

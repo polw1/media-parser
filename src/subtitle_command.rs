@@ -101,7 +101,6 @@ async fn subtitle_session(
       .await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn subtitle_tracks(
    sessions: &SubtitleSessions,
    source: &str,
@@ -125,7 +124,6 @@ async fn subtitle_tracks(
       .await?)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn subtitle_envelope(
    sessions: &SubtitleSessions,
    source: &str,
@@ -147,7 +145,6 @@ async fn subtitle_envelope(
 
 /// Extract subtitle tracks, optionally filtered and restricted to a half-open range.
 #[command]
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn get_subtitles(
    source: String,
    track_id: Option<u32>,

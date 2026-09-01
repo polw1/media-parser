@@ -127,7 +127,7 @@ export interface SubtitleInfo {
 export interface SubtitleOptions extends MetadataOptions {
    /**
     * Track selector. `0` selects the first valid supported subtitle track.
-    * When present, this takes precedence over `language`.
+    * When present, `language` is ignored.
     */
    trackId?: number;
    /** Case-insensitive language selector. An empty string is a valid no-match filter. */

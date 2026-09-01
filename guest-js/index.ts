@@ -150,12 +150,12 @@ export async function getThumbnails(
  * Extract subtitle tracks, optionally filtered and restricted to a half-open
  * millisecond range.
  *
- * `trackId` takes precedence over `language`. `trackId: 0` selects the first
- * valid supported subtitle track; without either filter, all valid supported
- * subtitle tracks are returned, but only when their combined work fits the
- * aggregate request budgets. Unfiltered and language-filtered requests skip
- * malformed or unsupported tracks; a selector that matches no track returns an
- * empty array.
+ * When `trackId` is present, `language` is ignored. `trackId: 0` selects the
+ * first valid supported subtitle track; without either filter, all valid
+ * supported subtitle tracks are returned, but only when their combined work
+ * fits the aggregate request budgets. Unfiltered and language-filtered
+ * requests skip malformed or unsupported tracks; a selector that matches no
+ * track returns an empty array.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Optional track/language filter, paired range, and URL headers
