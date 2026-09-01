@@ -36,6 +36,14 @@ const THUMBNAIL_SAMPLE_READ_LIMITS: SampleReadLimits = SampleReadLimits {
    max_coalesce_gap_bytes: 32 * 1024,
 };
 
+// Sample planning lets a lone sample form its own region without re-checking
+// the region ceiling, so a per-sample ceiling above the per-region one would
+// admit a region larger than max_region_bytes. The two literals happen to be
+// equal today; this pins the order rather than the values.
+const _: () = assert!(
+   THUMBNAIL_SAMPLE_READ_LIMITS.max_sample_bytes <= THUMBNAIL_SAMPLE_READ_LIMITS.max_region_bytes
+);
+
 /// Encoding options for extracted thumbnails.
 ///
 /// A struct rather than positional parameters because more knobs are expected

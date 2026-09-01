@@ -378,10 +378,10 @@ fn validate_physical_plan(
    let mut physical_bytes = 0usize;
    let mut regions = 0usize;
    let mut current_region: Option<(u64, usize)> = None;
+   // Phase 1 already rejected any sample above max_sample_bytes, and every
+   // caller asserts max_sample_bytes <= max_region_bytes, so a lone sample
+   // always fits its region and only coalescing can reach the region ceiling.
    for sample in samples {
-      if sample.size > limits.max_region_bytes {
-         return Err(limit_error("sample batch is too large"));
-      }
       if let Some((region_offset, region_size)) = current_region {
          if let Some(merged_size) =
             merged_region_size(region_offset, region_size, sample, coalesce_gap, limits)?
@@ -649,22 +649,25 @@ mod tests {
    }
 
    #[test]
-   fn max_region_bytes_failure_is_a_limit_error() {
+   fn max_region_bytes_partitions_contiguous_samples() {
       let mut budget = SampleReadBudget::default();
-      let error = plan_read_batches(
-         &[1],
-         &fixed_samples(1, 4),
-         &one_sample_per_chunk(),
-         &[0],
+      let batches = plan(
+         &[1, 2],
+         &fixed_samples(2, 1_024),
+         &[0, 1_024],
          SampleReadLimits {
-            max_region_bytes: 3,
+            max_region_bytes: 1_024,
             ..TEST_LIMITS
          },
          &mut budget,
       )
-      .expect_err("region bytes above their configured limit must fail");
+      .expect("samples within the region ceiling must plan as separate regions");
 
-      assert_limit(error, "sample batch is too large");
+      assert_eq!(
+         batches.iter().map(|batch| batch.size).collect::<Vec<_>>(),
+         vec![1_024, 1_024]
+      );
+      assert_eq!(budget.regions, 2);
    }
 
    #[test]

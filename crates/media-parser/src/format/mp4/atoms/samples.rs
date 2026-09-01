@@ -771,10 +771,13 @@ mod tests {
       stsc.extend_from_slice(&1u32.to_be_bytes());
       stsc.extend_from_slice(&1u32.to_be_bytes());
       stsc.push(0);
-      let mut retained = RetainedBudget::new(1024);
+      // A budget too small for a single entry separates the two orders: were
+      // the charge to precede the framing check, this would be the fatal
+      // BudgetExceeded instead of the track-local Invalid.
+      let mut retained = RetainedBudget::new(0);
       assert!(matches!(
          parse_stsc_bounded(&stsc, &mut retained),
-         Err(TableParseError::Invalid(_))
+         Err(TableParseError::Invalid("malformed stsc table"))
       ));
 
       let mut stco = vec![0u8; 8];
@@ -783,9 +786,10 @@ mod tests {
       stco.push(0);
       let mut stbl = Vec::new();
       append_box(&mut stbl, b"stco", &stco);
+      let mut retained = RetainedBudget::new(0);
       assert!(matches!(
          parse_chunk_offsets_bounded(&stbl, &mut retained),
-         Err(TableParseError::Invalid(_))
+         Err(TableParseError::Invalid("malformed chunk offset table"))
       ));
    }
 
