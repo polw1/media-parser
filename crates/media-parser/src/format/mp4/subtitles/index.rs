@@ -655,6 +655,11 @@ fn parse_track(
       tracing::warn!("skipping MP4 trak whose header is too damaged to recover its ID");
       return Ok(TrackParse::Skip);
    };
+   // `chapter_track_ids` only ever holds disabled IDs, so `!track_enabled` is
+   // redundant for well-formed input. It still matters for malformed files:
+   // nothing here rejects or deduplicates `tkhd.id`, so an enabled track can
+   // share its ID with a disabled chapter track, and without this conjunct the
+   // enabled one would be dropped along with it.
    if !tkhd.track_enabled && chapter_track_ids.contains(&tkhd.id) {
       return Ok(TrackParse::Skip);
    }
@@ -1210,6 +1215,26 @@ mod tests {
          .unwrap();
 
       assert_eq!(ready_track_ids(&index), vec![1]);
+   }
+
+   #[tokio::test]
+   async fn enabled_track_survives_a_chapter_id_shared_with_a_disabled_track() {
+      let source = chapter_source_track(10, true, &chapter_reference(&[1]));
+      let chapter = index_track_with_enabled(1, 1, b"text", false);
+      let subtitle = index_track_with_enabled(1, 1, b"tx3g", true);
+      let index = SubtitleIndex::read(&index_fixture(&[source, chapter, subtitle]))
+         .await
+         .unwrap();
+
+      let ready = index
+         .tracks
+         .iter()
+         .filter_map(|track| match track {
+            IndexedTrackState::Ready(track) => Some((track.id, track.codec().to_owned())),
+            IndexedTrackState::Rejected { .. } => None,
+         })
+         .collect::<Vec<_>>();
+      assert_eq!(ready, vec![(1, "tx3g".to_owned())]);
    }
 
    #[tokio::test]

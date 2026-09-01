@@ -35,10 +35,9 @@ fn envelope_task_error(label: &str, error: impl std::fmt::Display) -> crate::Err
 /// `version` they don't recognize rather than guessing at its shape.
 const ENVELOPE_VERSION: u32 = 1;
 const ENVELOPE_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
-const SUBTITLE_ENVELOPE_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 const SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES: usize = br#"{"version":1,"entries":[]}"#.len();
 const SUBTITLE_ENVELOPE_PROJECTED_BASE_BYTES: usize =
-   SUBTITLE_ENVELOPE_PREFIX_BYTES + SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES;
+   ENVELOPE_PREFIX_BYTES + SUBTITLE_ENVELOPE_EMPTY_HEADER_BYTES;
 pub(crate) const MAX_SUBTITLE_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 const SUBTITLE_TRACK_PROJECTION_BYTES: usize = 512;
 const SUBTITLE_CUE_PROJECTION_BYTES: usize = 160;
