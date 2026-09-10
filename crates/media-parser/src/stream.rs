@@ -9,8 +9,8 @@
 use crate::errors::{MediaParserError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE};
+use reqwest::{Client, redirect::Policy};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -344,7 +344,14 @@ impl HttpStreamReader {
    /// Creates a new `HttpStreamReader` with custom HTTP headers.
    ///
    /// Custom headers (e.g., for authentication) will be sent with all requests.
+   /// At most 64 entries are accepted. Redirects to another origin are stopped
+   /// when any headers are configured; same-origin redirects are limited to ten hops.
    pub async fn with_headers(url: &str, headers: HashMap<String, String>) -> Result<Self> {
+      if headers.len() > 64 {
+         return Err(MediaParserError::HttpRequest(
+            "At most 64 HTTP headers are supported".into(),
+         ));
+      }
       let mut header_map = HeaderMap::new();
       for (k, v) in headers {
          let header_name = HeaderName::try_from(k.as_str()).map_err(|e| {
@@ -363,7 +370,21 @@ impl HttpStreamReader {
    }
 
    async fn build_with_headers(url: &str, headers: HeaderMap) -> Result<Self> {
-      let builder = Client::builder()
+      let mut builder = Client::builder();
+      if !headers.is_empty() {
+         builder = builder.redirect(Policy::custom(|attempt| {
+            if attempt
+               .previous()
+               .last()
+               .is_some_and(|previous| previous.origin() == attempt.url().origin())
+            {
+               Policy::default().redirect(attempt)
+            } else {
+               attempt.stop()
+            }
+         }));
+      }
+      let builder = builder
          .default_headers(headers)
          .timeout(Duration::from_secs(30));
       #[cfg(target_os = "android")]
@@ -698,6 +719,91 @@ mod tests {
    // HttpStreamReader tests
    use wiremock::matchers::{header, method};
    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+   #[tokio::test]
+   async fn test_http_header_count_is_limited_before_building_the_client() {
+      for count in [64, 65, 24_576] {
+         let headers = (0..count)
+            .map(|i| (format!("x-test-{i}"), "v".into()))
+            .collect();
+         let result = HttpStreamReader::with_headers("https://example.com/file", headers).await;
+         if count == 64 {
+            assert!(result.is_ok());
+         } else {
+            assert!(
+               matches!(result, Err(MediaParserError::HttpRequest(message)) if message.contains("64"))
+            );
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn test_http_cross_origin_redirects_require_no_configured_headers() {
+      for configured in [true, false] {
+         let source = MockServer::start().await;
+         let target = MockServer::start().await;
+         Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
+            .expect(2)
+            .mount(&source)
+            .await;
+         Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+            .expect(if configured { 0 } else { 2 })
+            .mount(&target)
+            .await;
+         let headers = if configured {
+            HashMap::from([("X-Api-Key".into(), "test-secret".into())])
+         } else {
+            HashMap::new()
+         };
+         let reader = HttpStreamReader::with_headers(&source.uri(), headers)
+            .await
+            .unwrap();
+         let size = reader.size().await;
+         let bytes = reader.read_vec(0, 4).await;
+         if configured {
+            assert!(matches!(size, Err(MediaParserError::HttpStatus(302))));
+            assert!(matches!(bytes, Err(MediaParserError::HttpStatus(302))));
+         } else {
+            assert_eq!(size.unwrap(), 4);
+            assert_eq!(bytes.unwrap(), b"data");
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn test_http_same_origin_redirects_keep_headers_and_the_ten_hop_limit() {
+      let server = MockServer::start().await;
+      Mock::given(header("X-Api-Key", "test-secret"))
+         .respond_with(|request: &wiremock::Request| {
+            let step: usize = request.url.path().trim_start_matches('/').parse().unwrap();
+            if step == 11 {
+               ResponseTemplate::new(200).set_body_bytes(b"data")
+            } else {
+               ResponseTemplate::new(302).insert_header("Location", format!("/{}", step + 1))
+            }
+         })
+         .mount(&server)
+         .await;
+      for (start, allowed) in [(1, true), (0, false)] {
+         let reader = HttpStreamReader::with_headers(
+            &format!("{}/{start}", server.uri()),
+            HashMap::from([("X-Api-Key".into(), "test-secret".into())]),
+         )
+         .await
+         .unwrap();
+         let result = reader.size().await;
+         if allowed {
+            assert_eq!(result.unwrap(), 4);
+            assert_eq!(reader.read_vec(0, 4).await.unwrap(), b"data");
+         } else {
+            assert!(
+               matches!(result, Err(MediaParserError::HttpRequest(message)) if message.contains("redirect"))
+            );
+         }
+      }
+   }
 
    #[tokio::test]
    async fn test_http_read_at_beginning() {
