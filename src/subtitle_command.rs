@@ -12,7 +12,8 @@ use crate::envelope::{
 };
 use crate::session_cache::SessionPool;
 use crate::source::{
-   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration, source_key,
+   DefaultHeaders, MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration,
+   source_key,
 };
 
 const MAX_SUBTITLE_SESSIONS: usize = 8;
@@ -143,6 +144,7 @@ async fn subtitle_envelope(
 
 /// Extract subtitle tracks, optionally filtered and restricted to a half-open range.
 #[command]
+#[allow(clippy::too_many_arguments)] // Tauri exposes each command field as a top-level IPC argument.
 pub(crate) async fn get_subtitles(
    source: String,
    track_id: Option<u32>,
@@ -151,7 +153,9 @@ pub(crate) async fn get_subtitles(
    end_ms: Option<u64>,
    headers: Option<HashMap<String, String>>,
    sessions: State<'_, SubtitleSessions>,
+   defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
+   let headers = defaults.merge(&source, headers);
    let envelope = subtitle_envelope(
       &sessions,
       &source,

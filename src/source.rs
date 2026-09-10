@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use url::Url;
+use url::{Origin, Url};
 
 use media_parser::{FileStreamReader, HttpStreamReader, StreamReader};
 
@@ -11,6 +11,66 @@ use crate::session_cache::ExpirationPolicy;
 const REMOTE_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 const LOCAL_SESSION_TTL: Duration = Duration::from_secs(60);
 pub(crate) const SESSION_REAPER_INTERVAL: Duration = Duration::from_secs(1);
+
+pub(crate) struct DefaultHeaders {
+   headers: HashMap<String, String>,
+   origins: Option<Vec<Origin>>,
+}
+
+impl DefaultHeaders {
+   pub(crate) fn new(
+      headers: HashMap<String, String>,
+      origins: Option<Vec<String>>,
+   ) -> Result<Self> {
+      let origins = origins
+         .map(|origins| {
+            origins
+               .into_iter()
+               .map(|origin| {
+                  let url = Url::parse(&origin).map_err(|error| {
+                     crate::Error::Custom(format!("Invalid default headers origin: {error}"))
+                  })?;
+                  if !matches!(url.scheme(), "http" | "https") {
+                     return Err(crate::Error::Custom(
+                        "Default headers origins must use HTTP(S)".into(),
+                     ));
+                  }
+                  Ok(url.origin())
+               })
+               .collect::<Result<Vec<_>>>()
+         })
+         .transpose()?;
+      Ok(Self { headers, origins })
+   }
+
+   pub(crate) fn merge(
+      &self,
+      source: &str,
+      headers: Option<HashMap<String, String>>,
+   ) -> Option<HashMap<String, String>> {
+      let Ok(url) = Url::parse(source) else {
+         return None;
+      };
+      if !matches!(url.scheme(), "http" | "https") {
+         return None;
+      }
+      if self.headers.is_empty()
+         || self
+            .origins
+            .as_ref()
+            .is_some_and(|origins| !origins.contains(&url.origin()))
+      {
+         return headers;
+      }
+      let mut headers = headers.unwrap_or_default();
+      for (name, value) in &self.headers {
+         if !headers.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+            headers.insert(name.clone(), value.clone());
+         }
+      }
+      Some(headers)
+   }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct MediaSourceKey {
@@ -103,6 +163,87 @@ mod tests {
    use super::*;
    use std::collections::HashMap;
    use std::time::Duration;
+
+   #[test]
+   fn per_call_headers_override_defaults_ignoring_case() {
+      for (default_name, request_name) in [
+         ("x-app-version", "X-App-Version"),
+         ("X-App-Version", "x-app-version"),
+      ] {
+         let defaults = DefaultHeaders::new(
+            HashMap::from([
+               (default_name.into(), "1.0".into()),
+               ("x-other".into(), "keep".into()),
+            ]),
+            None,
+         )
+         .unwrap();
+         let headers = Some(HashMap::from([(request_name.into(), "2.0".into())]));
+         assert_eq!(
+            defaults.merge("https://example.com/video.mp4", headers),
+            Some(HashMap::from([
+               (request_name.into(), "2.0".into()),
+               ("x-other".into(), "keep".into()),
+            ])),
+         );
+      }
+   }
+
+   #[test]
+   fn default_headers_only_reach_normalized_allowed_origins() {
+      let headers = HashMap::from([("authorization".into(), "Bearer test".into())]);
+      let defaults = DefaultHeaders::new(
+         headers.clone(),
+         Some(vec!["https://API.EXAMPLE:443/path".into()]),
+      )
+      .unwrap();
+      assert_eq!(
+         defaults.merge("https://api.example/video.mp4", None),
+         Some(headers)
+      );
+      for source in [
+         "http://api.example/video.mp4",
+         "https://api.example:444/video.mp4",
+         "https://sub.api.example/video.mp4",
+         "https://api.example.evil/video.mp4",
+      ] {
+         let per_call = Some(HashMap::from([("x-call".into(), "keep".into())]));
+         assert_eq!(defaults.merge(source, per_call.clone()), per_call);
+      }
+   }
+
+   #[test]
+   fn absent_origins_are_global_and_empty_origins_allow_none() {
+      let headers = HashMap::from([("user-agent".into(), "app/1.0".into())]);
+      let global = DefaultHeaders::new(headers.clone(), None).unwrap();
+      let empty = DefaultHeaders::new(headers.clone(), Some(vec![])).unwrap();
+      assert_eq!(
+         global.merge("https://any.example/video.mp4", None),
+         Some(headers.clone())
+      );
+      assert_eq!(empty.merge("https://any.example/video.mp4", None), None);
+      for source in [
+         "/tmp/video.mp4",
+         "C:\\video.mp4",
+         "file:///tmp/video.mp4",
+         "https://",
+      ] {
+         assert_eq!(global.merge(source, Some(headers.clone())), None);
+         assert_eq!(empty.merge(source, Some(headers.clone())), None);
+      }
+   }
+
+   #[test]
+   fn invalid_default_header_origins_are_rejected() {
+      for origin in [
+         "not a URL",
+         "file:///tmp/video.mp4",
+         "ftp://api.example",
+         "https://",
+      ] {
+         assert!(DefaultHeaders::new(HashMap::new(), Some(vec![origin.into()])).is_err());
+      }
+   }
 
    #[tokio::test]
    async fn remote_source_key_normalizes_header_names_and_order() {

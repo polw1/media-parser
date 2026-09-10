@@ -12,7 +12,8 @@ use crate::Result;
 use crate::envelope::{cover_envelope, encode_thumbnail_envelope, run_envelope_task};
 use crate::session_cache::SessionPool;
 use crate::source::{
-   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration, source_key,
+   DefaultHeaders, MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration,
+   source_key,
 };
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
@@ -103,7 +104,9 @@ async fn thumbnail_frames(
 pub(crate) async fn get_metadata(
    source: String,
    headers: Option<HashMap<String, String>>,
+   defaults: State<'_, DefaultHeaders>,
 ) -> Result<Metadata> {
+   let headers = defaults.merge(&source, headers);
    let reader = open_reader(&source, headers.as_ref()).await?;
    MediaParser::new(reader.as_ref())
       .metadata()
@@ -116,7 +119,9 @@ pub(crate) async fn get_metadata(
 pub(crate) async fn get_tracks(
    source: String,
    headers: Option<HashMap<String, String>>,
+   defaults: State<'_, DefaultHeaders>,
 ) -> Result<Vec<TrackInfo>> {
+   let headers = defaults.merge(&source, headers);
    let reader = open_reader(&source, headers.as_ref()).await?;
    let tracks = MediaParser::new(reader.as_ref())
       .tracks()
@@ -131,7 +136,9 @@ pub(crate) async fn get_tracks(
 pub(crate) async fn get_cover(
    source: String,
    headers: Option<HashMap<String, String>>,
+   defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
+   let headers = defaults.merge(&source, headers);
    let reader = open_reader(&source, headers.as_ref()).await?;
    let cover = MediaParser::new(reader.as_ref())
       .cover()
@@ -154,7 +161,9 @@ pub(crate) async fn get_thumbnails(
    max_height: Option<u32>,
    headers: Option<HashMap<String, String>>,
    sessions: State<'_, ThumbnailSessions>,
+   defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
+   let headers = defaults.merge(&source, headers);
    let (unique_timestamps, order) = prepare_thumbnail_timestamps(&timestamps)?;
    let options = thumbnail_options(quality, max_width, max_height)?;
    let frames = thumbnail_frames(
