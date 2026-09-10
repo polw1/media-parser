@@ -47,7 +47,7 @@
 //! decoded cue text. Reuse it for repeated range requests over the same source:
 //!
 //! ```no_run
-//! use std::time::Duration;
+//! use std::{sync::Arc, time::Duration};
 //! use media_parser::{
 //!     FileStreamReader, TrackFilter,
 //!     format::mp4::SubtitleIndex,
@@ -55,8 +55,8 @@
 //!
 //! # async fn example() -> media_parser::Result<()> {
 //! let reader = FileStreamReader::new("video.mp4")?;
-//! let index = SubtitleIndex::read(&reader).await?;
-//! let tracks = index
+//! let index = Arc::new(SubtitleIndex::read(&reader).await?);
+//! let tracks = Arc::clone(&index)
 //!     .subtitles(
 //!         &reader,
 //!         Some(TrackFilter::Language("eng".into())),

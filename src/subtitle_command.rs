@@ -113,13 +113,11 @@ async fn subtitle_tracks(
    let request = prepare_subtitle_request(track_id, language, start_ms, end_ms)?;
    let session = subtitle_session(sessions, source, headers).await?;
    if request.first_track_only {
-      return Ok(session
-         .index
+      return Ok(Arc::clone(&session.index)
          .subtitles_first(session.reader.as_ref(), request.range)
          .await?);
    }
-   Ok(session
-      .index
+   Ok(Arc::clone(&session.index)
       .subtitles(session.reader.as_ref(), request.filter, request.range)
       .await?)
 }

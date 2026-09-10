@@ -3,6 +3,7 @@ use media_parser::format::mp4::{SubtitleIndex, read_subtitles, read_subtitles_in
 use media_parser::{
    MediaParser, MediaParserError, Result, StreamReader, TrackFilter, parse_subtitles,
 };
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -782,9 +783,9 @@ async fn high_level_subtitles_unknown_format_reads_one_header() {
 #[tokio::test]
 async fn public_mp4_subtitle_apis_extract_and_reuse_index() {
    let reader = BytesReader(subtitle_mp4());
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
 
-   let indexed = index
+   let indexed = Arc::clone(&index)
       .subtitles(&reader, None, None)
       .await
       .expect("extract indexed subtitles");
@@ -829,9 +830,9 @@ async fn hardening_invalid_ranges_perform_no_reads() {
    }
    assert_eq!(reader.reads(), 0);
 
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
    let reads_after_index = reader.reads();
-   index
+   Arc::clone(&index)
       .subtitles(
          &reader,
          None,
@@ -863,16 +864,16 @@ async fn hardening_track_local_decode_failure_never_returns_a_partial_track() {
    let text = find_bytes(&bytes, b"First");
    bytes[text - 2..text].copy_from_slice(&u16::MAX.to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
 
-   let broad = index
+   let broad = Arc::clone(&index)
       .subtitles(&reader, None, None)
       .await
       .expect("broad request skips bad track");
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
 
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit bad track reports its decode error");
@@ -884,10 +885,10 @@ async fn hardening_invalid_first_track_offset_is_skipped_broadly_and_by_language
    let first_stco = find_bytes(&bytes, b"stco") + 12;
    bytes[first_stco..first_stco + 4].copy_from_slice(&u32::MAX.to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
 
    for filter in [None, Some(TrackFilter::Language("eng".to_owned()))] {
-      let tracks = index
+      let tracks = Arc::clone(&index)
          .subtitles(&reader, filter, None)
          .await
          .expect("track-local offset failure is skipped");
@@ -895,7 +896,7 @@ async fn hardening_invalid_first_track_offset_is_skipped_broadly_and_by_language
       assert_eq!(tracks[0].base.id, 2);
    }
 
-   let error = index
+   let error = Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit malformed track reports its sample offset error");
@@ -914,15 +915,15 @@ async fn hardening_short_first_track_read_is_track_local_but_reader_error_is_fat
       fault_offset: first_sample,
       short_read: true,
    };
-   let index = SubtitleIndex::read(&short).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&short).await.expect("build index"));
 
-   let tracks = index
+   let tracks = Arc::clone(&index)
       .subtitles(&short, Some(TrackFilter::Language("eng".to_owned())), None)
       .await
       .expect("short sample data skips only the first track");
    assert_eq!(tracks.len(), 1);
    assert_eq!(tracks[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&short, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit truncated track errors");
@@ -933,7 +934,7 @@ async fn hardening_short_first_track_read_is_track_local_but_reader_error_is_fat
       short_read: false,
    };
    let fatal_index = SubtitleIndex::read(&fatal).await.expect("build index");
-   let error = fatal_index
+   let error = Arc::new(fatal_index)
       .subtitles(&fatal, None, None)
       .await
       .expect_err("reader I/O failure aborts a broad request");
@@ -984,10 +985,10 @@ async fn hardening_range_selection_reads_only_overlapping_samples() {
    let first_sample = u64::try_from(find_bytes(&bytes, &[0, 5, b'F', b'i'])).unwrap();
    let second_sample = u64::try_from(find_bytes(&bytes, &[0, 6, b'S', b'e'])).unwrap();
    let reader = CountingReader::new(bytes);
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
    let reads_after_index = reader.ranges().len();
 
-   let tracks = index
+   let tracks = Arc::clone(&index)
       .subtitles(
          &reader,
          Some(TrackFilter::TrackId(1)),
@@ -1015,10 +1016,10 @@ async fn hardening_distant_chunks_are_read_as_separate_batches() {
    let (bytes, first_sample, second_sample) = multi_chunk_subtitle_mp4();
    let sizes = (tx3g("First").len(), tx3g("Second").len());
    let reader = CountingReader::new(bytes);
-   let index = SubtitleIndex::read(&reader).await.expect("build index");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("build index"));
    let reads_after_index = reader.ranges().len();
 
-   let tracks = index
+   let tracks = Arc::clone(&index)
       .subtitles(&reader, None, None)
       .await
       .expect("extract both chunks");
@@ -1105,14 +1106,19 @@ async fn hardening_unsupported_codec_is_skipped_broadly_and_errors_explicitly() 
    let codec = find_bytes(&bytes, b"tx3g");
    bytes[codec..codec + 4].copy_from_slice(b"junk");
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("index rejected track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("index rejected track"),
+   );
 
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
+      .await
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit unsupported track errors");
@@ -1121,9 +1127,9 @@ async fn hardening_unsupported_codec_is_skipped_broadly_and_errors_explicitly() 
 #[tokio::test]
 async fn subtitles_first_returns_only_the_first_track_in_physical_order() {
    let reader = BytesReader(subtitle_mp4());
-   let index = SubtitleIndex::read(&reader).await.expect("index subtitles");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("index subtitles"));
 
-   let tracks = index
+   let tracks = Arc::clone(&index)
       .subtitles_first(&reader, None)
       .await
       .expect("extract first subtitle track");
@@ -1138,11 +1144,13 @@ async fn subtitles_first_skips_a_rejected_track_before_returning() {
    let codec = find_bytes(&bytes, b"tx3g");
    bytes[codec..codec + 4].copy_from_slice(b"junk");
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("index rejected first track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("index rejected first track"),
+   );
 
-   let tracks = index
+   let tracks = Arc::clone(&index)
       .subtitles_first(&reader, None)
       .await
       .expect("skip rejected track and extract next valid track");
@@ -1158,14 +1166,19 @@ async fn hardening_malformed_table_is_retained_as_a_track_rejection() {
    let sample_count = stsz + 12;
    bytes[sample_count..sample_count + 4].copy_from_slice(&3u32.to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("index rejected track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("index rejected track"),
+   );
 
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
+      .await
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   let error = index
+   let error = Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit malformed track errors");
@@ -1179,14 +1192,19 @@ async fn hardening_variable_stsz_count_above_limit_is_a_track_rejection() {
    let sample_count = stsz + 12;
    bytes[sample_count..sample_count + 4].copy_from_slice(&u32::MAX.to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("oversized malformed stsz should reject only its track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("oversized malformed stsz should reject only its track"),
+   );
 
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
+      .await
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit malformed variable-size track errors");
@@ -1200,16 +1218,16 @@ async fn hardening_oversized_sample_preserves_sibling_unless_explicitly_selected
    bytes[first_sample_size..first_sample_size + 4]
       .copy_from_slice(&(2 * 1024 * 1024u32).to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader).await.expect("index subtitles");
+   let index = Arc::new(SubtitleIndex::read(&reader).await.expect("index subtitles"));
 
-   let broad = index
+   let broad = Arc::clone(&index)
       .subtitles(&reader, None, None)
       .await
       .expect("an oversized sample must reject only its track");
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
 
-   let error = index
+   let error = Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("an explicitly selected oversized track must fail");
@@ -1224,14 +1242,19 @@ async fn hardening_oversized_sample_preserves_sibling_unless_explicitly_selected
 #[tokio::test]
 async fn hardening_fixed_stsz_count_mismatch_is_a_track_rejection() {
    let reader = BytesReader(fixed_stsz_count_mismatch_mp4());
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("inconsistent fixed stsz should reject only its track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("inconsistent fixed stsz should reject only its track"),
+   );
 
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
+      .await
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit malformed fixed-size track errors");
@@ -1245,10 +1268,15 @@ async fn assert_oversized_table_count_is_track_local(fourcc: [u8; 4]) {
    bytes[table + 8..table + 12].copy_from_slice(&u32::MAX.to_be_bytes());
    let reader = BytesReader(bytes);
 
-   let index = SubtitleIndex::read(&reader)
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("oversized malformed table should reject only its track"),
+   );
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
       .await
-      .expect("oversized malformed table should reject only its track");
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
 }
@@ -1285,14 +1313,19 @@ async fn hardening_invalid_sample_description_reference_is_track_local() {
    let description_index = stsc + 20;
    bytes[description_index..description_index + 4].copy_from_slice(&2u32.to_be_bytes());
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
-      .await
-      .expect("index rejected track");
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("index rejected track"),
+   );
 
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
+      .await
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit invalid description reference errors");
@@ -1300,13 +1333,18 @@ async fn hardening_invalid_sample_description_reference_is_track_local() {
 
 async fn assert_description_policy_rejects_track(bytes: Vec<u8>) {
    let reader = BytesReader(bytes);
-   let index = SubtitleIndex::read(&reader)
+   let index = Arc::new(
+      SubtitleIndex::read(&reader)
+         .await
+         .expect("index rejected description policy track"),
+   );
+   let broad = Arc::clone(&index)
+      .subtitles(&reader, None, None)
       .await
-      .expect("index rejected description policy track");
-   let broad = index.subtitles(&reader, None, None).await.unwrap();
+      .unwrap();
    assert_eq!(broad.len(), 1);
    assert_eq!(broad[0].base.id, 2);
-   index
+   Arc::clone(&index)
       .subtitles(&reader, Some(TrackFilter::TrackId(1)), None)
       .await
       .expect_err("explicit rejected description track errors");

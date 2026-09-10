@@ -19,12 +19,13 @@ use crate::format::mp4::atoms::{
    validate_sample_tables,
 };
 use crate::format::mp4::sample_io::{
-   SampleReadBudget, SampleReadError, SampleReadLimits, read_samples_coalesced_classified,
+   SampleData, SampleReadBudget, SampleReadError, SampleReadLimits, plan_read_batches,
+   read_planned_batches,
 };
 use crate::format::validate_subtitle_range;
 use crate::stream::StreamReader;
 use crate::types::{BaseTrackMeta, SubtitleCue, SubtitleTrack, TrackFilter};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -235,8 +236,10 @@ impl SubtitleIndex {
    /// Ranges are half-open `[start, end)` and returned times stay absolute to
    /// the source. Container-wide, I/O, and aggregate-budget failures reject the
    /// whole request rather than returning a partial result.
+   /// Selection/planning and decoding run on the blocking pool, with async I/O
+   /// between them. Clone the index Arc to retain it for subsequent requests.
    pub async fn subtitles(
-      &self,
+      self: Arc<Self>,
       reader: &dyn StreamReader,
       filter: Option<TrackFilter>,
       range: Option<(Duration, Duration)>,
@@ -251,7 +254,7 @@ impl SubtitleIndex {
    ///
    /// Recoverably malformed or unsupported tracks are skipped while searching.
    pub async fn subtitles_first(
-      &self,
+      self: Arc<Self>,
       reader: &dyn StreamReader,
       range: Option<(Duration, Duration)>,
    ) -> Result<Vec<SubtitleTrack>> {
@@ -262,7 +265,7 @@ impl SubtitleIndex {
    }
 
    async fn subtitles_first_with_limits(
-      &self,
+      self: Arc<Self>,
       reader: &dyn StreamReader,
       range: Option<(Duration, Duration)>,
       limits: RequestLimits,
@@ -280,7 +283,7 @@ impl SubtitleIndex {
    }
 
    async fn subtitles_with_limits(
-      &self,
+      self: Arc<Self>,
       reader: &dyn StreamReader,
       filter: Option<TrackFilter>,
       range: Option<(Duration, Duration)>,
@@ -299,7 +302,7 @@ impl SubtitleIndex {
    }
 
    async fn subtitles_with_request_and_read_limits(
-      &self,
+      self: Arc<Self>,
       reader: &dyn StreamReader,
       filter: Option<TrackFilter>,
       range: Option<(Duration, Duration)>,
@@ -311,7 +314,7 @@ impl SubtitleIndex {
       let mut sample_read_budget = SampleReadBudget::default();
       let mut request = RequestBudget::new(limits);
 
-      for indexed in &self.tracks {
+      for (track_position, indexed) in self.tracks.iter().enumerate() {
          let track = match indexed {
             IndexedTrackState::Rejected { id, reason } => {
                if matches!(filter.as_ref(), Some(TrackFilter::TrackId(wanted)) if wanted == id) {
@@ -332,33 +335,45 @@ impl SubtitleIndex {
             continue;
          }
 
-         let selected = match select_cues(track, range, &mut request) {
-            Ok(selected) => selected,
-            Err(SelectCuesError::Track(error)) => {
-               handle_track_failure(filter.as_ref(), track.id, error)?;
-               continue;
-            }
-            Err(SelectCuesError::Fatal(error)) => return Err(error),
-         };
-         let mut sample_indices = Vec::new();
-         sample_indices
-            .try_reserve_exact(selected.len())
-            .map_err(|_| {
-               MediaParserError::Other("MP4 subtitle sample selection allocation failed".to_owned())
-            })?;
-         sample_indices.extend(selected.iter().map(|cue| cue.sample_index));
-         let samples = match read_samples_coalesced_classified(
-            reader,
-            &sample_indices,
-            &track.sizes,
-            &track.stsc,
-            &track.chunk_offsets,
-            sample_read_limits,
-            &mut sample_read_budget,
-         )
-         .await
-         {
-            Ok(samples) => samples,
+         let index = Arc::clone(&self);
+         let (returned_request, returned_read_budget, planned) =
+            tokio::task::spawn_blocking(move || {
+               let IndexedTrackState::Ready(track) = &index.tracks[track_position] else {
+                  unreachable!("selected track is ready");
+               };
+               let result = (|| {
+                  let selected =
+                     select_cues(track, range, &mut request).map_err(|error| match error {
+                        SelectCuesError::Track(error) => SampleReadError::Track(error),
+                        SelectCuesError::Fatal(error) => SampleReadError::Fatal(error),
+                     })?;
+                  let mut sample_indices = Vec::new();
+                  sample_indices
+                     .try_reserve_exact(selected.len())
+                     .map_err(|_| {
+                        SampleReadError::Fatal(MediaParserError::Other(
+                           "MP4 subtitle sample selection allocation failed".to_owned(),
+                        ))
+                     })?;
+                  sample_indices.extend(selected.iter().map(|cue| cue.sample_index));
+                  let batches = plan_read_batches(
+                     &sample_indices,
+                     &track.sizes,
+                     &track.stsc,
+                     &track.chunk_offsets,
+                     sample_read_limits,
+                     &mut sample_read_budget,
+                  )?;
+                  Ok((selected, batches))
+               })();
+               (request, sample_read_budget, result)
+            })
+            .await
+            .map_err(subtitle_task_error)?;
+         request = returned_request;
+         sample_read_budget = returned_read_budget;
+         let (selected, batches) = match planned {
+            Ok(plan) => plan,
             Err(SampleReadError::Track(error)) => {
                handle_track_failure(filter.as_ref(), track.id, error)?;
                continue;
@@ -372,64 +387,100 @@ impl SubtitleIndex {
             }
             Err(SampleReadError::Fatal(error)) => return Err(error),
          };
+         let samples = match read_planned_batches(reader, batches).await {
+            Ok(samples) => samples,
+            Err(SampleReadError::Track(error)) => {
+               handle_track_failure(filter.as_ref(), track.id, error)?;
+               continue;
+            }
+            Err(error) => return Err(error.into_media_error()),
+         };
 
-         let mut cues = Vec::new();
-         cues.try_reserve_exact(selected.len()).map_err(|_| {
-            MediaParserError::Other("MP4 subtitle cue allocation failed".to_owned())
-         })?;
-         let mut track_error = None;
-         for selected_cue in selected {
-            let Some(data) = samples.get(&selected_cue.sample_index) else {
-               track_error = Some(MediaParserError::InvalidFormat(format!(
-                  "missing subtitle sample {}",
-                  selected_cue.sample_index
-               )));
-               break;
+         let index = Arc::clone(&self);
+         let (returned_request, decoded) = tokio::task::spawn_blocking(move || {
+            let IndexedTrackState::Ready(track) = &index.tracks[track_position] else {
+               unreachable!("selected track is ready");
             };
-            let text = match decode_sample(track.codec(), data.as_slice()) {
-               Ok(Some(text)) => text,
-               Ok(None) => continue,
-               Err(DecodeSampleError::Track(error)) => {
-                  track_error = Some(error);
-                  break;
-               }
-               Err(DecodeSampleError::Fatal(error)) => return Err(error),
-            };
-            request.charge_decoded_text(text.len())?;
-            request.charge_cue(1)?;
-            cues.push(SubtitleCue {
-               cue_id: selected_cue.sample_index,
-               start_time: selected_cue.start_time,
-               end_time: selected_cue.end_time,
-               text,
-            });
-         }
-         if let Some(error) = track_error {
-            handle_track_failure(filter.as_ref(), track.id, error)?;
-            continue;
-         }
-
-         let properties = track_properties(track.handler, track.sizes.sample_count, cues.len())?;
+            let result = decode_track(track, selected, samples, &mut request);
+            (request, result)
+         })
+         .await
+         .map_err(subtitle_task_error)?;
+         request = returned_request;
+         let decoded = match decoded {
+            Ok(track) => track,
+            Err(DecodeSampleError::Track(error)) => {
+               handle_track_failure(filter.as_ref(), track.id, error)?;
+               continue;
+            }
+            Err(DecodeSampleError::Fatal(error)) => return Err(error),
+         };
          output.try_reserve(1).map_err(|_| {
             MediaParserError::Other("MP4 subtitle track allocation failed".to_owned())
          })?;
-         output.push(SubtitleTrack {
-            base: BaseTrackMeta {
-               id: track.id,
-               codec: output_string(track.codec())?,
-               language: track.language.as_deref().map(output_string).transpose()?,
-               timescale: track.timescale,
-               duration: track.duration,
-               properties,
-            },
-            cues,
-         });
+         output.push(decoded);
          if first_track_only {
             break;
          }
       }
       Ok(output)
    }
+}
+
+fn subtitle_task_error(error: tokio::task::JoinError) -> MediaParserError {
+   MediaParserError::BlockingTask(format!("subtitle extraction task failed: {error}"))
+}
+
+fn decode_track(
+   track: &IndexedTrack,
+   selected: Vec<SelectedCue>,
+   samples: HashMap<u32, SampleData>,
+   request: &mut RequestBudget,
+) -> std::result::Result<SubtitleTrack, DecodeSampleError> {
+   use DecodeSampleError::{Fatal, Track};
+   let mut cues = Vec::new();
+   cues.try_reserve_exact(selected.len()).map_err(|_| {
+      Fatal(MediaParserError::Other(
+         "MP4 subtitle cue allocation failed".to_owned(),
+      ))
+   })?;
+   for selected_cue in selected {
+      let data = samples.get(&selected_cue.sample_index).ok_or_else(|| {
+         Track(MediaParserError::InvalidFormat(format!(
+            "missing subtitle sample {}",
+            selected_cue.sample_index
+         )))
+      })?;
+      let Some(text) = decode_sample(track.codec(), data.as_slice())? else {
+         continue;
+      };
+      request.charge_decoded_text(text.len()).map_err(Fatal)?;
+      request.charge_cue(1).map_err(Fatal)?;
+      cues.push(SubtitleCue {
+         cue_id: selected_cue.sample_index,
+         start_time: selected_cue.start_time,
+         end_time: selected_cue.end_time,
+         text,
+      });
+   }
+   let properties =
+      track_properties(track.handler, track.sizes.sample_count, cues.len()).map_err(Fatal)?;
+   Ok(SubtitleTrack {
+      base: BaseTrackMeta {
+         id: track.id,
+         codec: output_string(track.codec()).map_err(Fatal)?,
+         language: track
+            .language
+            .as_deref()
+            .map(output_string)
+            .transpose()
+            .map_err(Fatal)?,
+         timescale: track.timescale,
+         duration: track.duration,
+         properties,
+      },
+      cues,
+   })
 }
 
 fn subtitle_limit_error(
@@ -485,8 +536,7 @@ pub async fn read_subtitles_in_range(
    range: Option<(Duration, Duration)>,
 ) -> Result<Vec<SubtitleTrack>> {
    validate_subtitle_range(range)?;
-   SubtitleIndex::read(reader)
-      .await?
+   Arc::new(SubtitleIndex::read(reader).await?)
       .subtitles(reader, filter, range)
       .await
 }
@@ -508,12 +558,15 @@ impl From<MediaParserError> for TrackReject {
    }
 }
 
-/// Rejects the track on malformed table data and the whole request on a budget
-/// or allocation failure, sharing [`table_fatal`]'s mapping for the latter.
+/// Rejects malformed or individually oversized tracks locally. Cumulative
+/// exhaustion and allocation failures reject the whole request.
 fn retained<T>(result: TableResult<T>) -> std::result::Result<T, TrackReject> {
    match result {
       Ok(value) => Ok(value),
       Err(TableParseError::Invalid(reason)) => Err(TrackReject::Reason(reason)),
+      Err(TableParseError::TrackTooLarge) => Err(TrackReject::Reason(
+         "MP4 subtitle track retained budget exceeded",
+      )),
       Err(fatal) => Err(TrackReject::Fatal(table_fatal(fatal))),
    }
 }
@@ -664,7 +717,10 @@ fn parse_track(
       return Ok(TrackParse::Skip);
    }
    let id = tkhd.id;
-   match indexed_track(trak, id, budget) {
+   budget.retained.begin_track();
+   let result = indexed_track(trak, id, budget);
+   budget.retained.end_track();
+   match result {
       Ok(track) => Ok(TrackParse::Ready(track)),
       Err(TrackReject::Skip) => Ok(TrackParse::Skip),
       Err(TrackReject::Reason(reason)) => Ok(TrackParse::Rejected { id, reason }),
@@ -775,7 +831,7 @@ fn indexed_track(
    }
 
    let language = match mdhd.language {
-      Some(language) => Some(retained_language(language, &mut budget.retained)?),
+      Some(language) => Some(retained(retained_language(language, &mut budget.retained))?),
       None => None,
    };
    Ok(IndexedTrack {
@@ -796,20 +852,17 @@ fn indexed_track(
 
 fn retained_language(
    language: [u8; 3],
-   retained: &mut crate::format::mp4::atoms::RetainedBudget,
-) -> Result<String> {
-   retained.charge_bytes(language.len()).map_err(table_fatal)?;
+   budget: &mut crate::format::mp4::atoms::RetainedBudget,
+) -> TableResult<String> {
+   budget.charge_bytes(language.len())?;
    let mut value = String::new();
    value
       .try_reserve_exact(language.len())
-      .map_err(|_| MediaParserError::Other("MP4 subtitle index allocation failed".to_owned()))?;
-   retained
-      .charge_bytes(value.capacity().saturating_sub(language.len()))
-      .map_err(table_fatal)?;
+      .map_err(|_| TableParseError::AllocationFailed)?;
+   budget.charge_bytes(value.capacity().saturating_sub(language.len()))?;
    value.push_str(
-      std::str::from_utf8(&language).map_err(|_| {
-         MediaParserError::InvalidFormat("invalid MP4 subtitle language".to_owned())
-      })?,
+      std::str::from_utf8(&language)
+         .map_err(|_| TableParseError::Invalid("invalid MP4 subtitle language"))?,
    );
    Ok(value)
 }
@@ -817,7 +870,7 @@ fn retained_language(
 fn table_fatal(error: TableParseError) -> MediaParserError {
    match error {
       TableParseError::Invalid(reason) => MediaParserError::InvalidFormat(reason.to_owned()),
-      TableParseError::BudgetExceeded => {
+      TableParseError::BudgetExceeded | TableParseError::TrackTooLarge => {
          MediaParserError::Other("MP4 subtitle index retained budget exceeded".to_owned())
       }
       TableParseError::AllocationFailed => {
@@ -1171,7 +1224,7 @@ mod tests {
    ) -> MediaParserError {
       let mut limits = SUBTITLE_READ_LIMITS;
       limits.max_logical_bytes = 2;
-      one_cue_index()
+      Arc::new(one_cue_index())
          .subtitles_with_request_and_read_limits(
             &BytesReader(vec![0, 1, b'x']),
             filter,
@@ -1316,10 +1369,121 @@ mod tests {
       ));
    }
 
+   #[test]
+   fn extraction_waits_for_blocking_pool() {
+      let runtime = tokio::runtime::Builder::new_current_thread()
+         .max_blocking_threads(1)
+         .build()
+         .unwrap();
+      let (started_tx, started_rx) = std::sync::mpsc::channel();
+      let (release_tx, release_rx) = std::sync::mpsc::channel();
+      let blocker = runtime.spawn_blocking(move || {
+         started_tx.send(()).unwrap();
+         let _ = release_rx.recv();
+      });
+      started_rx.recv().unwrap();
+      runtime.block_on(async {
+         let reader = BytesReader(vec![0, 1, b'x']);
+         let extraction = Arc::new(one_cue_index()).subtitles(&reader, None, None);
+         tokio::pin!(extraction);
+         // This in-memory reader completes immediately, so an inline extraction
+         // would return Ready even while the only blocking worker is occupied.
+         let pending = futures::poll!(extraction.as_mut()).is_pending();
+         release_tx.send(()).unwrap();
+         assert!(pending, "selection must wait for the blocking worker");
+         let tracks = extraction.await.unwrap();
+         assert_eq!(tracks[0].cues[0].text, "x");
+         blocker.await.unwrap();
+      });
+   }
+
+   #[tokio::test]
+   async fn local_decode_error_returns_all_cumulative_budgets_without_refund() {
+      let mut first = one_cue_track(1, 0);
+      let IndexedTrackState::Ready(track) = &mut first else {
+         unreachable!()
+      };
+      let stts = full_box(
+         b"stts",
+         &[2u32, 1, 1000, 1, 1000]
+            .iter()
+            .flat_map(|value| value.to_be_bytes())
+            .collect::<Vec<_>>(),
+      );
+      track.timing = SampleTimingTable::parse(&stts[8..], &mut RetainedBudget::new(1024)).unwrap();
+      track.sizes = SampleSizes::fixed(2, 3).unwrap();
+      track.stsc[0].samples_per_chunk = 2;
+      let index = Arc::new(SubtitleIndex {
+         tracks: vec![first, one_cue_track(2, 6)],
+      });
+      let reader = BytesReader(vec![0, 1, b'x', 0, 2, b'!', 0, 1, b'y']);
+      let baseline = RequestLimits {
+         max_samples: 3,
+         max_cues: 2,
+         max_decoded_text_bytes: 2,
+      };
+      let tracks = Arc::clone(&index)
+         .subtitles_with_limits(&reader, None, None, baseline)
+         .await
+         .unwrap();
+      assert_eq!(tracks.len(), 1);
+      assert_eq!(tracks[0].base.id, 2);
+      assert_eq!(tracks[0].cues[0].text, "y");
+      for limits in [
+         RequestLimits {
+            max_samples: 2,
+            ..baseline
+         },
+         RequestLimits {
+            max_cues: 1,
+            ..baseline
+         },
+         RequestLimits {
+            max_decoded_text_bytes: 1,
+            ..baseline
+         },
+      ] {
+         assert!(matches!(
+            Arc::clone(&index)
+               .subtitles_with_limits(&reader, None, None, limits)
+               .await,
+            Err(MediaParserError::Other(_))
+         ));
+      }
+      let read_limits = SampleReadLimits {
+         max_samples: 2,
+         ..SUBTITLE_READ_LIMITS
+      };
+      assert!(
+         matches!(Arc::clone(&index).subtitles_with_request_and_read_limits(
+         &reader, None, None, baseline, read_limits, false).await,
+         Err(MediaParserError::Other(reason)) if reason.contains("too many samples"))
+      );
+   }
+
+   #[test]
+   fn retained_language_uses_track_local_classification() {
+      let mut budget = RetainedBudget::new(3);
+      budget.begin_track();
+      assert_eq!(retained_language(*b"eng", &mut budget).unwrap(), "eng");
+      assert!(matches!(
+         retained(retained_language(*b"eng", &mut budget)),
+         Err(TrackReject::Reason(_))
+      ));
+      assert_eq!(budget.used_bytes(), 3);
+      budget.end_track();
+      budget.begin_track();
+      assert!(matches!(
+         retained(retained_language(*b"eng", &mut budget)),
+         Err(TrackReject::Fatal(MediaParserError::Other(_)))
+      ));
+      assert_eq!(budget.used_bytes(), 3);
+   }
+
    #[tokio::test]
    async fn request_limits_accept_exact_boundaries() {
-      let index = one_cue_index();
-      let tracks = index
+      let index = Arc::new(one_cue_index());
+      let tracks = Arc::clone(&index)
          .subtitles_with_limits(
             &BytesReader(vec![0, 1, b'x']),
             None,
@@ -1338,9 +1502,9 @@ mod tests {
 
    #[tokio::test]
    async fn first_track_limit_stops_before_aggregate_request_budget_is_exhausted() {
-      let index = SubtitleIndex {
+      let index = Arc::new(SubtitleIndex {
          tracks: vec![one_cue_track(1, 0), one_cue_track(2, 3)],
-      };
+      });
       let reader = BytesReader(vec![0, 1, b'x', 0, 1, b'y']);
       let limits = RequestLimits {
          max_samples: 1,
@@ -1348,11 +1512,11 @@ mod tests {
          max_decoded_text_bytes: 1,
       };
 
-      index
+      Arc::clone(&index)
          .subtitles_with_limits(&reader, None, None, limits)
          .await
          .expect_err("decoding both tracks should exhaust the aggregate budget");
-      let tracks = index
+      let tracks = Arc::clone(&index)
          .subtitles_first_with_limits(&reader, None, limits)
          .await
          .expect("the first track fits the same budget by itself");
@@ -1364,7 +1528,7 @@ mod tests {
 
    #[tokio::test]
    async fn request_limits_reject_one_over_each_boundary() {
-      let index = one_cue_index();
+      let index = Arc::new(one_cue_index());
       let reader = BytesReader(vec![0, 1, b'x']);
       let baseline = RequestLimits {
          max_samples: 1,
@@ -1385,11 +1549,59 @@ mod tests {
             ..baseline
          },
       ] {
-         index
+         Arc::clone(&index)
             .subtitles_with_limits(&reader, None, None, limits)
             .await
             .expect_err("one-over request boundary");
       }
+   }
+
+   fn oversized_stco_track() -> Vec<u8> {
+      let mut track = index_track(1, 1, b"tx3g");
+      let count = MAX_RETAINED_INDEX_BYTES / 8 + 1;
+      let stco = track.windows(4).position(|bytes| bytes == b"stco").unwrap() - 4;
+      let growth = (count - 1) * 4;
+      for name in [b"trak", b"mdia", b"minf", b"stbl", b"stco"] {
+         let offset = track.windows(4).position(|bytes| bytes == name).unwrap() - 4;
+         let size = u32::from_be_bytes(track[offset..offset + 4].try_into().unwrap());
+         track[offset..offset + 4].copy_from_slice(&(size + growth as u32).to_be_bytes());
+      }
+      track[stco + 12..stco + 16].copy_from_slice(&(count as u32).to_be_bytes());
+      track.resize(track.len() + growth, 0);
+      track
+   }
+
+   #[tokio::test]
+   async fn framing_valid_oversized_stco_preserves_sibling_and_partial_charges() {
+      let reader = index_fixture(&[oversized_stco_track(), index_track(2, 1, b"tx3g")]);
+      let (index, usage) = SubtitleIndex::build_with_limits(
+         &reader,
+         MAX_TRAKS,
+         MAX_INDEXED_SUBTITLE_SAMPLES,
+         MAX_RETAINED_INDEX_BYTES,
+      )
+      .await
+      .expect("oversized stco is a local rejection");
+      assert_eq!(ready_track_ids(&index), vec![2]);
+      assert!(
+         usage.retained_bytes > independently_measured_retained_bytes(&index),
+         "tables parsed before the refused stco remain charged"
+      );
+      let index = Arc::new(index);
+      let range = Some((Duration::from_secs(2), Duration::from_secs(3)));
+      assert_eq!(
+         Arc::clone(&index)
+            .subtitles(&reader, None, range)
+            .await
+            .unwrap()[0]
+            .base
+            .id,
+         2
+      );
+      assert!(
+         matches!(Arc::clone(&index).subtitles(&reader, Some(TrackFilter::TrackId(1)), range).await,
+         Err(MediaParserError::SubtitleError(reason)) if reason.contains("retained"))
+      );
    }
 
    #[tokio::test]
@@ -1443,11 +1655,12 @@ mod tests {
          .unwrap();
       assert_eq!(usage.samples, 2);
 
-      let index =
+      let index = Arc::new(
          SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usage.samples, usage.retained_bytes)
             .await
-            .expect("rejected and valid track fit exact combined budget");
-      let broad = index
+            .expect("rejected and valid track fit exact combined budget"),
+      );
+      let broad = Arc::clone(&index)
          .subtitles(
             &reader,
             None,
@@ -1502,7 +1715,7 @@ mod tests {
    async fn real_request_uses_injected_subtitle_read_limits() {
       let mut limits = SUBTITLE_READ_LIMITS;
       limits.max_logical_bytes = 2;
-      one_cue_index()
+      Arc::new(one_cue_index())
          .subtitles_with_request_and_read_limits(
             &BytesReader(vec![0, 1, b'x']),
             None,
@@ -1565,13 +1778,13 @@ mod tests {
 
    #[tokio::test]
    async fn shared_region_budget_failure_never_returns_a_partial_track_prefix() {
-      let index = SubtitleIndex {
+      let index = Arc::new(SubtitleIndex {
          tracks: vec![one_cue_track(1, 0), one_cue_track(2, 3)],
-      };
+      });
       let mut limits = SUBTITLE_READ_LIMITS;
       limits.max_regions = 1;
 
-      let error = index
+      let error = Arc::clone(&index)
          .subtitles_with_request_and_read_limits(
             &BytesReader(vec![0, 1, b'x', 0, 1, b'y']),
             None,

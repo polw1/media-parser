@@ -794,6 +794,29 @@ mod tests {
    }
 
    #[test]
+   fn framing_valid_stco_accepts_exact_track_ceiling_and_rejects_one_more_entry() {
+      for count in [2u32, 3] {
+         let mut stco = vec![0u8; 4];
+         stco.extend_from_slice(&count.to_be_bytes());
+         for offset in 0..count {
+            stco.extend_from_slice(&offset.to_be_bytes());
+         }
+         let mut stbl = Vec::new();
+         append_box(&mut stbl, b"stco", &stco);
+         let mut budget = RetainedBudget::new(16);
+         budget.begin_track();
+         let result = parse_chunk_offsets_bounded(&stbl, &mut budget);
+         if count == 2 {
+            assert_eq!(result.unwrap(), vec![0, 1]);
+            assert_eq!(budget.used_bytes(), 16);
+         } else {
+            assert_eq!(result, Err(TableParseError::TrackTooLarge));
+            assert_eq!(budget.used_bytes(), 0);
+         }
+      }
+   }
+
+   #[test]
    fn exact_table_length_overflow_is_invalid() {
       assert_eq!(
          validate_exact_table_len(&[], usize::MAX, 2, "overflowed table"),

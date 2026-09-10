@@ -119,16 +119,16 @@ fewer tracks.
 Repeated range requests should build one `SubtitleIndex` and retain it:
 
 ```rust
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use media_parser::{FileStreamReader, TrackFilter, format::mp4::SubtitleIndex};
 
 #[tokio::main]
 async fn main() -> media_parser::Result<()> {
    let reader = FileStreamReader::new("video.mp4")?;
-   let index = SubtitleIndex::read(&reader).await?;
+   let index = Arc::new(SubtitleIndex::read(&reader).await?);
 
    for start in [0, 30] {
-      let tracks = index
+      let tracks = Arc::clone(&index)
          .subtitles(
             &reader,
             Some(TrackFilter::Language("eng".into())),

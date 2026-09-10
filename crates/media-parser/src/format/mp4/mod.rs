@@ -100,8 +100,7 @@ fn parse_subtitles(
    range: Option<(Duration, Duration)>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<SubtitleTrack>>> + Send + '_>> {
    Box::pin(async move {
-      SubtitleIndex::read(reader)
-         .await?
+      Arc::new(SubtitleIndex::read(reader).await?)
          .subtitles(reader, filter, range)
          .await
    })

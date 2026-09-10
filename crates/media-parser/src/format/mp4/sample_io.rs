@@ -87,7 +87,7 @@ struct LocatedSample {
 }
 
 #[derive(Debug)]
-struct ReadBatch {
+pub(super) struct ReadBatch {
    offset: u64,
    size: usize,
    samples: Vec<SampleSlice>,
@@ -172,6 +172,14 @@ pub(super) async fn read_samples_coalesced_classified(
    budget: &mut SampleReadBudget,
 ) -> SampleReadResult<HashMap<u32, SampleData>> {
    let batches = plan_read_batches(sample_indices, sizes, stsc, chunk_offsets, limits, budget)?;
+   read_planned_batches(reader, batches).await
+}
+
+/// Executes a validated, already charged plan without repeating CPU planning.
+pub(super) async fn read_planned_batches(
+   reader: &dyn StreamReader,
+   batches: Vec<ReadBatch>,
+) -> SampleReadResult<HashMap<u32, SampleData>> {
    let batch_count = batches.len();
    let mut pending = stream::iter(batches.into_iter().map(|batch| async move {
       let data = reader
@@ -238,7 +246,7 @@ pub(super) async fn read_samples_coalesced_classified(
    Ok(samples)
 }
 
-fn plan_read_batches(
+pub(super) fn plan_read_batches(
    sample_indices: &[u32],
    sizes: &SampleSizes,
    stsc: &[StscEntry],
