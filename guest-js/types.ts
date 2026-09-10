@@ -110,6 +110,10 @@ export interface SubtitleCueInfo {
    cueId: number;
    startSec: number;
    endSec: number;
+   /**
+    * Cue text as decoded from the sample. For `stpp` this is the decoded TTML
+    * markup; see `getSubtitles`.
+    */
    text: string;
 }
 

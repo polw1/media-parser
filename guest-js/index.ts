@@ -158,6 +158,9 @@ export async function getThumbnails(
  * requests skip malformed or unsupported tracks; a selector that matches no
  * track returns an empty array.
  *
+ * For `stpp` tracks, `cue.text` is the decoded TTML document, not display text;
+ * parsing and rendering it is the caller's responsibility.
+ *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Optional track/language filter, paired range, and URL headers
  * @returns Subtitle tracks with absolute source cue times in seconds

@@ -272,7 +272,8 @@ registry instead returns an empty subtitle vector for MP3.
 For `stpp`, `cue.text` contains the decoded TTML markup without XML
 interpretation or separation of `<p>` elements. Each decoded sample that
 remains non-empty after trimming whitespace and NUL characters produces one
-cue with its original interval.
+cue with its original interval. Parsing and rendering that markup is the caller's
+responsibility.
 
 ```typescript
 import { getSubtitles } from '@silvermine/tauri-plugin-media-parser';
