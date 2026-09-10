@@ -1,4 +1,4 @@
-//! Monotonic accounting for retained MP4 table allocations.
+//! Bounded accounting for retained MP4 table allocations.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::format::mp4) enum TableParseError {
@@ -27,14 +27,28 @@ impl RetainedBudget {
    }
 
    /// Starts a track-local counter with the same ceiling as the global budget.
-   /// Ending the track never refunds its global charges, including on rejection.
+   /// Discarded tracks release their charges; retained tracks keep them.
    pub(in crate::format::mp4) fn begin_track(&mut self) {
       debug_assert!(self.track_bytes.is_none());
       self.track_bytes = Some(0);
    }
 
+   /// Ends track-local accounting without releasing its global charges.
    pub(in crate::format::mp4) fn end_track(&mut self) {
       self.track_bytes = None;
+   }
+
+   /// Ends a rejected track after its allocations have been dropped.
+   /// Index-vector charges and previously retained tracks remain accounted for.
+   pub(in crate::format::mp4) fn discard_track(&mut self) {
+      let track_bytes = self
+         .track_bytes
+         .take()
+         .expect("an active track is discarded");
+      self.used_bytes = self
+         .used_bytes
+         .checked_sub(track_bytes)
+         .expect("track charges are included in global usage");
    }
 
    pub(in crate::format::mp4) fn used_bytes(&self) -> usize {
@@ -177,6 +191,31 @@ mod tests {
       assert_eq!(budget.track_bytes, Some(usize::MAX));
       budget.end_track();
       assert_eq!(budget.used_bytes(), usize::MAX);
+   }
+
+   #[test]
+   fn discarded_track_releases_only_its_own_allocations() {
+      let mut budget = RetainedBudget::new(64);
+      budget.charge_bytes(4).unwrap(); // index vector: global only
+      budget.begin_track();
+      let kept = budgeted_vec::<u32>(2, &mut budget).unwrap();
+      budget.end_track();
+      let retained_bytes = budget.used_bytes();
+
+      budget.begin_track();
+      let discarded = budgeted_vec::<u64>(3, &mut budget).unwrap();
+      assert_eq!(budget.charge_bytes(64), Err(TableParseError::TrackTooLarge));
+      drop(discarded);
+      budget.discard_track();
+
+      assert_eq!(budget.used_bytes(), retained_bytes);
+      assert_eq!(budget.used_bytes(), 4 + kept.capacity() * 4);
+      assert_eq!(budget.track_bytes, None);
+      budget.begin_track();
+      let next = budgeted_vec::<u8>(64 - retained_bytes, &mut budget).unwrap();
+      assert_eq!(budget.used_bytes(), 64);
+      assert_eq!(next.capacity(), 64 - retained_bytes);
+      budget.end_track();
    }
 
    #[test]

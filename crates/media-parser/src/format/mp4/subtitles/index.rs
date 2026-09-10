@@ -719,7 +719,13 @@ fn parse_track(
    let id = tkhd.id;
    budget.retained.begin_track();
    let result = indexed_track(trak, id, budget);
-   budget.retained.end_track();
+   if matches!(&result, Err(TrackReject::Reason(_))) {
+      // The rejected track's tables have been dropped. Release their memory
+      // charges, but keep the cumulative sample-work counter unchanged.
+      budget.retained.discard_track();
+   } else {
+      budget.retained.end_track();
+   }
    match result {
       Ok(track) => Ok(TrackParse::Ready(track)),
       Err(TrackReject::Skip) => Ok(TrackParse::Skip),
@@ -1556,9 +1562,8 @@ mod tests {
       }
    }
 
-   fn oversized_stco_track() -> Vec<u8> {
+   fn index_track_with_stco_count(count: usize) -> Vec<u8> {
       let mut track = index_track(1, 1, b"tx3g");
-      let count = MAX_RETAINED_INDEX_BYTES / 8 + 1;
       let stco = track.windows(4).position(|bytes| bytes == b"stco").unwrap() - 4;
       let growth = (count - 1) * 4;
       for name in [b"trak", b"mdia", b"minf", b"stbl", b"stco"] {
@@ -1572,8 +1577,22 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn framing_valid_oversized_stco_preserves_sibling_and_partial_charges() {
-      let reader = index_fixture(&[oversized_stco_track(), index_track(2, 1, b"tx3g")]);
+   async fn rejected_stco_refunds_retained_bytes_and_preserves_sibling() {
+      for (count, reason) in [
+         // Fits the individual byte ceiling, then fails sample-table validation.
+         (4_194_240, "invalid subtitle sample tables"),
+         // Refuses the stco allocation after charging the preceding tables.
+         (MAX_RETAINED_INDEX_BYTES / 8 + 1, "retained"),
+      ] {
+         assert_rejected_stco_preserves_sibling(count, reason).await;
+      }
+   }
+
+   async fn assert_rejected_stco_preserves_sibling(count: usize, reason: &str) {
+      let reader = index_fixture(&[
+         index_track_with_stco_count(count),
+         index_track(2, 1, b"tx3g"),
+      ]);
       let (index, usage) = SubtitleIndex::build_with_limits(
          &reader,
          MAX_TRAKS,
@@ -1581,11 +1600,12 @@ mod tests {
          MAX_RETAINED_INDEX_BYTES,
       )
       .await
-      .expect("oversized stco is a local rejection");
+      .expect("a rejected stco must release its tables before indexing its sibling");
       assert_eq!(ready_track_ids(&index), vec![2]);
-      assert!(
-         usage.retained_bytes > independently_measured_retained_bytes(&index),
-         "tables parsed before the refused stco remain charged"
+      assert_eq!(
+         usage.retained_bytes,
+         independently_measured_retained_bytes(&index),
+         "discarded tables must not remain charged"
       );
       let index = Arc::new(index);
       let range = Some((Duration::from_secs(2), Duration::from_secs(3)));
@@ -1600,7 +1620,7 @@ mod tests {
       );
       assert!(
          matches!(Arc::clone(&index).subtitles(&reader, Some(TrackFilter::TrackId(1)), range).await,
-         Err(MediaParserError::SubtitleError(reason)) if reason.contains("retained"))
+         Err(MediaParserError::SubtitleError(actual)) if actual.contains(reason))
       );
    }
 
@@ -1648,17 +1668,22 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn rejected_track_work_remains_charged_for_following_valid_track() {
+   async fn rejected_track_releases_retained_bytes_but_keeps_sample_work_charged() {
       let reader = index_fixture(&[index_track(1, 1, b"junk"), index_track(2, 1, b"tx3g")]);
-      let (_, usage) = SubtitleIndex::build_with_limits(&reader, MAX_TRAKS, usize::MAX, usize::MAX)
-         .await
-         .unwrap();
+      let (index, usage) =
+         SubtitleIndex::build_with_limits(&reader, MAX_TRAKS, usize::MAX, usize::MAX)
+            .await
+            .unwrap();
       assert_eq!(usage.samples, 2);
+      assert_eq!(
+         usage.retained_bytes,
+         independently_measured_retained_bytes(&index)
+      );
 
       let index = Arc::new(
          SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usage.samples, usage.retained_bytes)
             .await
-            .expect("rejected and valid track fit exact combined budget"),
+            .expect("retained states and the valid track fit the exact live budget"),
       );
       let broad = Arc::clone(&index)
          .subtitles(
@@ -1677,6 +1702,39 @@ mod tests {
       SubtitleIndex::read_with_limits(&reader, MAX_TRAKS, usize::MAX, usage.retained_bytes - 1)
          .await
          .expect_err("broad retained exhaustion remains fatal");
+   }
+
+   #[tokio::test]
+   async fn rejected_sample_count_refunds_tables_before_indexing_sibling() {
+      // Scale the sample ceiling down so the regression needs only a small stsz.
+      let oversized = index_track(1, 1024, b"tx3g");
+      let (_, standalone_usage) = SubtitleIndex::build_with_limits(
+         &index_fixture(std::slice::from_ref(&oversized)),
+         MAX_TRAKS,
+         usize::MAX,
+         usize::MAX,
+      )
+      .await
+      .unwrap();
+      let reader = index_fixture(&[oversized, index_track(2, 1, b"tx3g")]);
+      let (index, usage) =
+         SubtitleIndex::build_with_limits(&reader, MAX_TRAKS, 1, standalone_usage.retained_bytes)
+            .await
+            .expect("the rejected track's tables must not consume its sibling's budget");
+
+      assert!(matches!(
+         index.tracks[0],
+         IndexedTrackState::Rejected {
+            id: 1,
+            reason: "too many indexed subtitle samples"
+         }
+      ));
+      assert_eq!(ready_track_ids(&index), vec![2]);
+      assert_eq!(usage.samples, 1);
+      assert_eq!(
+         usage.retained_bytes,
+         independently_measured_retained_bytes(&index)
+      );
    }
 
    #[tokio::test]
