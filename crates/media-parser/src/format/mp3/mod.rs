@@ -44,12 +44,15 @@ pub mod tables;
 pub mod tags;
 
 use crate::Result;
-use crate::format::{AsyncCoverParser, AsyncParser, AsyncTrackParser, Format};
+use crate::format::{AsyncCoverParser, AsyncParser, AsyncSubtitleParser, AsyncTrackParser, Format};
 use crate::stream::StreamReader;
-use crate::types::{AudioTrackMeta, BaseTrackMeta, CoverArt, Metadata, TrackType};
+use crate::types::{
+   AudioTrackMeta, BaseTrackMeta, CoverArt, Metadata, SubtitleTrack, TrackFilter, TrackType,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration as StdDuration;
 
 /// MP3 format signature for detection.
 pub use crate::format::signatures::MP3 as SIGNATURE;
@@ -71,12 +74,21 @@ fn parse_cover(
    Box::pin(metadata::read_cover(reader))
 }
 
+fn parse_subtitles(
+   _reader: &dyn StreamReader,
+   _filter: Option<TrackFilter>,
+   _range: Option<(StdDuration, StdDuration)>,
+) -> Pin<Box<dyn Future<Output = Result<Vec<SubtitleTrack>>> + Send + '_>> {
+   Box::pin(async { Ok(Vec::new()) })
+}
+
 /// MP3 format definition registered in the global table.
 pub static FORMAT: Format = Format::new(
    SIGNATURE,
    parse as AsyncParser,
    parse_tracks as AsyncTrackParser,
    parse_cover as AsyncCoverParser,
+   parse_subtitles as AsyncSubtitleParser,
 );
 
 /// Main parsing function.

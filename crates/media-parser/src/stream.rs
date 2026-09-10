@@ -84,6 +84,21 @@ fn copy_into(dst: &mut [u8], src: &[u8]) -> usize {
    len
 }
 
+pub(crate) fn try_zeroed_bytes(len: usize, context: &'static str) -> Result<Vec<u8>> {
+   let mut bytes = Vec::new();
+   bytes.try_reserve_exact(len).map_err(|_| {
+      MediaParserError::Other(format!("{context} allocation failed for {len} bytes"))
+   })?;
+   bytes.resize(len, 0);
+   Ok(bytes)
+}
+
+pub(crate) fn try_copy_bytes(bytes: &[u8], context: &'static str) -> Result<Vec<u8>> {
+   let mut copy = try_zeroed_bytes(bytes.len(), context)?;
+   copy.copy_from_slice(bytes);
+   Ok(copy)
+}
+
 /// Provides a interface for reading data at arbitrary offsets
 ///
 /// # Contract
@@ -109,7 +124,7 @@ pub trait StreamReader: Send + Sync {
    /// `offset >= size()`. The default implementation reads through `read_at`;
    /// implementations may override it to avoid an intermediate copy.
    async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-      let mut buf = vec![0u8; len];
+      let mut buf = try_zeroed_bytes(len, "stream read buffer")?;
       let read = self.read_at(offset, &mut buf).await?;
       buf.truncate(read);
       Ok(buf)
@@ -228,7 +243,7 @@ impl StreamReader for FileStreamReader {
       let file = Arc::clone(&self.file);
 
       let buf = tokio::task::spawn_blocking(move || {
-         let mut buf = vec![0u8; len];
+         let mut buf = try_zeroed_bytes(len, "file stream read buffer")?;
          let read = Self::sync_read_into(&file, offset, &mut buf)?;
          buf.truncate(read);
          Ok::<_, MediaParserError>(buf)
@@ -591,7 +606,7 @@ impl StreamReader for HttpStreamReader {
                   .min(HTTP_READ_AHEAD_BYTES)
             })
             .unwrap_or(HTTP_READ_AHEAD_BYTES);
-         let mut window = vec![0; read_ahead];
+         let mut window = try_zeroed_bytes(read_ahead, "HTTP read-ahead buffer")?;
          let read = self.read_at_uncached(offset, &mut window).await?;
          window.truncate(read);
          let copied = copy_into(buf, &window);
@@ -601,6 +616,14 @@ impl StreamReader for HttpStreamReader {
          return Ok(copied);
       }
       self.read_at_uncached(offset, buf).await
+   }
+
+   /// Reads directly into a new buffer without populating the navigation read-ahead window.
+   async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+      let mut buf = try_zeroed_bytes(len, "HTTP read buffer")?;
+      let read = self.read_at_uncached(offset, &mut buf).await?;
+      buf.truncate(read);
+      Ok(buf)
    }
 
    /// Returns the total size of the HTTP stream.
@@ -643,6 +666,16 @@ mod tests {
       file.write_all(content).unwrap();
       file.flush().unwrap();
       file
+   }
+
+   #[test]
+   fn fallible_byte_buffer_reports_capacity_overflow() {
+      let error = try_zeroed_bytes(usize::MAX, "test byte buffer")
+         .expect_err("usize::MAX cannot be represented as a Vec capacity");
+
+      assert!(
+         matches!(error, MediaParserError::Other(message) if message.contains("test byte buffer allocation failed"))
+      );
    }
 
    #[test]
@@ -730,6 +763,33 @@ mod tests {
 
       assert_eq!(bytes_read, expected.len());
       assert_eq!(&buffer[..bytes_read], expected);
+   }
+
+   #[tokio::test]
+   async fn test_http_read_vec_requests_only_the_requested_range() {
+      let mock_server = MockServer::start().await;
+      let offset = 8u64;
+      let len = 4usize;
+      let range_end = offset + len as u64 - 1;
+      let requested_range = format!("bytes={offset}-{range_end}");
+      let content_range = format!("bytes {offset}-{range_end}/{}", TEST_CONTENT.len());
+      Mock::given(method("GET"))
+         .and(header("Range", requested_range.as_str()))
+         .respond_with(
+            ResponseTemplate::new(206)
+               .set_body_bytes(&TEST_CONTENT[offset as usize..=range_end as usize])
+               .insert_header("Content-Range", content_range.as_str()),
+         )
+         .expect(1)
+         .mount(&mock_server)
+         .await;
+
+      let reader = HttpStreamReader::new(&mock_server.uri()).await.unwrap();
+      let reader: &dyn StreamReader = &reader;
+
+      let bytes = reader.read_vec(offset, len).await.unwrap();
+
+      assert_eq!(bytes, TEST_CONTENT[offset as usize..=range_end as usize]);
    }
 
    #[tokio::test]

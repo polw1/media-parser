@@ -1,12 +1,17 @@
 /**
- * Decodes binary envelopes returned by `get_cover` and `get_thumbnails`.
+ * Decodes binary envelopes returned by `get_cover`, `get_thumbnails`, and
+ * `get_subtitles`, the last through `subtitle-envelope.ts`.
  *
  * Layout: a 4-byte little-endian header length, a JSON header, then the
  * concatenated binary payloads. The JSON header is either a bare array of
  * entries (legacy, version 0) or `{ version, entries }` (version 1+).
+ *
+ * Every decoder reaches the payload through `parseEnvelopeHeader`, which takes
+ * the accepted versions as a required policy and rejects anything else before
+ * returning entries.
  */
 
-/** Envelope header shapes this decoder understands. Reject anything else. */
+/** Envelope header shapes the media (`get_cover`/`get_thumbnails`) decoder understands. */
 const SUPPORTED_ENVELOPE_VERSIONS = new Set([0, 1]);
 
 interface EnvelopeEntry {
@@ -14,7 +19,37 @@ interface EnvelopeEntry {
    length: number;
 }
 
+export interface ParsedEnvelopeHeader<T> {
+   version: number;
+   entries: T[];
+   buffer: Uint8Array;
+   payloadStart: number;
+   payloadLength: number;
+}
+
+export interface EnvelopeVersionPolicy {
+   supportedVersions: ReadonlySet<number>;
+   envelopeKind: string;
+}
+
 export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: Uint8Array })[] {
+   const parsed = parseEnvelopeHeader<T & EnvelopeEntry>(raw, {
+      supportedVersions: SUPPORTED_ENVELOPE_VERSIONS,
+      envelopeKind: 'media',
+   });
+
+   return parsed.entries.map((entry) => decodeEnvelopeEntry(
+      entry,
+      parsed.buffer,
+      parsed.payloadStart,
+      parsed.payloadLength,
+   ));
+}
+
+export function parseEnvelopeHeader<T>(
+   raw: ArrayBuffer | Uint8Array,
+   policy: EnvelopeVersionPolicy,
+): ParsedEnvelopeHeader<T> {
    const buffer = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
 
    if (buffer.byteLength < 4) {
@@ -34,13 +69,21 @@ export function decodeEnvelope<T>(raw: ArrayBuffer | Uint8Array): (T & { data: U
    const parsed: unknown = JSON.parse(new TextDecoder().decode(header));
    const { version, entries } = normalizeEnvelopeHeader<T>(parsed);
 
-   if (!SUPPORTED_ENVELOPE_VERSIONS.has(version)) {
-      throw new TypeError(`Unsupported media envelope version: ${String(version)}.`);
+   if (!policy.supportedVersions.has(version)) {
+      throw new TypeError(
+         `Unsupported ${policy.envelopeKind} envelope version: ${String(version)}.`,
+      );
    }
 
    const payloadLength = buffer.byteLength - headerEnd;
 
-   return entries.map((entry) => decodeEnvelopeEntry(entry, buffer, headerEnd, payloadLength));
+   return {
+      version,
+      entries,
+      buffer,
+      payloadStart: headerEnd,
+      payloadLength,
+   };
 }
 
 function decodeEnvelopeEntry<T>(
@@ -81,9 +124,9 @@ function decodeEnvelopeEntry<T>(
 
 function normalizeEnvelopeHeader<T>(
    parsed: unknown,
-): { version: number; entries: (T & EnvelopeEntry)[] } {
+): { version: number; entries: T[] } {
    if (Array.isArray(parsed)) {
-      return { version: 0, entries: parsed as (T & EnvelopeEntry)[] };
+      return { version: 0, entries: parsed as T[] };
    }
 
    if (typeof parsed !== 'object' || parsed === null) {
@@ -101,6 +144,6 @@ function normalizeEnvelopeHeader<T>(
 
    return {
       version: header.version,
-      entries: header.entries as (T & EnvelopeEntry)[],
+      entries: header.entries as T[],
    };
 }

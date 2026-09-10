@@ -1,38 +1,27 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 use tauri::{State, command};
-use url::Url;
 
 use media_parser::{
-   BaseTrackMeta, FileStreamReader, Frame, HttpStreamReader, JpegQuality, MediaParser, Metadata,
-   StreamReader, TrackType,
+   BaseTrackMeta, Frame, JpegQuality, MediaParser, Metadata, StreamReader, TrackType,
    format::mp4::{MAX_THUMBNAIL_OUTPUTS, ThumbnailIndex, ThumbnailOptions, ThumbnailSize},
 };
 
 use crate::Result;
-use crate::envelope::{cover_envelope, encode_thumbnail_envelope};
-use crate::session_cache::SessionCache;
+use crate::envelope::{cover_envelope, encode_thumbnail_envelope, run_envelope_task};
+use crate::session_cache::SessionPool;
+use crate::source::{
+   MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration, source_key,
+};
 
 const MAX_THUMBNAIL_SESSIONS: usize = 8;
-const REMOTE_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(5 * 60);
-const LOCAL_THUMBNAIL_SESSION_TTL: Duration = Duration::from_secs(60);
-const SESSION_CACHE_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_THUMBNAIL_OUTPUT_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ThumbnailSessionKey {
-   source: String,
-   headers: Vec<(String, String)>,
+   source: MediaSourceKey,
    track_id: u32,
-   local_version: Option<LocalSourceVersion>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct LocalSourceVersion {
-   length: u64,
-   modified_nanos: Option<u128>,
 }
 
 struct ThumbnailSession {
@@ -40,145 +29,16 @@ struct ThumbnailSession {
    index: Arc<ThumbnailIndex>,
 }
 
-#[derive(Default)]
-struct SessionCacheReaper {
-   started: AtomicBool,
-}
-
-impl SessionCacheReaper {
-   fn start<K, V>(&self, cache: Arc<Mutex<SessionCache<K, V>>>, interval: Duration) -> bool
-   where
-      K: PartialEq + Send + 'static,
-      V: Clone + Send + 'static,
-   {
-      if self
-         .started
-         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-         .is_err()
-      {
-         return false;
-      }
-      let cache = Arc::downgrade(&cache);
-      tauri::async_runtime::spawn(async move {
-         loop {
-            tokio::time::sleep(interval).await;
-            let Some(cache) = cache.upgrade() else {
-               break;
-            };
-            let Ok(mut cache) = cache.lock() else {
-               break;
-            };
-            cache.remove_expired(Instant::now());
-         }
-      });
-      true
-   }
-}
-
 pub(crate) struct ThumbnailSessions {
-   cache: Arc<Mutex<SessionCache<ThumbnailSessionKey, Arc<ThumbnailSession>>>>,
-   expiration_reaper: SessionCacheReaper,
-   build_locks: Mutex<HashMap<ThumbnailSessionKey, Weak<tauri::async_runtime::Mutex<()>>>>,
+   pool: SessionPool<ThumbnailSessionKey, ThumbnailSession>,
 }
 
 impl Default for ThumbnailSessions {
    fn default() -> Self {
       Self {
-         cache: Arc::new(Mutex::new(SessionCache::new(MAX_THUMBNAIL_SESSIONS))),
-         expiration_reaper: SessionCacheReaper::default(),
-         build_locks: Mutex::new(HashMap::new()),
+         pool: SessionPool::new(MAX_THUMBNAIL_SESSIONS, SESSION_REAPER_INTERVAL),
       }
    }
-}
-
-impl ThumbnailSessions {
-   /// Returns the per-key lock used to serialize index construction,
-   /// creating it if this is the first waiter for `key`.
-   fn build_lock(&self, key: &ThumbnailSessionKey) -> Result<Arc<tauri::async_runtime::Mutex<()>>> {
-      let mut locks = self.build_locks.lock().map_err(|_| {
-         crate::Error::Custom("thumbnail session lock table is unavailable".to_string())
-      })?;
-      locks.retain(|_, lock| lock.strong_count() > 0);
-      if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
-         return Ok(lock);
-      }
-      let lock = Arc::new(tauri::async_runtime::Mutex::new(()));
-      locks.insert(key.clone(), Arc::downgrade(&lock));
-      Ok(lock)
-   }
-}
-
-fn is_http_source(source: &str) -> bool {
-   Url::parse(source)
-      .map(|url| matches!(url.scheme(), "http" | "https"))
-      .unwrap_or(false)
-}
-
-/// Builds the reader for a source, with optional HTTP headers for URLs.
-async fn open_reader(
-   source: &str,
-   headers: Option<&HashMap<String, String>>,
-   is_remote: bool,
-) -> Result<Arc<dyn StreamReader>> {
-   if is_remote {
-      let reader = match headers {
-         Some(headers) => HttpStreamReader::with_headers(source, headers.clone()).await?,
-         None => HttpStreamReader::new(source).await?,
-      };
-      Ok(Arc::new(reader))
-   } else {
-      Ok(Arc::new(FileStreamReader::new(source)?))
-   }
-}
-
-async fn thumbnail_session_key(
-   source: &str,
-   headers: Option<&HashMap<String, String>>,
-   track_id: u32,
-   is_remote: bool,
-) -> ThumbnailSessionKey {
-   let mut headers = if is_remote {
-      headers
-         .into_iter()
-         .flat_map(HashMap::iter)
-         .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
-         .collect::<Vec<_>>()
-   } else {
-      Vec::new()
-   };
-   headers.sort_unstable();
-   let local_version = if is_remote {
-      None
-   } else {
-      let path = source.to_string();
-      tauri::async_runtime::spawn_blocking(move || std::fs::metadata(path).ok())
-         .await
-         .ok()
-         .flatten()
-         .map(|metadata| LocalSourceVersion {
-            length: metadata.len(),
-            modified_nanos: metadata
-               .modified()
-               .ok()
-               .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-               .map(|elapsed| elapsed.as_nanos()),
-         })
-   };
-   ThumbnailSessionKey {
-      source: source.to_string(),
-      headers,
-      track_id,
-      local_version,
-   }
-}
-
-fn thumbnail_session_expiration(is_remote: bool, now: Instant) -> Option<Instant> {
-   let ttl = if is_remote {
-      REMOTE_THUMBNAIL_SESSION_TTL
-   } else {
-      LOCAL_THUMBNAIL_SESSION_TTL
-   };
-   now.checked_add(ttl)
 }
 
 async fn thumbnail_session(
@@ -187,46 +47,20 @@ async fn thumbnail_session(
    headers: Option<&HashMap<String, String>>,
    track_id: u32,
 ) -> Result<Arc<ThumbnailSession>> {
-   let is_remote = is_http_source(source);
-   let key = thumbnail_session_key(source, headers, track_id, is_remote).await;
-   if let Some(session) = sessions
-      .cache
-      .lock()
-      .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
-      .get(&key, Instant::now())
-   {
-      return Ok(session);
-   }
-
-   // Serialize index construction per key so concurrent requests for the
-   // same cold source share one build instead of racing N index builds.
-   let build_lock = sessions.build_lock(&key)?;
-   let _build_guard = build_lock.lock().await;
-
-   if let Some(session) = sessions
-      .cache
-      .lock()
-      .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
-      .get(&key, Instant::now())
-   {
-      return Ok(session);
-   }
-
-   let reader = open_reader(source, headers, is_remote).await?;
-   let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
-   let session = Arc::new(ThumbnailSession { reader, index });
-   let expires_at = thumbnail_session_expiration(is_remote, Instant::now());
-   {
-      sessions
-         .cache
-         .lock()
-         .map_err(|_| crate::Error::Custom("thumbnail session cache is unavailable".to_string()))?
-         .insert(key, Arc::clone(&session), expires_at);
-   }
+   let media_source = source_key(source, headers).await;
+   let expiration = session_expiration(&media_source);
+   let key = ThumbnailSessionKey {
+      source: media_source,
+      track_id,
+   };
    sessions
-      .expiration_reaper
-      .start(Arc::clone(&sessions.cache), SESSION_CACHE_REAPER_INTERVAL);
-   Ok(session)
+      .pool
+      .get_or_try_build(key, expiration, || async {
+         let reader = open_reader(source, headers).await?;
+         let index = Arc::new(ThumbnailIndex::read(reader.as_ref(), track_id).await?);
+         Ok(ThumbnailSession { reader, index })
+      })
+      .await
 }
 
 async fn thumbnail_frames(
@@ -270,7 +104,7 @@ pub(crate) async fn get_metadata(
    source: String,
    headers: Option<HashMap<String, String>>,
 ) -> Result<Metadata> {
-   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   let reader = open_reader(&source, headers.as_ref()).await?;
    MediaParser::new(reader.as_ref())
       .metadata()
       .await
@@ -283,7 +117,7 @@ pub(crate) async fn get_tracks(
    source: String,
    headers: Option<HashMap<String, String>>,
 ) -> Result<Vec<TrackInfo>> {
-   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   let reader = open_reader(&source, headers.as_ref()).await?;
    let tracks = MediaParser::new(reader.as_ref())
       .tracks()
       .await
@@ -298,23 +132,13 @@ pub(crate) async fn get_cover(
    source: String,
    headers: Option<HashMap<String, String>>,
 ) -> Result<tauri::ipc::Response> {
-   let reader = open_reader(&source, headers.as_ref(), is_http_source(&source)).await?;
+   let reader = open_reader(&source, headers.as_ref()).await?;
    let cover = MediaParser::new(reader.as_ref())
       .cover()
       .await
       .map_err(crate::Error::from)?;
 
    Ok(tauri::ipc::Response::new(cover_envelope(cover)?))
-}
-
-async fn run_thumbnail_envelope_task<T, F>(task: F) -> Result<T>
-where
-   T: Send + 'static,
-   F: FnOnce() -> Result<T> + Send + 'static,
-{
-   tauri::async_runtime::spawn_blocking(task)
-      .await
-      .map_err(|error| crate::Error::Custom(format!("thumbnail envelope task failed: {error}")))?
 }
 
 /// Extract thumbnails from a video track at millisecond timestamps.
@@ -343,7 +167,7 @@ pub(crate) async fn get_thumbnails(
       options,
    )
    .await?;
-   let envelope = run_thumbnail_envelope_task(move || {
+   let envelope = run_envelope_task("thumbnail", move || {
       encode_thumbnail_envelope(&frames, &order, MAX_THUMBNAIL_OUTPUT_BYTES)
    })
    .await?;
@@ -509,6 +333,30 @@ mod tests {
          .into_owned()
    }
 
+   #[tokio::test]
+   async fn thumbnail_session_key_distinguishes_track_ids() {
+      // The fixture's track 1 is video and track 2 is audio, so the second
+      // request must build its own index and fail. Dropping `track_id` from the
+      // key would hand it the cached video session instead.
+      let sessions = ThumbnailSessions::default();
+      let source = video_fixture_source();
+
+      thumbnail_session(&sessions, &source, None, 1)
+         .await
+         .expect("the video track should build a session");
+      let Err(error) = thumbnail_session(&sessions, &source, None, 2).await else {
+         panic!("the audio track must not reuse the video session");
+      };
+
+      assert!(
+         matches!(
+            error,
+            crate::Error::MediaParser(media_parser::MediaParserError::TrackNotFound(2))
+         ),
+         "unexpected error for the audio track: {error:?}"
+      );
+   }
+
    #[test]
    fn omitted_thumbnail_quality_keeps_the_default() {
       let options = thumbnail_options(None, None, None).expect("omitted options are valid");
@@ -599,124 +447,6 @@ mod tests {
       assert_eq!(order.len(), MAX_THUMBNAIL_OUTPUTS);
    }
 
-   #[tokio::test(flavor = "current_thread")]
-   async fn thumbnail_envelope_work_runs_off_the_async_runtime_thread() {
-      let runtime_thread = std::thread::current().id();
-
-      let worker_thread = run_thumbnail_envelope_task(|| Ok(std::thread::current().id()))
-         .await
-         .expect("blocking thumbnail work should complete");
-
-      assert_ne!(worker_thread, runtime_thread);
-   }
-
-   #[tokio::test]
-   async fn thumbnail_session_key_normalizes_http_header_names_and_order() {
-      let first_headers = HashMap::from([
-         ("X-Test".to_string(), "one".to_string()),
-         ("Authorization".to_string(), "Bearer token".to_string()),
-      ]);
-      let second_headers = HashMap::from([
-         ("authorization".to_string(), "Bearer token".to_string()),
-         ("x-test".to_string(), "one".to_string()),
-      ]);
-
-      let first = thumbnail_session_key(
-         "https://example.com/video.mp4",
-         Some(&first_headers),
-         7,
-         true,
-      )
-      .await;
-      let second = thumbnail_session_key(
-         "https://example.com/video.mp4",
-         Some(&second_headers),
-         7,
-         true,
-      )
-      .await;
-
-      assert!(first == second);
-   }
-
-   #[tokio::test]
-   async fn thumbnail_session_key_ignores_headers_for_local_sources() {
-      let source = video_fixture_source();
-      let headers = HashMap::from([("Authorization".to_string(), "ignored".to_string())]);
-
-      assert!(
-         thumbnail_session_key(&source, None, 1, false).await
-            == thumbnail_session_key(&source, Some(&headers), 1, false).await
-      );
-   }
-
-   #[tokio::test]
-   async fn thumbnail_session_key_changes_when_a_local_file_changes() {
-      let unique = std::time::SystemTime::now()
-         .duration_since(std::time::UNIX_EPOCH)
-         .unwrap()
-         .as_nanos();
-      let path = std::env::temp_dir().join(format!(
-         "media-parser-thumbnail-session-{}-{unique}",
-         std::process::id()
-      ));
-      std::fs::write(&path, [1]).unwrap();
-      let source = path.to_string_lossy();
-      let first = thumbnail_session_key(&source, None, 1, false).await;
-
-      std::fs::write(&path, [1, 2]).unwrap();
-      let second = thumbnail_session_key(&source, None, 1, false).await;
-      std::fs::remove_file(&path).unwrap();
-
-      assert!(first != second);
-   }
-
-   #[test]
-   fn remote_and_local_thumbnail_sessions_both_receive_an_expiration_deadline() {
-      let now = Instant::now();
-
-      assert_eq!(
-         thumbnail_session_expiration(true, now),
-         now.checked_add(REMOTE_THUMBNAIL_SESSION_TTL)
-      );
-      assert_eq!(
-         thumbnail_session_expiration(false, now),
-         now.checked_add(LOCAL_THUMBNAIL_SESSION_TTL)
-      );
-   }
-
-   #[tokio::test]
-   async fn session_cache_reaper_starts_only_once() {
-      let cache = Arc::new(Mutex::new(SessionCache::<&str, Arc<()>>::new(1)));
-      let reaper = SessionCacheReaper::default();
-
-      assert!(reaper.start(Arc::clone(&cache), Duration::from_millis(1)));
-      assert!(!reaper.start(cache, Duration::from_millis(1)));
-   }
-
-   #[tokio::test]
-   async fn session_expiration_releases_values_without_later_cache_access() {
-      let cache = Arc::new(Mutex::new(SessionCache::new(1)));
-      let reaper = SessionCacheReaper::default();
-      let value = Arc::new(());
-      let weak = Arc::downgrade(&value);
-      let deadline = Instant::now() + Duration::from_millis(10);
-      cache
-         .lock()
-         .unwrap()
-         .insert("local", Arc::clone(&value), Some(deadline));
-      assert!(reaper.start(Arc::clone(&cache), Duration::from_millis(2)));
-      drop(value);
-
-      tokio::time::timeout(Duration::from_secs(1), async {
-         while weak.upgrade().is_some() {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-         }
-      })
-      .await
-      .expect("the expiration task should release the cached value");
-   }
-
    #[tokio::test]
    async fn accurate_thumbnail_mode_returns_the_requested_frame_timestamp() {
       let sessions = ThumbnailSessions::default();
@@ -774,11 +504,6 @@ mod tests {
    async fn concurrent_requests_for_a_cold_source_build_a_single_session() {
       let sessions = Arc::new(ThumbnailSessions::default());
       let source = video_fixture_source();
-      let key = thumbnail_session_key(&source, None, 0, false).await;
-      let key_lock = sessions
-         .build_lock(&key)
-         .expect("build lock should be available");
-      let guard = key_lock.lock().await;
 
       let first_sessions = Arc::clone(&sessions);
       let first_source = source.clone();
@@ -795,21 +520,6 @@ mod tests {
       let third_sessions = Arc::clone(&sessions);
       let third =
          tokio::spawn(async move { thumbnail_session(&third_sessions, &source, None, 0).await });
-
-      // This test and the three requests hold four strong references. Reaching
-      // four proves every request observed the cold cache and joined this lock.
-      tokio::time::timeout(Duration::from_secs(10), async {
-         loop {
-            if Arc::strong_count(&key_lock) >= 4 {
-               break;
-            }
-            tokio::task::yield_now().await;
-         }
-      })
-      .await
-      .expect("all requests should reference the pre-acquired per-key lock");
-      drop(guard);
-      drop(key_lock);
 
       let (first, second, third) = tokio::time::timeout(Duration::from_secs(10), async {
          tokio::join!(first, second, third)
@@ -828,35 +538,6 @@ mod tests {
 
       assert!(Arc::ptr_eq(&first, &second));
       assert!(Arc::ptr_eq(&first, &third));
-      assert!(
-         sessions
-            .build_locks
-            .lock()
-            .expect("lock table should be reachable")
-            .values()
-            .all(|lock| lock.strong_count() == 0),
-         "completed builds must not retain strong lock references"
-      );
-   }
-
-   #[tokio::test]
-   async fn failed_thumbnail_session_build_does_not_retain_its_build_lock() {
-      let sessions = ThumbnailSessions::default();
-
-      assert!(
-         thumbnail_session(&sessions, "/file/that/does/not/exist.mp4", None, 0)
-            .await
-            .is_err()
-      );
-      assert!(
-         sessions
-            .build_locks
-            .lock()
-            .expect("lock table should be reachable")
-            .values()
-            .all(|lock| lock.strong_count() == 0),
-         "failed session builds must not retain strong lock references"
-      );
    }
 
    #[tokio::test]

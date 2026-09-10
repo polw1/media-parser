@@ -10,5 +10,15 @@
       "skipLibCheck": true,
       "forceConsistentCasingInFileNames": true
    },
-   "include": ["envelope.ts", "envelope.test.ts", "thumbnail-options.ts", "thumbnail-options.test.ts"]
+   "include": [
+      "envelope.ts",
+      "envelope.test.ts",
+      "subtitle-envelope.ts",
+      "subtitle-envelope.test.ts",
+      "subtitle-options.ts",
+      "subtitle-options.test.ts",
+      "index.ts",
+      "thumbnail-options.ts",
+      "thumbnail-options.test.ts"
+   ]
 }

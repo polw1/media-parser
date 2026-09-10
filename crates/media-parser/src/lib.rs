@@ -177,8 +177,8 @@ pub use decoders::h264::JpegQuality;
 pub use errors::{MediaParserError, Result};
 pub use format::mp4::atoms::Mp4Nav;
 pub use format::registry::{
-   detect_format, get_format_info, is_supported, parse_cover, parse_metadata, parse_tracks,
-   supported_formats,
+   detect_format, get_format_info, is_supported, parse_cover, parse_metadata, parse_subtitles,
+   parse_tracks, supported_formats,
 };
 pub use stream::{FileStreamReader, HttpStreamReader, StreamReader};
 pub use types::{
@@ -214,9 +214,17 @@ impl<R: StreamReader> MediaParser<R> {
 
    /// Extract subtitle tracks from the media file.
    pub async fn subtitles(&self, filter: Option<TrackFilter>) -> Result<Vec<SubtitleTrack>> {
-      // TODO: Implement actual subtitle parsing
-      let _ = filter; // Suppress unused parameter warning
-      Ok(vec![])
+      format::registry::parse_subtitles(&self.reader, filter, None).await
+   }
+
+   /// Extract subtitle tracks overlapping the half-open range `[start, end)`.
+   pub async fn subtitles_in_range(
+      &self,
+      filter: Option<TrackFilter>,
+      range: (std::time::Duration, std::time::Duration),
+   ) -> Result<Vec<SubtitleTrack>> {
+      format::validate_subtitle_range(Some(range))?;
+      format::registry::parse_subtitles(&self.reader, filter, Some(range)).await
    }
 
    /// List all supported format names.

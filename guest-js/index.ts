@@ -1,11 +1,15 @@
 import { invoke } from '@tauri-apps/api/core';
 
 import { decodeEnvelope } from './envelope';
+import { decodeSubtitleEnvelope } from './subtitle-envelope';
+import { validateSubtitleOptions } from './subtitle-options';
 import { validateThumbnailDimensions, validateTimestamps } from './thumbnail-options';
 import type {
    CoverInfo,
    Metadata,
    MetadataOptions,
+   SubtitleInfo,
+   SubtitleOptions,
    ThumbnailInfo,
    ThumbnailsOptions,
    TrackInfo,
@@ -111,7 +115,8 @@ export async function getCover(
  * Retaining one thumbnail therefore retains the complete response buffer; use
  * `new Uint8Array(thumbnail.data)` when a small image must be retained alone.
  * Parsed thumbnail sessions are cached with an eight-entry LRU: remote
- * sessions expire after five minutes and local sessions after one minute.
+ * sessions expire five minutes after they are built and local sessions after
+ * one minute without reuse.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Timestamps, optional track, accuracy, JPEG bounds/quality, and URL headers
@@ -140,6 +145,44 @@ export async function getThumbnails(
    });
 
    return decodeThumbnailEnvelope(raw);
+}
+
+/**
+ * Extract subtitle tracks, optionally filtered and restricted to a half-open
+ * millisecond range.
+ *
+ * When `trackId` is present, `language` is ignored. `trackId: 0` selects the
+ * first valid supported subtitle track; without either filter, all valid
+ * supported subtitle tracks are returned, but only when their combined work
+ * fits the aggregate request budgets. Unfiltered and language-filtered
+ * requests skip malformed or unsupported tracks; a selector that matches no
+ * track returns an empty array.
+ *
+ * For `stpp` tracks, `cue.text` is the decoded TTML document, not display text;
+ * parsing and rendering it is the caller's responsibility.
+ *
+ * @param source - Absolute path to a local file or URL of a remote media file
+ * @param options - Optional track/language filter, paired range, and URL headers
+ * @returns Subtitle tracks with absolute source cue times in seconds
+ * @throws TypeError if the track ID or paired range cannot be represented
+ * @throws {string} if an explicitly selected positive trackId is malformed or
+ * unsupported, or if aggregate request budgets are exceeded
+ */
+export async function getSubtitles(
+   source: string,
+   options: SubtitleOptions = {},
+): Promise<SubtitleInfo[]> {
+   validateSubtitleOptions(options);
+   const raw = await invoke<ArrayBuffer>('plugin:media-parser|get_subtitles', {
+      source,
+      trackId: options.trackId,
+      language: options.language,
+      startMs: options.startMs,
+      endMs: options.endMs,
+      headers: options.headers,
+   });
+
+   return decodeSubtitleEnvelope(raw);
 }
 
 /**

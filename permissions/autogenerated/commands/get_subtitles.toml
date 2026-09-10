@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-get-subtitles"
+description = "Enables the get_subtitles command without any pre-configured scope."
+commands.allow = ["get_subtitles"]
+
+[[permission]]
+identifier = "deny-get-subtitles"
+description = "Denies the get_subtitles command without any pre-configured scope."
+commands.deny = ["get_subtitles"]

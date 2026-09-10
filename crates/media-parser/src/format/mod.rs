@@ -65,9 +65,19 @@ pub mod signatures;
 
 use crate::Result;
 use crate::stream::StreamReader;
-use crate::types::{CoverArt, Metadata, TrackType};
+use crate::types::{CoverArt, Metadata, SubtitleTrack, TrackFilter, TrackType};
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+
+pub(crate) fn validate_subtitle_range(range: Option<(Duration, Duration)>) -> Result<()> {
+   if range.is_some_and(|(start, end)| start >= end) {
+      return Err(crate::MediaParserError::SubtitleError(
+         "subtitle range start must be before end".to_owned(),
+      ));
+   }
+   Ok(())
+}
 
 /// Async parser function type.
 ///
@@ -86,6 +96,14 @@ pub type AsyncCoverParser =
    for<'a> fn(
       &'a dyn StreamReader,
    ) -> Pin<Box<dyn Future<Output = Result<Option<CoverArt>>> + Send + 'a>>;
+
+/// Async subtitle parser function type.
+pub type AsyncSubtitleParser =
+   for<'a> fn(
+      &'a dyn StreamReader,
+      Option<TrackFilter>,
+      Option<(Duration, Duration)>,
+   ) -> Pin<Box<dyn Future<Output = Result<Vec<SubtitleTrack>>> + Send + 'a>>;
 
 /// Format signature for identification.
 ///
@@ -111,6 +129,7 @@ pub struct Format {
    pub parser: AsyncParser,
    pub track_parser: AsyncTrackParser,
    pub cover_parser: AsyncCoverParser,
+   pub subtitle_parser: AsyncSubtitleParser,
 }
 
 impl Format {
@@ -119,12 +138,14 @@ impl Format {
       parser: AsyncParser,
       track_parser: AsyncTrackParser,
       cover_parser: AsyncCoverParser,
+      subtitle_parser: AsyncSubtitleParser,
    ) -> Self {
       Self {
          signature,
          parser,
          track_parser,
          cover_parser,
+         subtitle_parser,
       }
    }
 

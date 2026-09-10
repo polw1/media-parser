@@ -1,8 +1,147 @@
 //! MP4 sample timing and presentation-order calculations.
 
+use super::budget::{RetainedBudget, TableParseError, TableResult, budgeted_vec};
+use super::nav::Mp4Nav;
 use super::samples::table_entries;
-use crate::helpers::read_u32_be;
+use crate::helpers::{read_u32_be, read_u64_be};
 use std::time::Duration;
+
+#[derive(Clone, Copy, Debug)]
+pub(in crate::format::mp4) struct TimeToSampleEntry {
+   pub sample_count: u32,
+   pub sample_delta: u32,
+}
+
+#[derive(Clone, Debug)]
+pub(in crate::format::mp4) struct SampleTimingTable {
+   entries: Vec<TimeToSampleEntry>,
+   sample_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::format::mp4) struct SampleTiming {
+   pub sample_index: u32,
+   pub start_tick: u64,
+   pub duration_ticks: u64,
+}
+
+impl SampleTimingTable {
+   pub(in crate::format::mp4) fn parse(
+      stts: &[u8],
+      budget: &mut RetainedBudget,
+   ) -> TableResult<Self> {
+      let entry_count = usize::try_from(
+         read_u32_be(stts, 4).ok_or(TableParseError::Invalid("malformed stts table"))?,
+      )
+      .map_err(|_| TableParseError::BudgetExceeded)?;
+
+      let expected_len = entry_count
+         .checked_mul(8)
+         .and_then(|bytes| bytes.checked_add(8))
+         .ok_or(TableParseError::Invalid("malformed stts table"))?;
+      if expected_len != stts.len() {
+         return Err(TableParseError::Invalid("malformed stts table"));
+      }
+
+      let mut entries = budgeted_vec(entry_count, budget)?;
+
+      let mut sample_count = 0u32;
+      for index in 0..entry_count {
+         let offset = 8 + index * 8;
+         let entry = TimeToSampleEntry {
+            sample_count: read_u32_be(stts, offset)
+               .ok_or(TableParseError::Invalid("malformed stts entry"))?,
+            sample_delta: read_u32_be(stts, offset + 4)
+               .ok_or(TableParseError::Invalid("malformed stts entry"))?,
+         };
+         if entry.sample_count == 0 {
+            return Err(TableParseError::Invalid("zero stts sample count"));
+         }
+         // Capping the running sample count at `u32::MAX` also bounds any total
+         // duration this table can express: the largest reachable sum is
+         // `u32::MAX * u32::MAX`, which still fits `u64`. A separate duration
+         // accumulator would therefore be arithmetic that can never fail.
+         sample_count = sample_count
+            .checked_add(entry.sample_count)
+            .ok_or(TableParseError::Invalid("stts sample count overflow"))?;
+         entries.push(entry);
+      }
+
+      Ok(Self {
+         entries,
+         sample_count,
+      })
+   }
+
+   #[cfg(test)]
+   pub(in crate::format::mp4) fn entries(&self) -> &[TimeToSampleEntry] {
+      &self.entries
+   }
+
+   #[cfg(test)]
+   pub(in crate::format::mp4) fn entries_capacity(&self) -> usize {
+      self.entries.capacity()
+   }
+
+   pub(in crate::format::mp4) fn sample_count(&self) -> u32 {
+      self.sample_count
+   }
+
+   pub(in crate::format::mp4) fn iter(&self) -> SampleTimingIter<'_> {
+      SampleTimingIter {
+         entries: self.entries.iter(),
+         current_entry: None,
+         remaining_in_entry: 0,
+         remaining_samples: self.sample_count,
+         next_sample_index: 1,
+         next_start_tick: 0,
+      }
+   }
+}
+
+pub(in crate::format::mp4) struct SampleTimingIter<'a> {
+   entries: std::slice::Iter<'a, TimeToSampleEntry>,
+   current_entry: Option<TimeToSampleEntry>,
+   remaining_in_entry: u32,
+   remaining_samples: u32,
+   next_sample_index: u32,
+   next_start_tick: u64,
+}
+
+impl Iterator for SampleTimingIter<'_> {
+   type Item = SampleTiming;
+
+   fn next(&mut self) -> Option<Self::Item> {
+      if self.remaining_in_entry == 0 {
+         self.current_entry = self.entries.next().copied();
+         self.remaining_in_entry = self.current_entry?.sample_count;
+      }
+      let entry = self.current_entry?;
+      let timing = SampleTiming {
+         sample_index: self.next_sample_index,
+         start_tick: self.next_start_tick,
+         duration_ticks: u64::from(entry.sample_delta),
+      };
+      self.remaining_in_entry -= 1;
+      self.remaining_samples -= 1;
+      self.next_sample_index = self
+         .next_sample_index
+         .checked_add(1)
+         .unwrap_or(self.next_sample_index);
+      self.next_start_tick = self
+         .next_start_tick
+         .checked_add(u64::from(entry.sample_delta))
+         .expect("validated stts duration fits u64");
+      Some(timing)
+   }
+
+   fn size_hint(&self) -> (usize, Option<usize>) {
+      let remaining = usize::try_from(self.remaining_samples).unwrap_or(usize::MAX);
+      (remaining, Some(remaining))
+   }
+}
+
+impl ExactSizeIterator for SampleTimingIter<'_> {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositionOffset {
@@ -291,6 +430,70 @@ impl<'a> TimingWalker<'a> {
    }
 }
 
+/// Resolves the presentation offset an `edts`/`elst` applies to a track,
+/// degrading to none for edit lists this parser does not model.
+///
+/// Only a single normal-rate segment maps to a scalar offset. A list with
+/// several real segments can repeat, reorder or retime media, which one
+/// offset cannot express — applying the first segment's `media_time` to the
+/// whole timeline would silently misplace every later segment. Falling back
+/// to zero instead leaves such a track behaving exactly like one carrying no
+/// `edts` at all, which is the same degrade-rather-than-fail policy
+/// `resolve_gop_color` applies to the colour hint.
+///
+/// The two-entry `empty edit + real edit` delay idiom is rejected by the same
+/// rule even though it does reduce to a scalar: the real segment's
+/// `media_time` minus the empty edit's `segment_duration`. That subtraction
+/// needs a conversion this function cannot make, because `segment_duration`
+/// counts in the `mvhd` timescale while `media_time` counts in the `mdhd` one
+/// and only the track is in scope here. So a track delayed that way keeps a
+/// zero offset and every sample lands earlier than authored, by the length of
+/// the empty edit; modelling the idiom is left to a separate change.
+pub fn track_presentation_offset(trak: &[u8]) -> i64 {
+   trak
+      .nav(&[*b"edts", *b"elst"])
+      .and_then(parse_elst_media_time)
+      .unwrap_or(0)
+}
+
+/// Reads the media time of an edit list, or `None` when the list is not a
+/// single normal-rate segment. See [`track_presentation_offset`].
+fn parse_elst_media_time(elst: &[u8]) -> Option<i64> {
+   let version = *elst.first()?;
+   let entry_size = match version {
+      0 => 12usize,
+      1 => 20usize,
+      _ => return None,
+   };
+   if table_entries(elst, entry_size)? != 1 {
+      return None;
+   }
+
+   let offset = 8;
+   let (segment_duration, media_time, rate_offset) = if version == 0 {
+      (
+         u64::from(read_u32_be(elst, offset)?),
+         i64::from(i32::from_be_bytes(
+            read_u32_be(elst, offset + 4)?.to_be_bytes(),
+         )),
+         offset + 8,
+      )
+   } else {
+      (
+         read_u64_be(elst, offset)?,
+         i64::from_be_bytes(read_u64_be(elst, offset + 8)?.to_be_bytes()),
+         offset + 16,
+      )
+   };
+   let media_rate = read_u32_be(elst, rate_offset)?;
+   if segment_duration == 0 || media_rate != 0x0001_0000 || media_time < -1 {
+      return None;
+   }
+   // An empty edit (media_time -1) only delays presentation; it does not shift
+   // media timestamps, so it maps to no presentation offset.
+   Some(media_time.max(0))
+}
+
 pub fn duration_to_ticks(duration: Duration, timescale: u32) -> u64 {
    let ticks = duration.as_nanos().saturating_mul(u128::from(timescale)) / 1_000_000_000;
    u64::try_from(ticks).unwrap_or(u64::MAX)
@@ -324,13 +527,188 @@ pub fn ticks_to_duration(ticks: u64, timescale: u32) -> Duration {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use crate::format::mp4::atoms::budget::RetainedBudget;
+
+   fn stts_entries(entries: &[(u32, u32)]) -> Vec<u8> {
+      let mut bytes = vec![0; 8];
+      bytes[4..8].copy_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
+      for (count, delta) in entries {
+         bytes.extend_from_slice(&count.to_be_bytes());
+         bytes.extend_from_slice(&delta.to_be_bytes());
+      }
+      bytes
+   }
 
    fn stts(count: u32, delta: u32) -> Vec<u8> {
-      let mut bytes = vec![0; 8];
-      bytes[4..8].copy_from_slice(&1u32.to_be_bytes());
-      bytes.extend_from_slice(&count.to_be_bytes());
-      bytes.extend_from_slice(&delta.to_be_bytes());
-      bytes
+      stts_entries(&[(count, delta)])
+   }
+
+   fn mp4_box(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+      let mut data = u32::try_from(payload.len() + 8)
+         .unwrap()
+         .to_be_bytes()
+         .to_vec();
+      data.extend_from_slice(fourcc);
+      data.extend_from_slice(payload);
+      data
+   }
+
+   /// Builds a version 0 `elst` payload from `(segment_duration, media_time)`
+   /// pairs, all at normal rate.
+   fn elst_payload(segments: &[(u32, i32)]) -> Vec<u8> {
+      let mut payload = vec![0; 4];
+      payload.extend_from_slice(&u32::try_from(segments.len()).unwrap().to_be_bytes());
+      for (segment_duration, media_time) in segments {
+         payload.extend_from_slice(&segment_duration.to_be_bytes());
+         payload.extend_from_slice(&media_time.to_be_bytes());
+         payload.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+      }
+      payload
+   }
+
+   fn trak_with_edit_list(segments: &[(u32, i32)]) -> Vec<u8> {
+      mp4_box(b"edts", &mp4_box(b"elst", &elst_payload(segments)))
+   }
+
+   #[test]
+   fn compact_timing_retains_runs_and_expands_samples_lazily() {
+      let mut budget = RetainedBudget::new(usize::MAX);
+      let table = SampleTimingTable::parse(&stts(100_000, 1_000), &mut budget).unwrap();
+
+      assert_eq!(table.entries().len(), 1);
+      assert_eq!(
+         budget.used_bytes(),
+         table.entries.capacity() * std::mem::size_of::<TimeToSampleEntry>()
+      );
+      assert_eq!(table.sample_count(), 100_000);
+      assert_eq!(
+         table.iter().nth(2),
+         Some(SampleTiming {
+            sample_index: 3,
+            start_tick: 2_000,
+            duration_ticks: 1_000,
+         })
+      );
+   }
+
+   #[test]
+   fn compact_timing_rejects_aggregate_sample_count_overflow() {
+      let mut budget = RetainedBudget::new(usize::MAX);
+
+      assert!(matches!(
+         SampleTimingTable::parse(&stts_entries(&[(u32::MAX, 1), (1, 1)]), &mut budget),
+         Err(TableParseError::Invalid(_))
+      ));
+   }
+
+   #[test]
+   fn compact_timing_keeps_committed_budget_between_parses() {
+      let entry_bytes = std::mem::size_of::<TimeToSampleEntry>();
+      let second_entry_count = 1_024usize;
+      let mut budget = RetainedBudget::new(second_entry_count * entry_bytes);
+
+      SampleTimingTable::parse(&stts(1, 1), &mut budget).unwrap();
+      let first_charge = budget.used_bytes();
+      let second_entries = vec![(1, 1); second_entry_count];
+      assert!(matches!(
+         SampleTimingTable::parse(&stts_entries(&second_entries), &mut budget),
+         Err(TableParseError::BudgetExceeded)
+      ));
+      assert_eq!(budget.used_bytes(), first_charge);
+   }
+
+   #[test]
+   fn compact_timing_distinguishes_malformed_input_from_budget_failure() {
+      let mut budget = RetainedBudget::new(usize::MAX);
+      let malformed = [0, 0, 0, 0, 0, 0, 0, 1];
+
+      assert!(matches!(
+         SampleTimingTable::parse(&malformed, &mut budget),
+         Err(TableParseError::Invalid(_))
+      ));
+   }
+
+   #[test]
+   fn compact_timing_does_not_refund_after_allocating_for_an_invalid_entry() {
+      let entry_bytes = std::mem::size_of::<TimeToSampleEntry>();
+      let mut budget = RetainedBudget::new(usize::MAX);
+
+      assert!(matches!(
+         SampleTimingTable::parse(&stts(0, 1), &mut budget),
+         Err(TableParseError::Invalid(_))
+      ));
+      assert!(budget.used_bytes() >= entry_bytes);
+   }
+
+   #[test]
+   fn compact_timing_allows_zero_sample_delta() {
+      let mut budget = RetainedBudget::new(usize::MAX);
+      let table = SampleTimingTable::parse(
+         &stts_entries(&[(1, 1_000), (1, 0), (1, 1_000)]),
+         &mut budget,
+      )
+      .expect("zero-duration subtitle samples are timing gaps");
+
+      assert_eq!(table.sample_count(), 3);
+      assert_eq!(
+         table.iter().collect::<Vec<_>>(),
+         vec![
+            SampleTiming {
+               sample_index: 1,
+               start_tick: 0,
+               duration_ticks: 1_000,
+            },
+            SampleTiming {
+               sample_index: 2,
+               start_tick: 1_000,
+               duration_ticks: 0,
+            },
+            SampleTiming {
+               sample_index: 3,
+               start_tick: 1_000,
+               duration_ticks: 1_000,
+            },
+         ]
+      );
+   }
+
+   #[test]
+   fn accepts_empty_edit_and_rejects_multi_segment_edit_lists() {
+      let empty_edit = elst_payload(&[(1_000, -1)]);
+      let multiple_edits = elst_payload(&[(1_000, 0), (1_000, 1_000)]);
+
+      assert_eq!(parse_elst_media_time(&empty_edit), Some(0));
+      assert_eq!(parse_elst_media_time(&multiple_edits), None);
+   }
+
+   #[test]
+   fn falls_back_to_no_presentation_offset_for_unmodeled_edit_lists() {
+      let single_segment = trak_with_edit_list(&[(1_000, 512)]);
+      let several_segments = trak_with_edit_list(&[(1_000, 0), (1_000, 1_000)]);
+      let malformed = mp4_box(b"edts", &mp4_box(b"elst", &[0, 0]));
+
+      assert_eq!(track_presentation_offset(&single_segment), 512);
+      assert_eq!(track_presentation_offset(&several_segments), 0);
+      assert_eq!(track_presentation_offset(&malformed), 0);
+      assert_eq!(track_presentation_offset(&[]), 0);
+   }
+
+   #[test]
+   fn edit_list_media_time_defines_the_shared_cue_origin() {
+      let trak = trak_with_edit_list(&[(1_000, 250)]);
+      let presentation_offset = track_presentation_offset(&trak);
+      let mut budget = RetainedBudget::new(usize::MAX);
+      let timing = SampleTimingTable::parse(&stts(4, 100), &mut budget).unwrap();
+      let fourth_sample = timing.iter().nth(3).unwrap();
+
+      assert_eq!(presentation_offset, 250);
+      assert_eq!(
+         fourth_sample.start_tick - u64::try_from(presentation_offset).unwrap(),
+         50
+      );
+      let thumbnail_timeline =
+         PresentationTimeline::new(&stts(4, 100), None, presentation_offset, 4).unwrap();
+      assert_eq!(thumbnail_timeline.tick(4), Some(50));
    }
 
    #[test]
@@ -483,7 +861,7 @@ mod tests {
    }
 
    #[test]
-   fn rejects_zero_sample_delta() {
+   fn presentation_timeline_still_rejects_zero_sample_delta() {
       assert!(PresentationTimeline::new(&stts(2, 0), None, 0, 2).is_none());
    }
 

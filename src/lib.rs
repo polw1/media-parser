@@ -50,6 +50,8 @@ mod commands;
 mod envelope;
 mod error;
 mod session_cache;
+mod source;
+mod subtitle_command;
 
 pub use error::{Error, Result};
 
@@ -72,13 +74,15 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
    tauri::plugin::Builder::new("media-parser")
       .setup(|app, _api| {
          app.manage(commands::ThumbnailSessions::default());
+         app.manage(subtitle_command::SubtitleSessions::default());
          Ok(())
       })
       .invoke_handler(tauri::generate_handler![
          commands::get_metadata,
          commands::get_tracks,
          commands::get_cover,
-         commands::get_thumbnails
+         commands::get_thumbnails,
+         subtitle_command::get_subtitles
       ])
       .build()
 }

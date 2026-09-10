@@ -105,6 +105,43 @@ export interface ThumbnailsOptions extends MetadataOptions {
    maxHeight?: number;
 }
 
+/** One timed subtitle cue decoded from the binary IPC response. */
+export interface SubtitleCueInfo {
+   cueId: number;
+   startSec: number;
+   endSec: number;
+   /**
+    * Cue text as decoded from the sample. For `stpp` this is the decoded TTML
+    * markup; see `getSubtitles`.
+    */
+   text: string;
+}
+
+/** One subtitle track and the cues selected for the requested range. */
+export interface SubtitleInfo {
+   id: number;
+   codec: string;
+   language?: string;
+   timescale: number;
+   duration: number;
+   cues: SubtitleCueInfo[];
+}
+
+/** Options for extracting subtitle tracks and cues. */
+export interface SubtitleOptions extends MetadataOptions {
+   /**
+    * Track selector. `0` selects the first valid supported subtitle track.
+    * When present, `language` is ignored.
+    */
+   trackId?: number;
+   /** Case-insensitive language selector. An empty string is a valid no-match filter. */
+   language?: string;
+   /** Inclusive range start in milliseconds; must be paired with `endMs`. */
+   startMs?: number;
+   /** Exclusive range end in milliseconds; must be paired with `startMs`. */
+   endMs?: number;
+}
+
 // ============================================================================
 // Track Types
 // ============================================================================

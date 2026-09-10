@@ -158,9 +158,9 @@ struct OutputSelection<'a> {
 }
 
 /// Decodes one GOP and encodes the selected presentation-order pictures.
-pub fn decode_frames_to_jpeg(
+pub fn decode_frames_to_jpeg<S: AsRef<[u8]>>(
    config: &AvcConfig,
-   samples: &[Vec<u8>],
+   samples: &[S],
    output_indices: &[usize],
    output_counts: &[usize],
    quality: JpegQuality,
@@ -207,7 +207,7 @@ pub fn decode_frames_to_jpeg(
    let mut rgb = Vec::new();
 
    for sample in samples {
-      sample_to_annex_b(sample, config.length_size, &mut annex_b)?;
+      sample_to_annex_b(sample.as_ref(), config.length_size, &mut annex_b)?;
       if let Some(yuv) = decoder
          .decode_with_options(&annex_b, no_flush.clone())
          .map_err(|error| error.to_string())?

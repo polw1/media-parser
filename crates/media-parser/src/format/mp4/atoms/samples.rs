@@ -1,5 +1,6 @@
 //! MP4 sample-table parsing and sample reads.
 
+use super::budget::{RetainedBudget, TableParseError, TableResult, budgeted_vec};
 use super::sample_timing::{CompositionOffset, stts_sample_count};
 use super::{Mp4Nav, iter_boxes};
 use crate::decoders::h264::{AvcColorMetadata, AvcConfig};
@@ -39,6 +40,11 @@ impl SampleSizes {
       Self::from_parts(0, sizes, sample_count)
    }
 
+   #[cfg(test)]
+   pub(in crate::format::mp4) fn size_prefixes_capacity(&self) -> usize {
+      self.size_prefixes.capacity()
+   }
+
    fn from_parts(fixed_size: u32, sizes: Vec<u32>, sample_count: u32) -> Option<Self> {
       if fixed_size != 0 {
          return sizes.is_empty().then_some(Self {
@@ -64,6 +70,47 @@ impl SampleSizes {
          total = total.checked_add(u64::from(size))?;
       }
       Some(Self {
+         fixed_size,
+         sizes,
+         sample_count,
+         size_prefixes,
+      })
+   }
+
+   fn from_parts_bounded(
+      fixed_size: u32,
+      sizes: Vec<u32>,
+      sample_count: u32,
+      budget: &mut RetainedBudget,
+   ) -> TableResult<Self> {
+      if fixed_size != 0 {
+         return sizes
+            .is_empty()
+            .then_some(Self {
+               fixed_size,
+               sizes,
+               sample_count,
+               size_prefixes: Vec::new(),
+            })
+            .ok_or(TableParseError::Invalid("fixed stsz has size entries"));
+      }
+      if usize::try_from(sample_count).map_err(|_| TableParseError::BudgetExceeded)? != sizes.len()
+      {
+         return Err(TableParseError::Invalid("stsz sample count mismatch"));
+      }
+
+      let prefix_count = sizes.len().div_ceil(SAMPLE_SIZE_PREFIX_INTERVAL);
+      let mut size_prefixes = budgeted_vec(prefix_count, budget)?;
+      let mut total = 0u64;
+      for (index, size) in sizes.iter().copied().enumerate() {
+         if index % SAMPLE_SIZE_PREFIX_INTERVAL == 0 {
+            size_prefixes.push(total);
+         }
+         total = total
+            .checked_add(u64::from(size))
+            .ok_or(TableParseError::Invalid("stsz byte total overflow"))?;
+      }
+      Ok(Self {
          fixed_size,
          sizes,
          sample_count,
@@ -180,8 +227,7 @@ pub fn parse_avc_config(sample_entry_payload: &[u8]) -> Option<AvcConfig> {
 }
 
 pub fn parse_sample_sizes(stsz: &[u8]) -> Option<SampleSizes> {
-   let fixed_size = read_u32_be(stsz, 4)?;
-   let sample_count = read_u32_be(stsz, 8)?;
+   let (fixed_size, sample_count) = sample_size_header(stsz)?;
    let mut sizes = Vec::new();
    if fixed_size == 0 {
       let available = stsz.len().checked_sub(12)? / 4;
@@ -198,28 +244,54 @@ pub fn parse_sample_sizes(stsz: &[u8]) -> Option<SampleSizes> {
    SampleSizes::from_parts(fixed_size, sizes, sample_count)
 }
 
+pub(in crate::format::mp4) fn parse_sample_sizes_bounded(
+   stsz: &[u8],
+   budget: &mut RetainedBudget,
+) -> TableResult<SampleSizes> {
+   let (fixed_size, sample_count) =
+      sample_size_header(stsz).ok_or(TableParseError::Invalid("malformed stsz table"))?;
+   let expected_len = if fixed_size == 0 {
+      usize::try_from(sample_count)
+         .map_err(|_| TableParseError::Invalid("malformed stsz entry count"))?
+         .checked_mul(4)
+         .and_then(|bytes| bytes.checked_add(12))
+         .ok_or(TableParseError::Invalid("malformed stsz entry count"))?
+   } else {
+      12
+   };
+   if stsz.len() != expected_len {
+      return Err(TableParseError::Invalid("malformed stsz entry count"));
+   }
+
+   let count = usize::try_from(sample_count).map_err(|_| TableParseError::BudgetExceeded)?;
+   let mut sizes = if fixed_size == 0 {
+      budgeted_vec(count, budget)?
+   } else {
+      Vec::new()
+   };
+   if fixed_size == 0 {
+      for index in 0..count {
+         sizes.push(
+            read_u32_be(stsz, 12 + index * 4)
+               .ok_or(TableParseError::Invalid("malformed stsz entry"))?,
+         );
+      }
+   }
+   SampleSizes::from_parts_bounded(fixed_size, sizes, sample_count, budget)
+}
+
+fn sample_size_header(stsz: &[u8]) -> Option<(u32, u32)> {
+   Some((read_u32_be(stsz, 4)?, read_u32_be(stsz, 8)?))
+}
+
 pub fn parse_stsc(stsc: &[u8]) -> Option<Vec<StscEntry>> {
    let entry_count = table_entries(stsc, 12)?;
 
    let mut entries = Vec::new();
    entries.try_reserve(entry_count).ok()?;
    for index in 0..entry_count {
-      let offset = 8 + index * 12;
-      let entry = StscEntry {
-         first_chunk: read_u32_be(stsc, offset)?,
-         samples_per_chunk: read_u32_be(stsc, offset + 4)?,
-         sample_description_index: read_u32_be(stsc, offset + 8)?,
-      };
-      if entry.first_chunk == 0
-         || entry.samples_per_chunk == 0
-         || entry.sample_description_index == 0
-      {
-         return None;
-      }
-      if entries
-         .last()
-         .is_some_and(|previous: &StscEntry| previous.first_chunk >= entry.first_chunk)
-      {
+      let entry = parse_stsc_entry(stsc, index)?;
+      if !valid_stsc_entry(entries.last(), entry) {
          return None;
       }
       entries.push(entry);
@@ -227,25 +299,109 @@ pub fn parse_stsc(stsc: &[u8]) -> Option<Vec<StscEntry>> {
    Some(entries)
 }
 
-pub fn parse_chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
-   if let Some(stco) = stbl.nav(&[*b"stco"]) {
-      let entry_count = table_entries(stco, 4)?;
-      let mut offsets = Vec::new();
-      offsets.try_reserve(entry_count).ok()?;
-      for index in 0..entry_count {
-         offsets.push(u64::from(read_u32_be(stco, 8 + index * 4)?));
+pub(in crate::format::mp4) fn parse_stsc_bounded(
+   stsc: &[u8],
+   budget: &mut RetainedBudget,
+) -> TableResult<Vec<StscEntry>> {
+   let entry_count = raw_table_entries(stsc, "malformed stsc table")?;
+   validate_exact_table_len(stsc, entry_count, 12, "malformed stsc table")?;
+   let mut entries = budgeted_vec(entry_count, budget)?;
+   for index in 0..entry_count {
+      let entry =
+         parse_stsc_entry(stsc, index).ok_or(TableParseError::Invalid("malformed stsc entry"))?;
+      if !valid_stsc_entry(entries.last(), entry) {
+         return Err(TableParseError::Invalid("invalid stsc entry"));
       }
-      return Some(offsets);
+      entries.push(entry);
    }
+   Ok(entries)
+}
 
-   let co64 = stbl.nav(&[*b"co64"])?;
-   let entry_count = table_entries(co64, 8)?;
+fn parse_stsc_entry(stsc: &[u8], index: usize) -> Option<StscEntry> {
+   let offset = 8usize.checked_add(index.checked_mul(12)?)?;
+   Some(StscEntry {
+      first_chunk: read_u32_be(stsc, offset)?,
+      samples_per_chunk: read_u32_be(stsc, offset + 4)?,
+      sample_description_index: read_u32_be(stsc, offset + 8)?,
+   })
+}
+
+fn valid_stsc_entry(previous: Option<&StscEntry>, entry: StscEntry) -> bool {
+   entry.first_chunk != 0
+      && entry.samples_per_chunk != 0
+      && entry.sample_description_index != 0
+      && previous.is_none_or(|previous| previous.first_chunk < entry.first_chunk)
+}
+
+pub fn parse_chunk_offsets(stbl: &[u8]) -> Option<Vec<u64>> {
+   let (table, entry_size, is_64) = chunk_offset_table(stbl)?;
+   let entry_count = table_entries(table, entry_size)?;
    let mut offsets = Vec::new();
    offsets.try_reserve(entry_count).ok()?;
    for index in 0..entry_count {
-      offsets.push(read_u64_be(co64, 8 + index * 8)?);
+      offsets.push(read_chunk_offset(table, index, entry_size, is_64)?);
    }
    Some(offsets)
+}
+
+pub(in crate::format::mp4) fn parse_chunk_offsets_bounded(
+   stbl: &[u8],
+   budget: &mut RetainedBudget,
+) -> TableResult<Vec<u64>> {
+   let (table, entry_size, is_64) =
+      chunk_offset_table(stbl).ok_or(TableParseError::Invalid("missing stco/co64 table"))?;
+   let entry_count = raw_table_entries(table, "malformed chunk offset table")?;
+   validate_exact_table_len(
+      table,
+      entry_count,
+      entry_size,
+      "malformed chunk offset table",
+   )?;
+   let mut offsets = budgeted_vec(entry_count, budget)?;
+   for index in 0..entry_count {
+      offsets.push(
+         read_chunk_offset(table, index, entry_size, is_64)
+            .ok_or(TableParseError::Invalid("malformed chunk offset entry"))?,
+      );
+   }
+   Ok(offsets)
+}
+
+fn chunk_offset_table(stbl: &[u8]) -> Option<(&[u8], usize, bool)> {
+   stbl
+      .nav(&[*b"stco"])
+      .map(|stco| (stco, 4, false))
+      .or_else(|| stbl.nav(&[*b"co64"]).map(|co64| (co64, 8, true)))
+}
+
+fn read_chunk_offset(table: &[u8], index: usize, entry_size: usize, is_64: bool) -> Option<u64> {
+   let offset = 8usize.checked_add(index.checked_mul(entry_size)?)?;
+   if is_64 {
+      read_u64_be(table, offset)
+   } else {
+      read_u32_be(table, offset).map(u64::from)
+   }
+}
+
+fn raw_table_entries(table: &[u8], message: &'static str) -> TableResult<usize> {
+   usize::try_from(read_u32_be(table, 4).ok_or(TableParseError::Invalid(message))?)
+      .map_err(|_| TableParseError::BudgetExceeded)
+}
+
+fn validate_exact_table_len(
+   table: &[u8],
+   entry_count: usize,
+   entry_size: usize,
+   message: &'static str,
+) -> TableResult<()> {
+   let expected_len = entry_count
+      .checked_mul(entry_size)
+      .and_then(|bytes| bytes.checked_add(8))
+      .ok_or(TableParseError::Invalid(message))?;
+   if expected_len != table.len() {
+      return Err(TableParseError::Invalid(message));
+   }
+   Ok(())
 }
 
 pub fn parse_stss(stss: &[u8]) -> Option<Vec<u32>> {
@@ -593,6 +749,92 @@ mod tests {
       target.extend_from_slice(&size.to_be_bytes());
       target.extend_from_slice(fourcc);
       target.extend_from_slice(payload);
+   }
+
+   #[test]
+   fn bounded_stsz_validates_framing_before_charging_declared_entries() {
+      let mut stsz = vec![0u8; 12];
+      stsz[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+      let mut budget = RetainedBudget::new(8);
+
+      assert_eq!(
+         parse_sample_sizes_bounded(&stsz, &mut budget).unwrap_err(),
+         TableParseError::Invalid("malformed stsz entry count")
+      );
+   }
+
+   #[test]
+   fn bounded_stsc_and_offsets_reject_trailing_bytes() {
+      let mut stsc = vec![0u8; 8];
+      stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stsc.extend_from_slice(&1u32.to_be_bytes());
+      stsc.extend_from_slice(&1u32.to_be_bytes());
+      stsc.extend_from_slice(&1u32.to_be_bytes());
+      stsc.push(0);
+      // A budget too small for a single entry separates the two orders: were
+      // the charge to precede the framing check, this would be the fatal
+      // BudgetExceeded instead of the track-local Invalid.
+      let mut retained = RetainedBudget::new(0);
+      assert!(matches!(
+         parse_stsc_bounded(&stsc, &mut retained),
+         Err(TableParseError::Invalid("malformed stsc table"))
+      ));
+
+      let mut stco = vec![0u8; 8];
+      stco[4..8].copy_from_slice(&1u32.to_be_bytes());
+      stco.extend_from_slice(&100u32.to_be_bytes());
+      stco.push(0);
+      let mut stbl = Vec::new();
+      append_box(&mut stbl, b"stco", &stco);
+      let mut retained = RetainedBudget::new(0);
+      assert!(matches!(
+         parse_chunk_offsets_bounded(&stbl, &mut retained),
+         Err(TableParseError::Invalid("malformed chunk offset table"))
+      ));
+   }
+
+   #[test]
+   fn framing_valid_stco_accepts_exact_track_ceiling_and_rejects_one_more_entry() {
+      for count in [2u32, 3] {
+         let mut stco = vec![0u8; 4];
+         stco.extend_from_slice(&count.to_be_bytes());
+         for offset in 0..count {
+            stco.extend_from_slice(&offset.to_be_bytes());
+         }
+         let mut stbl = Vec::new();
+         append_box(&mut stbl, b"stco", &stco);
+         let mut budget = RetainedBudget::new(16);
+         budget.begin_track();
+         let result = parse_chunk_offsets_bounded(&stbl, &mut budget);
+         if count == 2 {
+            assert_eq!(result.unwrap(), vec![0, 1]);
+            assert_eq!(budget.used_bytes(), 16);
+         } else {
+            assert_eq!(result, Err(TableParseError::TrackTooLarge));
+            assert_eq!(budget.used_bytes(), 0);
+         }
+      }
+   }
+
+   #[test]
+   fn exact_table_length_overflow_is_invalid() {
+      assert_eq!(
+         validate_exact_table_len(&[], usize::MAX, 2, "overflowed table"),
+         Err(TableParseError::Invalid("overflowed table"))
+      );
+   }
+
+   #[test]
+   fn bounded_stsc_rejects_a_false_small_count_without_charging_budget() {
+      let mut stsc = vec![0u8; 8];
+      stsc[4..8].copy_from_slice(&1u32.to_be_bytes());
+      let mut budget = RetainedBudget::new(1024);
+
+      assert!(matches!(
+         parse_stsc_bounded(&stsc, &mut budget),
+         Err(TableParseError::Invalid("malformed stsc table"))
+      ));
+      assert_eq!(budget.used_bytes(), 0);
    }
 
    #[test]

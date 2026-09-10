@@ -319,6 +319,18 @@
           "markdownDescription": "Denies the get_metadata command without any pre-configured scope."
         },
         {
+          "description": "Enables the get_subtitles command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-get-subtitles",
+          "markdownDescription": "Enables the get_subtitles command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the get_subtitles command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-get-subtitles",
+          "markdownDescription": "Denies the get_subtitles command without any pre-configured scope."
+        },
+        {
           "description": "Enables the get_thumbnails command without any pre-configured scope.",
           "type": "string",
           "const": "allow-get-thumbnails",
@@ -343,10 +355,10 @@
           "markdownDescription": "Denies the get_tracks command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`\n- `allow-get-cover`\n- `allow-get-thumbnails`",
+          "description": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`\n- `allow-get-cover`\n- `allow-get-thumbnails`\n- `allow-get-subtitles`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`\n- `allow-get-cover`\n- `allow-get-thumbnails`"
+          "markdownDescription": "Default permissions for the media-parser plugin\n#### This default permission set includes:\n\n- `allow-get-metadata`\n- `allow-get-tracks`\n- `allow-get-cover`\n- `allow-get-thumbnails`\n- `allow-get-subtitles`"
         }
       ]
     }

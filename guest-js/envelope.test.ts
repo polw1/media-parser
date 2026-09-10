@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { decodeEnvelope } from './envelope';
+import { decodeEnvelope, parseEnvelopeHeader } from './envelope';
 
 interface Entry {
    label: string;
    offset: number;
    length: number;
 }
+
+const MEDIA_VERSION_POLICY = { supportedVersions: new Set([0, 1]), envelopeKind: 'media' };
 
 function buildEnvelope(header: unknown, payload: number[]): Uint8Array {
    const headerBytes = new TextEncoder().encode(JSON.stringify(header));
@@ -44,6 +46,34 @@ test('decodes a version 1 { version, entries } header', () => {
    assert.deepEqual([...entries[1].data], [3]);
 });
 
+test('parses the shared prefix, normalized header, and payload boundaries', () => {
+   const envelope = buildEnvelope(
+      { version: 1, entries: [{ label: 'a', offset: 0, length: 2 }] },
+      [7, 8],
+   );
+
+   const parsed = parseEnvelopeHeader<Entry>(envelope, MEDIA_VERSION_POLICY);
+
+   assert.equal(parsed.version, 1);
+   assert.equal(parsed.entries[0].label, 'a');
+   assert.equal(parsed.buffer, envelope);
+   assert.equal(parsed.payloadStart + parsed.payloadLength, envelope.byteLength);
+   assert.deepEqual(
+      [...parsed.buffer.subarray(parsed.payloadStart, parsed.payloadStart + parsed.payloadLength)],
+      [7, 8],
+   );
+});
+
+test('shared header parsing normalizes a legacy bare array to version 0', () => {
+   const parsed = parseEnvelopeHeader<Entry>(
+      buildEnvelope([{ label: 'a', offset: 0, length: 0 }], []),
+      MEDIA_VERSION_POLICY,
+   );
+
+   assert.equal(parsed.version, 0);
+   assert.equal(parsed.entries.length, 1);
+});
+
 test('decodes an empty envelope as zero entries', () => {
    const envelope = buildEnvelope({ version: 1, entries: [] }, []);
 
@@ -56,6 +86,18 @@ test('rejects an unknown envelope version', () => {
    const envelope = buildEnvelope({ version: 99, entries: [] }, []);
 
    assert.throws(() => decodeEnvelope(envelope), /Unsupported media envelope version: 99/);
+});
+
+test('shared header parsing rejects a version outside the caller policy', () => {
+   const envelope = buildEnvelope({ version: 0, entries: [] }, []);
+
+   assert.throws(
+      () => parseEnvelopeHeader<Entry>(envelope, {
+         supportedVersions: new Set([1]),
+         envelopeKind: 'caption',
+      }),
+      /Unsupported caption envelope version: 0/,
+   );
 });
 
 test('rejects a version 1 header missing "entries"', () => {
