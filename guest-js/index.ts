@@ -115,7 +115,8 @@ export async function getCover(
  * Retaining one thumbnail therefore retains the complete response buffer; use
  * `new Uint8Array(thumbnail.data)` when a small image must be retained alone.
  * Parsed thumbnail sessions are cached with an eight-entry LRU: remote
- * sessions expire after five minutes and local sessions after one minute.
+ * sessions expire five minutes after they are built and local sessions after
+ * one minute without reuse.
  *
  * @param source - Absolute path to a local file or URL of a remote media file
  * @param options - Timestamps, optional track, accuracy, JPEG bounds/quality, and URL headers

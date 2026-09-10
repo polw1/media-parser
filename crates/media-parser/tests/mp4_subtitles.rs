@@ -697,6 +697,21 @@ async fn high_level_subtitles_decodes_length_prefixed_quicktime_text() {
 }
 
 #[tokio::test]
+async fn high_level_subtitles_preserves_stpp_payload() {
+   let parser = MediaParser::new(BytesReader(single_codec_subtitle_mp4(
+      b"stpp",
+      b"<p>cue</p>".to_vec(),
+   )));
+
+   let tracks = parser.subtitles(None).await.expect("extract stpp track");
+
+   assert_eq!(tracks.len(), 1);
+   assert_eq!(tracks[0].base.codec, "stpp");
+   assert_eq!(tracks[0].cues.len(), 1);
+   assert_eq!(tracks[0].cues[0].text, "<p>cue</p>");
+}
+
+#[tokio::test]
 async fn high_level_subtitles_in_range_dispatches_synthetic_mp4() {
    let parser = MediaParser::new(BytesReader(subtitle_mp4()));
 
