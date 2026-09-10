@@ -1403,6 +1403,77 @@ mod tests {
       });
    }
 
+   #[test]
+   fn decode_waits_for_blocking_pool_after_read() {
+      use std::future::{Future, poll_fn};
+      use std::sync::atomic::{AtomicBool, Ordering};
+      use std::sync::{Mutex, mpsc};
+      use std::task::Poll;
+
+      struct BlockingReader {
+         release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+         read_completed: AtomicBool,
+      }
+
+      #[async_trait]
+      impl StreamReader for BlockingReader {
+         async fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+            BytesReader(vec![0, 1, b'x']).read_at(offset, buf).await
+         }
+
+         async fn size(&self) -> Result<u64> {
+            Ok(3)
+         }
+
+         async fn read_vec(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            let data = BytesReader(vec![0, 1, b'x']).read_vec(offset, len).await?;
+            let release_rx = self.release_rx.lock().unwrap().take().unwrap();
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            tokio::task::spawn_blocking(move || {
+               let _ = started_tx.send(());
+               let _ = release_rx.recv();
+            });
+            started_rx.await.unwrap();
+            self.read_completed.store(true, Ordering::SeqCst);
+            Ok(data)
+         }
+      }
+
+      let runtime = tokio::runtime::Builder::new_current_thread()
+         .max_blocking_threads(1)
+         .build()
+         .unwrap();
+      // Dropping the sender also releases the worker if the test panics.
+      let (release_tx, release_rx) = mpsc::channel();
+      runtime.block_on(async {
+         let reader = BlockingReader {
+            release_rx: Mutex::new(Some(release_rx)),
+            read_completed: AtomicBool::new(false),
+         };
+         let extraction = Arc::new(one_cue_index()).subtitles(&reader, None, None);
+         tokio::pin!(extraction);
+         let pending_after_read = poll_fn(|cx| {
+            let result = extraction.as_mut().poll(cx);
+            // Ignore waits for planning and for the reader's worker handshake.
+            // Once read_vec returns, inline decoding would finish this poll.
+            if reader.read_completed.load(Ordering::SeqCst) {
+               Poll::Ready(result.is_pending())
+            } else {
+               assert!(result.is_pending(), "extraction must reach the sample read");
+               Poll::Pending
+            }
+         })
+         .await;
+         release_tx.send(()).unwrap();
+         assert!(
+            pending_after_read,
+            "decoding must wait for the blocking worker"
+         );
+         let tracks = extraction.await.unwrap();
+         assert_eq!(tracks[0].cues[0].text, "x");
+      });
+   }
+
    #[tokio::test]
    async fn local_decode_error_returns_all_cumulative_budgets_without_refund() {
       let mut first = one_cue_track(1, 0);
