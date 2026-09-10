@@ -131,6 +131,38 @@ fn main() {
 }
 ```
 
+To configure HTTP defaults on all platforms, use `Builder` instead of `init()`:
+
+```rust
+tauri::Builder::default().plugin(
+    tauri_plugin_media_parser::Builder::new()
+        .user_agent("my-app/1.0")
+        .default_headers([("X-App-Version", "1.0")])
+        .default_headers_origins(["https://api.example.com"])
+        .build(),
+);
+```
+
+Per-call headers override these defaults regardless of header name casing.
+`user_agent` overrides `User-Agent` in `default_headers`. Invalid HTTP header
+names or values fail plugin initialization. Local files ignore headers.
+
+`default_headers_origins` restricts all defaults, including the user agent, by
+scheme, host and port. Paths are ignored and default ports are normalized. Calls
+accumulate origins; an explicitly empty list allows none. Outside the list, requests
+still run with their per-call headers, but without defaults. Invalid origin URLs or
+non-HTTP(S) schemes fail plugin initialization.
+
+Without `default_headers_origins`, defaults are sent to any URL requested by the
+frontend. Configure trusted HTTPS origins when defaults include credentials such as
+`Authorization` or `X-Api-Key`; the credential can stay in Rust.
+
+HTTP requests accept at most 64 headers after merging defaults and per-call headers.
+When any headers are configured (even just `User-Agent`), redirects to another
+origin are stopped, including redirects to another allowed origin or a CDN.
+Same-origin redirects keep the headers and allow up to ten hops. Without configured
+headers, the existing redirect policy is unchanged.
+
 ### JavaScript/TypeScript API
 
 Install the JavaScript package in your frontend:

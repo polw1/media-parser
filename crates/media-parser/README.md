@@ -5,6 +5,12 @@
 The `media-parser` crate provides an API for getting metadata, tracks, subtitles
 and frames from a local or remote MP4 media file.
 
+`HttpStreamReader::with_headers` accepts at most 64 header entries and returns an
+error above that limit. With a nonempty header map, redirects may only stay within
+the same origin (scheme, host and port), for up to ten hops. This also applies to
+public headers such as `User-Agent`. Without configured headers, redirects retain
+the default policy of up to ten hops across origins.
+
 ## Examples
 
 ### 1) Metadata
