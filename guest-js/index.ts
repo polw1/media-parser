@@ -161,7 +161,7 @@ export async function getThumbnails(
  * @param options - Optional track/language filter, paired range, and URL headers
  * @returns Subtitle tracks with absolute source cue times in seconds
  * @throws TypeError if the track ID or paired range cannot be represented
- * @throws Error if an explicitly selected positive trackId is malformed or
+ * @throws {string} if an explicitly selected positive trackId is malformed or
  * unsupported, or if aggregate request budgets are exceeded
  */
 export async function getSubtitles(

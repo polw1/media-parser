@@ -237,6 +237,7 @@ pub(crate) fn encode_subtitle_envelope(
       .try_reserve(cue_count)
       .map_err(|_| subtitle_envelope_too_large())?;
    let mut payload_len = 0usize;
+   let mut payloads: Vec<&[u8]> = Vec::new();
    for cue in tracks.iter().flat_map(|track| &track.cues) {
       if let std::collections::hash_map::Entry::Vacant(entry) = text_ranges.entry(cue.text.as_str())
       {
@@ -248,24 +249,13 @@ pub(crate) fn encode_subtitle_envelope(
             .checked_add(length)
             .filter(|total| *total <= output_cap)
             .ok_or_else(subtitle_envelope_too_large)?;
+         payloads
+            .try_reserve(1)
+            .map_err(|_| subtitle_envelope_too_large())?;
+         payloads.push(cue.text.as_bytes());
          entry.insert((offset, length));
       }
    }
-
-   let mut payloads = Vec::new();
-   payloads
-      .try_reserve_exact(text_ranges.len())
-      .map_err(|_| subtitle_envelope_too_large())?;
-   for text in text_ranges.keys() {
-      payloads.push(text.as_bytes());
-   }
-   payloads.sort_unstable_by_key(|payload| {
-      let text = std::str::from_utf8(payload).expect("subtitle payloads originate from UTF-8 text");
-      text_ranges
-         .get(text)
-         .expect("every subtitle payload has a deduplicated range")
-         .0
-   });
 
    let mut entries = Vec::new();
    entries
