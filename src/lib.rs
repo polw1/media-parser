@@ -172,11 +172,14 @@ mod tests {
       let defaults = source::DefaultHeaders::new(builder.into_headers(), origins).unwrap();
       for source in ["https://first.example/file", "https://second.example/file"] {
          assert_eq!(
-            defaults.merge(source, None),
+            defaults.merge(source, None).headers,
             Some(HashMap::from([("user-agent".into(), "app/1.0".into())]))
          );
       }
-      assert_eq!(defaults.merge("https://third.example/file", None), None);
+      assert_eq!(
+         defaults.merge("https://third.example/file", None).headers,
+         None
+      );
    }
 
    #[test]

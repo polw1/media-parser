@@ -9,7 +9,9 @@
 use crate::errors::{MediaParserError, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE};
+use reqwest::header::{
+   CONTENT_LENGTH, CONTENT_RANGE, HeaderMap, HeaderName, HeaderValue, RANGE, USER_AGENT,
+};
 use reqwest::{Client, redirect::Policy};
 use std::collections::HashMap;
 use std::path::Path;
@@ -338,15 +340,31 @@ struct ReadWindow {
 impl HttpStreamReader {
    /// Creates a new `HttpStreamReader` for the given URL.
    pub async fn new(url: &str) -> Result<Self> {
-      Self::build_with_headers(url, HeaderMap::new()).await
+      Self::build_with_headers(url, HeaderMap::new(), false).await
    }
 
    /// Creates a new `HttpStreamReader` with custom HTTP headers.
    ///
    /// Custom headers (e.g., for authentication) will be sent with all requests.
-   /// At most 64 entries are accepted. Redirects to another origin are stopped
-   /// when any headers are configured; same-origin redirects are limited to ten hops.
+   /// At most 64 entries are accepted. An empty map or only `User-Agent` uses the
+   /// default redirect policy across origins. Any other header restricts redirects
+   /// to the same origin (scheme, host and port). Both policies allow up to ten hops.
    pub async fn with_headers(url: &str, headers: HashMap<String, String>) -> Result<Self> {
+      Self::with_headers_and_redirect_policy(url, headers, false).await
+   }
+
+   /// Creates a reader with custom HTTP headers and an additional redirect restriction.
+   ///
+   /// Like [`Self::with_headers`], accepts at most 64 entries, rejects invalid names
+   /// and values, and rejects duplicate names ignoring case. `force_same_origin`
+   /// restricts redirects to the same origin even with an empty map or only
+   /// `User-Agent`. Setting it to `false` still restricts redirects when any other
+   /// header is present. Both policies allow up to ten hops.
+   pub async fn with_headers_and_redirect_policy(
+      url: &str,
+      headers: HashMap<String, String>,
+      force_same_origin: bool,
+   ) -> Result<Self> {
       if headers.len() > 64 {
          return Err(MediaParserError::HttpRequest(
             "At most 64 HTTP headers are supported".into(),
@@ -366,12 +384,16 @@ impl HttpStreamReader {
             )));
          }
       }
-      Self::build_with_headers(url, header_map).await
+      Self::build_with_headers(url, header_map, force_same_origin).await
    }
 
-   async fn build_with_headers(url: &str, headers: HeaderMap) -> Result<Self> {
+   async fn build_with_headers(
+      url: &str,
+      headers: HeaderMap,
+      force_same_origin: bool,
+   ) -> Result<Self> {
       let mut builder = Client::builder();
-      if !headers.is_empty() {
+      if force_same_origin || headers.keys().any(|name| name != USER_AGENT) {
          builder = builder.redirect(Policy::custom(|attempt| {
             if attempt
                .previous()
@@ -738,7 +760,7 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_http_cross_origin_redirects_require_no_configured_headers() {
+   async fn test_http_cross_origin_redirects_allow_empty_headers_but_block_api_keys() {
       for configured in [true, false] {
          let source = MockServer::start().await;
          let target = MockServer::start().await;
@@ -768,6 +790,134 @@ mod tests {
          } else {
             assert_eq!(size.unwrap(), 4);
             assert_eq!(bytes.unwrap(), b"data");
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn test_http_user_agent_only_follows_cross_origin_redirects_ignoring_case() {
+      for name in ["User-Agent", "uSeR-aGeNt"] {
+         let source = MockServer::start().await;
+         let target = MockServer::start().await;
+         Mock::given(header("User-Agent", "app/1.0"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
+            .expect(2)
+            .mount(&source)
+            .await;
+         for verb in ["HEAD", "GET"] {
+            Mock::given(method(verb))
+               .and(header("User-Agent", "app/1.0"))
+               .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+               .expect(1)
+               .mount(&target)
+               .await;
+         }
+         let reader = HttpStreamReader::with_headers(
+            &source.uri(),
+            HashMap::from([(name.into(), "app/1.0".into())]),
+         )
+         .await
+         .unwrap();
+
+         assert_eq!(reader.size().await.unwrap(), 4);
+         assert_eq!(reader.read_vec(0, 4).await.unwrap(), b"data");
+      }
+   }
+
+   #[tokio::test]
+   async fn test_http_explicit_redirect_restriction_only_adds_same_origin_protection() {
+      for (headers, force_same_origin, blocked) in [
+         (HashMap::new(), true, true),
+         (
+            HashMap::from([("User-Agent".into(), "app/1.0".into())]),
+            true,
+            true,
+         ),
+         (
+            HashMap::from([("User-Agent".into(), "app/1.0".into())]),
+            false,
+            false,
+         ),
+         (
+            HashMap::from([
+               ("User-Agent".into(), "app/1.0".into()),
+               ("X-Api-Key".into(), "test-secret".into()),
+            ]),
+            false,
+            true,
+         ),
+      ] {
+         let source = MockServer::start().await;
+         let target = MockServer::start().await;
+         Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
+            .expect(2)
+            .mount(&source)
+            .await;
+         Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+            .expect(if blocked { 0 } else { 2 })
+            .mount(&target)
+            .await;
+         let reader = HttpStreamReader::with_headers_and_redirect_policy(
+            &source.uri(),
+            headers,
+            force_same_origin,
+         )
+         .await
+         .unwrap();
+
+         let size = reader.size().await;
+         let bytes = reader.read_vec(0, 4).await;
+         if blocked {
+            assert!(matches!(size, Err(MediaParserError::HttpStatus(302))));
+            assert!(matches!(bytes, Err(MediaParserError::HttpStatus(302))));
+            assert!(target.received_requests().await.unwrap().is_empty());
+         } else {
+            assert_eq!(size.unwrap(), 4);
+            assert_eq!(bytes.unwrap(), b"data");
+            for request in target.received_requests().await.unwrap() {
+               assert_eq!(request.headers.get("User-Agent").unwrap(), "app/1.0");
+            }
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn test_http_explicit_redirect_policy_validates_headers() {
+      for force_same_origin in [false, true] {
+         for (headers, message) in [
+            (
+               (0..65)
+                  .map(|i| (format!("x-test-{i}"), "v".into()))
+                  .collect(),
+               "64",
+            ),
+            (
+               HashMap::from([("bad name".into(), "value".into())]),
+               "Invalid header name",
+            ),
+            (
+               HashMap::from([("User-Agent".into(), "bad\nvalue".into())]),
+               "Invalid header value",
+            ),
+            (
+               HashMap::from([
+                  ("User-Agent".into(), "app/1.0".into()),
+                  ("user-agent".into(), "app/1.0".into()),
+               ]),
+               "duplicate header name",
+            ),
+         ] {
+            let result = HttpStreamReader::with_headers_and_redirect_policy(
+               "https://example.com/file",
+               headers,
+               force_same_origin,
+            )
+            .await;
+            assert!(
+               matches!(result, Err(MediaParserError::HttpRequest(error)) if error.contains(message))
+            );
          }
       }
    }

@@ -12,8 +12,8 @@ use crate::envelope::{
 };
 use crate::session_cache::SessionPool;
 use crate::source::{
-   DefaultHeaders, MediaSourceKey, SESSION_REAPER_INTERVAL, open_reader, session_expiration,
-   source_key,
+   DefaultHeaders, MediaSourceKey, MergedHeaders, SESSION_REAPER_INTERVAL, open_reader,
+   session_expiration, source_key,
 };
 
 const MAX_SUBTITLE_SESSIONS: usize = 8;
@@ -88,7 +88,7 @@ fn prepare_subtitle_request(
 async fn subtitle_session(
    sessions: &SubtitleSessions,
    source: &str,
-   headers: Option<&HashMap<String, String>>,
+   headers: &MergedHeaders,
 ) -> Result<Arc<SubtitleSession>> {
    let key = source_key(source, headers).await;
    let expiration = session_expiration(&key);
@@ -109,7 +109,7 @@ async fn subtitle_tracks(
    language: Option<String>,
    start_ms: Option<u64>,
    end_ms: Option<u64>,
-   headers: Option<&HashMap<String, String>>,
+   headers: &MergedHeaders,
 ) -> Result<Vec<SubtitleTrack>> {
    let request = prepare_subtitle_request(track_id, language, start_ms, end_ms)?;
    let session = subtitle_session(sessions, source, headers).await?;
@@ -130,7 +130,7 @@ async fn subtitle_envelope(
    language: Option<String>,
    start_ms: Option<u64>,
    end_ms: Option<u64>,
-   headers: Option<&HashMap<String, String>>,
+   headers: &MergedHeaders,
 ) -> Result<Vec<u8>> {
    let tracks = subtitle_tracks(
       sessions, source, track_id, language, start_ms, end_ms, headers,
@@ -157,13 +157,7 @@ pub(crate) async fn get_subtitles(
 ) -> Result<tauri::ipc::Response> {
    let headers = defaults.merge(&source, headers);
    let envelope = subtitle_envelope(
-      &sessions,
-      &source,
-      track_id,
-      language,
-      start_ms,
-      end_ms,
-      headers.as_ref(),
+      &sessions, &source, track_id, language, start_ms, end_ms, &headers,
    )
    .await?;
    Ok(tauri::ipc::Response::new(envelope))
@@ -223,7 +217,7 @@ mod tests {
          Some("spa".to_string()),
          None,
          None,
-         None,
+         &MergedHeaders::default(),
       )
       .await
       .expect("track zero should select the first valid track");
@@ -310,7 +304,7 @@ mod tests {
             None,
             start,
             end,
-            None,
+            &MergedHeaders::default(),
          )
          .await
          .expect_err("invalid range must fail")
@@ -333,7 +327,7 @@ mod tests {
          None,
          None,
          None,
-         None,
+         &MergedHeaders::default(),
       )
       .await
       .expect("a missing track is a successful empty result");
@@ -350,10 +344,10 @@ mod tests {
       let sessions = SubtitleSessions::default();
       let source = subtitle_fixture_source();
 
-      let first = subtitle_session(&sessions, &source, None)
+      let first = subtitle_session(&sessions, &source, &MergedHeaders::default())
          .await
          .expect("first session should build");
-      let second = subtitle_session(&sessions, &source, None)
+      let second = subtitle_session(&sessions, &source, &MergedHeaders::default())
          .await
          .expect("the source-wide session should be reused");
 
@@ -365,7 +359,7 @@ mod tests {
       let sessions = Arc::new(SubtitleSessions::default());
       let source = subtitle_fixture_source();
       let request = |sessions: Arc<SubtitleSessions>, source: String| async move {
-         subtitle_session(&sessions, &source, None).await
+         subtitle_session(&sessions, &source, &MergedHeaders::default()).await
       };
 
       let (first, second, third) = tokio::time::timeout(Duration::from_secs(10), async {
@@ -456,13 +450,13 @@ mod tests {
       let source = path.to_string_lossy().into_owned();
       let sessions = SubtitleSessions::default();
 
-      let first = subtitle_session(&sessions, &source, None)
+      let first = subtitle_session(&sessions, &source, &MergedHeaders::default())
          .await
          .expect("first version should build");
       let mut changed = fixture;
       changed.push(0);
       std::fs::write(&path, changed).expect("change local file version");
-      let second = subtitle_session(&sessions, &source, None)
+      let second = subtitle_session(&sessions, &source, &MergedHeaders::default())
          .await
          .expect("changed version should build a new session");
       std::fs::remove_file(path).expect("remove temporary fixture");

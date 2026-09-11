@@ -158,10 +158,12 @@ frontend. Configure trusted HTTPS origins when defaults include credentials such
 `Authorization` or `X-Api-Key`; the credential can stay in Rust.
 
 HTTP requests accept at most 64 headers after merging defaults and per-call headers.
-When any headers are configured (even just `User-Agent`), redirects to another
-origin are stopped, including redirects to another allowed origin or a CDN.
-Same-origin redirects keep the headers and allow up to ten hops. Without configured
-headers, the existing redirect policy is unchanged.
+With no headers or only `User-Agent`, redirects follow the default policy across
+origins, unless a default subject to `default_headers_origins` was actually inserted
+during the merge. A per-call override does not count as inserting that default,
+even when its value is identical. Any other header, or an inserted restricted
+default, stops redirects to another origin, including another allowed origin or a
+CDN. Same-origin redirects keep the headers. Both policies allow up to ten hops.
 
 ### JavaScript/TypeScript API
 

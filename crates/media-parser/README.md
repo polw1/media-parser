@@ -6,10 +6,13 @@ The `media-parser` crate provides an API for getting metadata, tracks, subtitles
 and frames from a local or remote MP4 media file.
 
 `HttpStreamReader::with_headers` accepts at most 64 header entries and returns an
-error above that limit. With a nonempty header map, redirects may only stay within
-the same origin (scheme, host and port), for up to ten hops. This also applies to
-public headers such as `User-Agent`. Without configured headers, redirects retain
-the default policy of up to ten hops across origins.
+error above that limit. An empty map or only `User-Agent` retains the default
+redirect policy across origins. Any other header restricts redirects to the same
+origin (scheme, host and port). `HttpStreamReader::with_headers_and_redirect_policy`
+also accepts `force_same_origin`: `true` enforces the same-origin restriction even
+with no headers or only `User-Agent`; `false` keeps the rules of `with_headers`.
+Both constructors reject invalid names or values and duplicate names ignoring
+case. Both redirect policies allow up to ten hops.
 
 ## Examples
 

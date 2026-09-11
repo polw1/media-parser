@@ -17,6 +17,13 @@ pub(crate) struct DefaultHeaders {
    origins: Option<Vec<Origin>>,
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MergedHeaders {
+   pub(crate) headers: Option<HashMap<String, String>>,
+   // A restricted default was actually inserted, rather than overridden per call.
+   pub(crate) force_same_origin: bool,
+}
+
 impl DefaultHeaders {
    pub(crate) fn new(
       headers: HashMap<String, String>,
@@ -47,12 +54,12 @@ impl DefaultHeaders {
       &self,
       source: &str,
       headers: Option<HashMap<String, String>>,
-   ) -> Option<HashMap<String, String>> {
+   ) -> MergedHeaders {
       let Ok(url) = Url::parse(source) else {
-         return None;
+         return MergedHeaders::default();
       };
       if !matches!(url.scheme(), "http" | "https") {
-         return None;
+         return MergedHeaders::default();
       }
       if self.headers.is_empty()
          || self
@@ -60,15 +67,23 @@ impl DefaultHeaders {
             .as_ref()
             .is_some_and(|origins| !origins.contains(&url.origin()))
       {
-         return headers;
+         return MergedHeaders {
+            headers,
+            force_same_origin: false,
+         };
       }
       let mut headers = headers.unwrap_or_default();
+      let mut force_same_origin = false;
       for (name, value) in &self.headers {
          if !headers.keys().any(|key| key.eq_ignore_ascii_case(name)) {
             headers.insert(name.clone(), value.clone());
+            force_same_origin |= self.origins.is_some();
          }
       }
-      Some(headers)
+      MergedHeaders {
+         headers: Some(headers),
+         force_same_origin,
+      }
    }
 }
 
@@ -76,6 +91,7 @@ impl DefaultHeaders {
 pub(crate) struct MediaSourceKey {
    source: String,
    headers: Vec<(String, String)>,
+   force_same_origin: bool,
    local_version: Option<LocalSourceVersion>,
 }
 
@@ -91,13 +107,12 @@ fn is_http_source(source: &str) -> bool {
       .unwrap_or(false)
 }
 
-pub(crate) async fn source_key(
-   source: &str,
-   headers: Option<&HashMap<String, String>>,
-) -> MediaSourceKey {
+pub(crate) async fn source_key(source: &str, merged: &MergedHeaders) -> MediaSourceKey {
    let is_remote = is_http_source(source);
    let mut headers = if is_remote {
-      headers
+      merged
+         .headers
+         .as_ref()
          .into_iter()
          .flat_map(HashMap::iter)
          .map(|(name, value)| (name.to_ascii_lowercase(), value.clone()))
@@ -127,19 +142,22 @@ pub(crate) async fn source_key(
    MediaSourceKey {
       source: source.to_string(),
       headers,
+      force_same_origin: is_remote && merged.force_same_origin,
       local_version,
    }
 }
 
 pub(crate) async fn open_reader(
    source: &str,
-   headers: Option<&HashMap<String, String>>,
+   merged: &MergedHeaders,
 ) -> Result<Arc<dyn StreamReader>> {
    if is_http_source(source) {
-      let reader = match headers {
-         Some(headers) => HttpStreamReader::with_headers(source, headers.clone()).await?,
-         None => HttpStreamReader::new(source).await?,
-      };
+      let reader = HttpStreamReader::with_headers_and_redirect_policy(
+         source,
+         merged.headers.clone().unwrap_or_default(),
+         merged.force_same_origin,
+      )
+      .await?;
       Ok(Arc::new(reader))
    } else {
       Ok(Arc::new(FileStreamReader::new(source)?))
@@ -180,7 +198,9 @@ mod tests {
          .unwrap();
          let headers = Some(HashMap::from([(request_name.into(), "2.0".into())]));
          assert_eq!(
-            defaults.merge("https://example.com/video.mp4", headers),
+            defaults
+               .merge("https://example.com/video.mp4", headers)
+               .headers,
             Some(HashMap::from([
                (request_name.into(), "2.0".into()),
                ("x-other".into(), "keep".into()),
@@ -197,10 +217,9 @@ mod tests {
          Some(vec!["https://API.EXAMPLE:443/path".into()]),
       )
       .unwrap();
-      assert_eq!(
-         defaults.merge("https://api.example/video.mp4", None),
-         Some(headers)
-      );
+      let merged = defaults.merge("https://api.example/video.mp4", None);
+      assert_eq!(merged.headers, Some(headers));
+      assert!(merged.force_same_origin);
       for source in [
          "http://api.example/video.mp4",
          "https://api.example:444/video.mp4",
@@ -208,7 +227,9 @@ mod tests {
          "https://api.example.evil/video.mp4",
       ] {
          let per_call = Some(HashMap::from([("x-call".into(), "keep".into())]));
-         assert_eq!(defaults.merge(source, per_call.clone()), per_call);
+         let merged = defaults.merge(source, per_call.clone());
+         assert_eq!(merged.headers, per_call);
+         assert!(!merged.force_same_origin);
       }
    }
 
@@ -217,19 +238,27 @@ mod tests {
       let headers = HashMap::from([("user-agent".into(), "app/1.0".into())]);
       let global = DefaultHeaders::new(headers.clone(), None).unwrap();
       let empty = DefaultHeaders::new(headers.clone(), Some(vec![])).unwrap();
+      let merged = global.merge("https://any.example/video.mp4", None);
+      assert_eq!(merged.headers, Some(headers.clone()));
+      assert!(!merged.force_same_origin);
       assert_eq!(
-         global.merge("https://any.example/video.mp4", None),
-         Some(headers.clone())
+         empty.merge("https://any.example/video.mp4", None),
+         MergedHeaders::default()
       );
-      assert_eq!(empty.merge("https://any.example/video.mp4", None), None);
       for source in [
          "/tmp/video.mp4",
          "C:\\video.mp4",
          "file:///tmp/video.mp4",
          "https://",
       ] {
-         assert_eq!(global.merge(source, Some(headers.clone())), None);
-         assert_eq!(empty.merge(source, Some(headers.clone())), None);
+         assert_eq!(
+            global.merge(source, Some(headers.clone())),
+            MergedHeaders::default()
+         );
+         assert_eq!(
+            empty.merge(source, Some(headers.clone())),
+            MergedHeaders::default()
+         );
       }
    }
 
@@ -246,6 +275,125 @@ mod tests {
    }
 
    #[tokio::test]
+   async fn merged_user_agent_redirects_preserve_origin_restrictions_and_overrides() {
+      use wiremock::matchers::{any, header, method};
+      use wiremock::{Mock, MockServer, ResponseTemplate};
+
+      for (restricted, overridden, blocked) in [
+         (false, false, false),
+         (true, false, true),
+         (true, true, false),
+      ] {
+         let source = MockServer::start().await;
+         let target = MockServer::start().await;
+         Mock::given(header("User-Agent", "app/1.0"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
+            .expect(2)
+            .mount(&source)
+            .await;
+         if blocked {
+            Mock::given(any())
+               .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+               .expect(0)
+               .mount(&target)
+               .await;
+         } else {
+            for verb in ["HEAD", "GET"] {
+               Mock::given(method(verb))
+                  .and(header("User-Agent", "app/1.0"))
+                  .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+                  .expect(1)
+                  .mount(&target)
+                  .await;
+            }
+         }
+         let defaults = DefaultHeaders::new(
+            crate::Builder::new().user_agent("app/1.0").into_headers(),
+            restricted.then(|| vec![source.uri(), target.uri()]),
+         )
+         .unwrap();
+         let per_call =
+            overridden.then(|| HashMap::from([("user-agent".into(), "app/1.0".into())]));
+         let headers = defaults.merge(&source.uri(), per_call);
+         let reader = open_reader(&source.uri(), &headers).await.unwrap();
+
+         let size = reader.size().await;
+         let bytes = reader.read_vec(0, 4).await;
+         if blocked {
+            assert!(matches!(
+               size,
+               Err(media_parser::MediaParserError::HttpStatus(302))
+            ));
+            assert!(matches!(
+               bytes,
+               Err(media_parser::MediaParserError::HttpStatus(302))
+            ));
+            assert!(target.received_requests().await.unwrap().is_empty());
+         } else {
+            assert_eq!(size.unwrap(), 4);
+            assert_eq!(bytes.unwrap(), b"data");
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn restricted_default_override_with_the_same_value_has_a_distinct_source_key() {
+      let source = "https://example.com/video.mp4";
+      let defaults = DefaultHeaders::new(
+         HashMap::from([("user-agent".into(), "app/1.0".into())]),
+         Some(vec![source.into()]),
+      )
+      .unwrap();
+      let inherited = defaults.merge(source, None);
+      let overridden = defaults.merge(source, inherited.headers.clone());
+
+      assert_eq!(inherited.headers, overridden.headers);
+      assert!(inherited.force_same_origin);
+      assert!(!overridden.force_same_origin);
+      let inherited_key = source_key(source, &inherited).await;
+      let overridden_key = source_key(source, &overridden).await;
+      assert_ne!(inherited_key, overridden_key);
+      assert_eq!(
+         std::collections::HashSet::from([inherited_key, overridden_key]).len(),
+         2
+      );
+   }
+
+   #[test]
+   fn only_effectively_inserted_restricted_defaults_force_same_origin() {
+      let source = "https://example.com/video.mp4";
+      let defaults = DefaultHeaders::new(
+         HashMap::from([
+            ("User-Agent".into(), "app/1.0".into()),
+            ("X-App-Version".into(), "1.0".into()),
+         ]),
+         Some(vec![source.into()]),
+      )
+      .unwrap();
+      let partial_override = defaults.merge(
+         source,
+         Some(HashMap::from([("user-agent".into(), "app/1.0".into())])),
+      );
+      assert!(partial_override.force_same_origin);
+      let full_override = defaults.merge(
+         source,
+         Some(HashMap::from([
+            ("user-agent".into(), "app/1.0".into()),
+            ("x-app-version".into(), "1.0".into()),
+         ])),
+      );
+      assert!(!full_override.force_same_origin);
+      assert!(
+         !defaults
+            .merge("https://other.example/file", None)
+            .force_same_origin
+      );
+
+      let empty_defaults = DefaultHeaders::new(HashMap::new(), Some(vec![source.into()])).unwrap();
+      assert!(!empty_defaults.merge(source, None).force_same_origin);
+   }
+
+   #[tokio::test]
    async fn remote_source_key_normalizes_header_names_and_order() {
       let first_headers = HashMap::from([
          ("X-Test".to_string(), "one".to_string()),
@@ -256,8 +404,22 @@ mod tests {
          ("x-test".to_string(), "one".to_string()),
       ]);
 
-      let first = source_key("https://example.com/video.mp4", Some(&first_headers)).await;
-      let second = source_key("https://example.com/video.mp4", Some(&second_headers)).await;
+      let first = source_key(
+         "https://example.com/video.mp4",
+         &MergedHeaders {
+            headers: Some(first_headers),
+            force_same_origin: false,
+         },
+      )
+      .await;
+      let second = source_key(
+         "https://example.com/video.mp4",
+         &MergedHeaders {
+            headers: Some(second_headers),
+            force_same_origin: false,
+         },
+      )
+      .await;
 
       assert!(first == second);
    }
@@ -276,12 +438,19 @@ mod tests {
       let source = path.to_string_lossy();
       let headers = HashMap::from([("Authorization".to_string(), "ignored".to_string())]);
 
-      let first = source_key(&source, None).await;
-      let with_headers = source_key(&source, Some(&headers)).await;
+      let first = source_key(&source, &MergedHeaders::default()).await;
+      let with_headers = source_key(
+         &source,
+         &MergedHeaders {
+            headers: Some(headers),
+            force_same_origin: true,
+         },
+      )
+      .await;
       assert!(first == with_headers);
 
       std::fs::write(&path, [1, 2]).expect("fixture version should change");
-      let changed = source_key(&source, None).await;
+      let changed = source_key(&source, &MergedHeaders::default()).await;
       std::fs::remove_file(&path).expect("fixture should be removed");
 
       assert!(first != changed);
@@ -289,8 +458,8 @@ mod tests {
 
    #[tokio::test]
    async fn missing_local_metadata_keeps_a_stable_key_without_a_version() {
-      let first = source_key("/file/that/does/not/exist.mp4", None).await;
-      let second = source_key("/file/that/does/not/exist.mp4", None).await;
+      let first = source_key("/file/that/does/not/exist.mp4", &MergedHeaders::default()).await;
+      let second = source_key("/file/that/does/not/exist.mp4", &MergedHeaders::default()).await;
 
       assert!(first == second);
       assert!(first.local_version.is_none());
@@ -298,8 +467,8 @@ mod tests {
 
    #[tokio::test]
    async fn local_sessions_slide_for_one_minute_and_remote_sessions_end_after_five() {
-      let local = source_key("/file/that/does/not/exist.mp4", None).await;
-      let remote = source_key("https://example.com/video.mp4", None).await;
+      let local = source_key("/file/that/does/not/exist.mp4", &MergedHeaders::default()).await;
+      let remote = source_key("https://example.com/video.mp4", &MergedHeaders::default()).await;
 
       assert_eq!(
          session_expiration(&local),
