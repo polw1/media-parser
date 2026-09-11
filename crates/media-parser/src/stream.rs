@@ -42,6 +42,8 @@ impl FileReadAt for std::fs::File {
 }
 
 // Constants
+const MAX_HTTP_HEADERS: usize = 64;
+
 /// HTTP status code for partial content (Range request success)
 const HTTP_PARTIAL_CONTENT: u16 = 206;
 /// HTTP status code for an unsatisfiable Range request.
@@ -389,10 +391,10 @@ impl HttpStreamReader {
       headers: HashMap<String, String>,
       force_same_origin: bool,
    ) -> Result<Self> {
-      if headers.len() > 64 {
-         return Err(MediaParserError::HttpRequest(
-            "At most 64 HTTP headers are supported".into(),
-         ));
+      if headers.len() > MAX_HTTP_HEADERS {
+         return Err(MediaParserError::HttpRequest(format!(
+            "At most {MAX_HTTP_HEADERS} HTTP headers are supported"
+         )));
       }
       let mut header_map = HeaderMap::new();
       for (k, v) in headers {
