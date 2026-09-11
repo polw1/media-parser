@@ -364,9 +364,13 @@ impl HttpStreamReader {
    ///
    /// At most 64 entries are accepted. Uses reqwest's default redirect policy,
    /// allowing up to ten hops across origins regardless of configured headers.
-   /// Reqwest removes its known sensitive headers, such as `Authorization` and
-   /// `Cookie`, when the origin changes. Other headers, including `User-Agent`
-   /// and `X-Api-Key`, can be forwarded to the new origin. To restrict redirects,
+   /// In the locked versions (reqwest 0.13.4 and tower-http 0.6.11), reqwest removes
+   /// known sensitive headers, such as `Authorization` and `Cookie`, only on the
+   /// hop that changes origin. This protection does not persist across later hops:
+   /// tower-http restores the original headers per hop, and reqwest compares only
+   /// consecutive origins. In A → B/1 → B/2, `Authorization` is removed for B/1 but
+   /// can reappear at B/2, exposing credentials. Other headers, including `User-Agent`
+   /// and `X-Api-Key`, can be forwarded on the first cross-origin hop. To confine headers,
    /// use [`Self::with_headers_and_redirect_policy`] with `force_same_origin = true`.
    pub async fn with_headers(url: &str, headers: HashMap<String, String>) -> Result<Self> {
       Self::with_headers_and_redirect_policy(url, headers, false).await

@@ -92,9 +92,11 @@ cargo test
 ```
 
 The HTTP default helper tests cover composition and validation, including accumulated
-and empty origins and invalid headers. They do not execute `Builder::build()` or
-Tauri's setup hook. A separate setup integration test using `tauri::test::mock_builder`
-(with Tauri's `test` feature in dev-dependencies) remains recommended.
+and empty origins and invalid headers. Setup integration tests using
+`tauri::test::mock_builder` execute `Builder::build()` and Tauri's plugin setup hook:
+valid configuration makes the configured defaults available in `State<DefaultHeaders>`,
+and an invalid default header rejects plugin initialization. Tauri's `test` feature
+is enabled in dev-dependencies.
 
 ### Linting and standards checks
 
@@ -171,10 +173,16 @@ frontend. Configure trusted HTTPS origins when defaults include credentials such
 HTTP requests accept at most 64 headers after merging defaults and per-call headers.
 Unless a restricted default was inserted, redirects follow reqwest's default
 policy across origins, regardless of the configured header names or combinations.
-Reqwest removes `Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and
-`WWW-Authenticate` when the origin changes. Other headers, including `User-Agent`
-and `X-Api-Key`, can be forwarded to the new origin. Configure
-`default_headers_origins` to restrict defaults containing credentials.
+In the locked versions (reqwest 0.13.4 and tower-http 0.6.11), reqwest removes
+`Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
+only on the hop that changes origin. This protection does not persist across later
+hops: tower-http restores the original headers for each hop, and reqwest compares
+only consecutive origins. In A → B/1 → B/2, `Authorization` is removed for B/1 but
+can reappear at B/2, exposing credentials, including Rust-configured global defaults.
+Other headers, including `User-Agent` and `X-Api-Key`, can be forwarded on the first
+cross-origin hop. Configure `default_headers_origins` to confine credential defaults
+as described below. Direct users of `HttpStreamReader` can use
+`with_headers_and_redirect_policy` with `force_same_origin = true`.
 
 If a default subject to `default_headers_origins` was actually inserted during the
 merge, redirects stay within the same origin regardless of the final header names,

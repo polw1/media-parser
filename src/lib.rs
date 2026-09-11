@@ -167,6 +167,53 @@ impl Builder {
 #[cfg(test)]
 mod tests {
    use super::*;
+   use tauri::test::{mock_builder, mock_context, noop_assets};
+
+   #[test]
+   fn plugin_setup_registers_configured_default_headers() {
+      let app = mock_builder()
+         .plugin(
+            Builder::new()
+               .user_agent("app/1.0")
+               .default_headers([("Authorization", "Bearer test")])
+               .default_headers_origins(["https://example.com"])
+               .build(),
+         )
+         .build(mock_context(noop_assets()))
+         .expect("valid defaults should allow plugin initialization");
+
+      let defaults: tauri::State<'_, source::DefaultHeaders> = app.state();
+      assert_eq!(
+         defaults.merge("https://example.com/file", None).unwrap(),
+         source::MergedHeaders {
+            headers: Some(HashMap::from([
+               ("user-agent".into(), "app/1.0".into()),
+               ("authorization".into(), "Bearer test".into()),
+            ])),
+            force_same_origin: true,
+         }
+      );
+      assert_eq!(
+         defaults.merge("https://other.example/file", None).unwrap(),
+         source::MergedHeaders::default()
+      );
+   }
+
+   #[test]
+   fn plugin_setup_rejects_invalid_default_header() {
+      let result = mock_builder()
+         .plugin(Builder::new().default_headers([("X-Test", "a\nb")]).build())
+         .build(mock_context(noop_assets()));
+
+      match result {
+         Err(tauri::Error::PluginInitialization(name, reason)) => {
+            assert_eq!(name, "media-parser");
+            assert!(reason.contains("Invalid default header value"), "{reason}");
+         }
+         Err(error) => panic!("unexpected initialization error: {error}"),
+         Ok(_) => panic!("invalid defaults should reject plugin initialization"),
+      }
+   }
 
    #[test]
    fn default_header_origins_accumulate_and_limit_where_defaults_are_sent() {

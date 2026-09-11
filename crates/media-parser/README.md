@@ -7,10 +7,14 @@ and frames from a local or remote MP4 media file.
 
 `HttpStreamReader::with_headers` accepts at most 64 header entries and returns an
 error above that limit. It uses reqwest's default redirect policy across origins,
-regardless of the configured header names or combinations. Reqwest removes
-`Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and `WWW-Authenticate`
-when the origin changes. Other headers, including `User-Agent` and `X-Api-Key`,
-can be forwarded to the new origin.
+regardless of the configured header names or combinations. In the locked versions
+(reqwest 0.13.4 and tower-http 0.6.11), reqwest removes `Authorization`, `Cookie`,
+`cookie2`, `Proxy-Authorization` and `WWW-Authenticate` only on the hop that changes
+origin. This protection does not persist across later hops: tower-http restores
+the original headers for each hop, and reqwest compares only consecutive origins.
+In A → B/1 → B/2, `Authorization` is removed for B/1 but can reappear at B/2,
+exposing credentials. Other headers, including `User-Agent` and `X-Api-Key`, can
+be forwarded on the first cross-origin hop.
 
 `HttpStreamReader::with_headers_and_redirect_policy` also accepts
 `force_same_origin`: `true` restricts redirects to the same origin (scheme, host
