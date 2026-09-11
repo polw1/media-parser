@@ -155,7 +155,7 @@ pub(crate) async fn get_subtitles(
    sessions: State<'_, SubtitleSessions>,
    defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
-   let headers = defaults.merge(&source, headers);
+   let headers = defaults.merge(&source, headers)?;
    let envelope = subtitle_envelope(
       &sessions, &source, track_id, language, start_ms, end_ms, &headers,
    )

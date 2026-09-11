@@ -75,7 +75,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
    Builder::new().build()
 }
 
-/// Configures HTTP defaults on all platforms. Per-call headers override these defaults.
+/// Configures HTTP defaults on all platforms.
+/// Per-call headers override defaults, except `Host` when defaults apply to the requested URL.
 #[derive(Default)]
 pub struct Builder {
    user_agent: Option<String>,
@@ -131,17 +132,23 @@ impl Builder {
       self.headers
    }
 
-   /// Builds the plugin. Invalid HTTP headers fail plugin initialization.
-   pub fn build<R: Runtime>(mut self) -> TauriPlugin<R> {
+   fn into_default_headers(mut self) -> Result<source::DefaultHeaders> {
       let origins = self.origins.take();
       let headers = self.into_headers();
+      for (name, value) in &headers {
+         tauri::http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| Error::Custom(format!("Invalid default header name: {error}")))?;
+         tauri::http::HeaderValue::from_str(value)
+            .map_err(|error| Error::Custom(format!("Invalid default header value: {error}")))?;
+      }
+      source::DefaultHeaders::new(headers, origins)
+   }
+
+   /// Builds the plugin. Invalid HTTP headers fail plugin initialization.
+   pub fn build<R: Runtime>(self) -> TauriPlugin<R> {
       tauri::plugin::Builder::new("media-parser")
          .setup(move |app, _api| {
-            for (name, value) in &headers {
-               tauri::http::HeaderName::from_bytes(name.as_bytes())?;
-               tauri::http::HeaderValue::from_str(value)?;
-            }
-            app.manage(source::DefaultHeaders::new(headers, origins)?);
+            app.manage(self.into_default_headers()?);
             app.manage(commands::ThumbnailSessions::default());
             app.manage(subtitle_command::SubtitleSessions::default());
             Ok(())
@@ -163,23 +170,57 @@ mod tests {
 
    #[test]
    fn default_header_origins_accumulate_and_limit_where_defaults_are_sent() {
-      let mut builder = Builder::new()
+      let defaults = Builder::new()
          .user_agent("app/1.0")
          .default_headers_origins(Vec::<String>::new())
          .default_headers_origins(["https://first.example"])
-         .default_headers_origins(["https://second.example"]);
-      let origins = builder.origins.take();
-      let defaults = source::DefaultHeaders::new(builder.into_headers(), origins).unwrap();
+         .default_headers_origins(["https://second.example"])
+         .into_default_headers()
+         .unwrap();
       for source in ["https://first.example/file", "https://second.example/file"] {
          assert_eq!(
-            defaults.merge(source, None).headers,
+            defaults.merge(source, None).unwrap().headers,
             Some(HashMap::from([("user-agent".into(), "app/1.0".into())]))
          );
       }
       assert_eq!(
-         defaults.merge("https://third.example/file", None).headers,
+         defaults
+            .merge("https://third.example/file", None)
+            .unwrap()
+            .headers,
          None
       );
+   }
+
+   #[test]
+   fn empty_default_header_origins_send_no_defaults() {
+      let defaults = Builder::new()
+         .user_agent("app/1.0")
+         .default_headers([("Authorization", "Bearer test")])
+         .default_headers_origins(Vec::<String>::new())
+         .into_default_headers()
+         .unwrap();
+      assert_eq!(
+         defaults
+            .merge("https://example.com/file", None)
+            .unwrap()
+            .headers,
+         None
+      );
+   }
+
+   #[test]
+   fn invalid_http_defaults_fail_default_header_composition() {
+      for builder in [
+         Builder::new().user_agent("a\nb"),
+         Builder::new().default_headers([("invalid header", "value")]),
+         Builder::new().default_headers([("X-Test", "a\nb")]),
+      ] {
+         assert!(matches!(
+            builder.into_default_headers(),
+            Err(Error::Custom(_))
+         ));
+      }
    }
 
    #[test]
@@ -193,8 +234,13 @@ mod tests {
             .user_agent("my-app/1.0"),
       ] {
          assert_eq!(
-            builder.into_headers(),
-            HashMap::from([("user-agent".into(), "my-app/1.0".into())]),
+            builder
+               .into_default_headers()
+               .unwrap()
+               .merge("https://example.com/file", None)
+               .unwrap()
+               .headers,
+            Some(HashMap::from([("user-agent".into(), "my-app/1.0".into())])),
          );
       }
    }

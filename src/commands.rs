@@ -106,7 +106,7 @@ pub(crate) async fn get_metadata(
    headers: Option<HashMap<String, String>>,
    defaults: State<'_, DefaultHeaders>,
 ) -> Result<Metadata> {
-   let headers = defaults.merge(&source, headers);
+   let headers = defaults.merge(&source, headers)?;
    let reader = open_reader(&source, &headers).await?;
    MediaParser::new(reader.as_ref())
       .metadata()
@@ -121,7 +121,7 @@ pub(crate) async fn get_tracks(
    headers: Option<HashMap<String, String>>,
    defaults: State<'_, DefaultHeaders>,
 ) -> Result<Vec<TrackInfo>> {
-   let headers = defaults.merge(&source, headers);
+   let headers = defaults.merge(&source, headers)?;
    let reader = open_reader(&source, &headers).await?;
    let tracks = MediaParser::new(reader.as_ref())
       .tracks()
@@ -138,7 +138,7 @@ pub(crate) async fn get_cover(
    headers: Option<HashMap<String, String>>,
    defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
-   let headers = defaults.merge(&source, headers);
+   let headers = defaults.merge(&source, headers)?;
    let reader = open_reader(&source, &headers).await?;
    let cover = MediaParser::new(reader.as_ref())
       .cover()
@@ -163,7 +163,7 @@ pub(crate) async fn get_thumbnails(
    sessions: State<'_, ThumbnailSessions>,
    defaults: State<'_, DefaultHeaders>,
 ) -> Result<tauri::ipc::Response> {
-   let headers = defaults.merge(&source, headers);
+   let headers = defaults.merge(&source, headers)?;
    let (unique_timestamps, order) = prepare_thumbnail_timestamps(&timestamps)?;
    let options = thumbnail_options(quality, max_width, max_height)?;
    let frames = thumbnail_frames(

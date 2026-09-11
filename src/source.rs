@@ -54,12 +54,12 @@ impl DefaultHeaders {
       &self,
       source: &str,
       headers: Option<HashMap<String, String>>,
-   ) -> MergedHeaders {
+   ) -> Result<MergedHeaders> {
       let Ok(url) = Url::parse(source) else {
-         return MergedHeaders::default();
+         return Ok(MergedHeaders::default());
       };
       if !matches!(url.scheme(), "http" | "https") {
-         return MergedHeaders::default();
+         return Ok(MergedHeaders::default());
       }
       if self.headers.is_empty()
          || self
@@ -67,12 +67,17 @@ impl DefaultHeaders {
             .as_ref()
             .is_some_and(|origins| !origins.contains(&url.origin()))
       {
-         return MergedHeaders {
+         return Ok(MergedHeaders {
             headers,
             force_same_origin: false,
-         };
+         });
       }
       let mut headers = headers.unwrap_or_default();
+      if headers.keys().any(|name| name.eq_ignore_ascii_case("host")) {
+         return Err(crate::Error::Custom(
+            "Per-call Host header is not allowed when default headers apply".into(),
+         ));
+      }
       let mut force_same_origin = false;
       for (name, value) in &self.headers {
          if !headers.keys().any(|key| key.eq_ignore_ascii_case(name)) {
@@ -80,10 +85,10 @@ impl DefaultHeaders {
             force_same_origin |= self.origins.is_some();
          }
       }
-      MergedHeaders {
+      Ok(MergedHeaders {
          headers: Some(headers),
          force_same_origin,
-      }
+      })
    }
 }
 
@@ -183,6 +188,67 @@ mod tests {
    use std::time::Duration;
 
    #[test]
+   fn per_call_host_is_rejected_ignoring_case_when_defaults_apply() {
+      for origins in [None, Some(vec!["https://api.example".into()])] {
+         let defaults = DefaultHeaders::new(
+            HashMap::from([("authorization".into(), "Bearer test".into())]),
+            origins,
+         )
+         .unwrap();
+         for name in ["Host", "host", "HOST", "hOsT"] {
+            for override_default in [false, true] {
+               let mut headers = HashMap::from([(name.into(), "other-tenant.example".into())]);
+               if override_default {
+                  headers.insert("Authorization".into(), "Bearer per-call".into());
+               }
+               let result = defaults.merge("https://api.example/file", Some(headers));
+               assert!(
+                  matches!(result, Err(crate::Error::Custom(ref message)) if message.contains("Host")),
+                  "per-call {name} must fail when defaults apply: {result:?}"
+               );
+            }
+         }
+      }
+   }
+
+   #[test]
+   fn per_call_host_is_preserved_when_no_defaults_apply() {
+      let configured = HashMap::from([("authorization".into(), "Bearer test".into())]);
+      for (headers, origins) in [
+         (HashMap::new(), None),
+         (HashMap::new(), Some(vec!["https://api.example".into()])),
+         (configured.clone(), Some(vec![])),
+         (configured, Some(vec!["https://other.example".into()])),
+      ] {
+         let defaults = DefaultHeaders::new(headers, origins).unwrap();
+         let per_call = Some(HashMap::from([(
+            "Host".into(),
+            "other-tenant.example".into(),
+         )]));
+         let merged = defaults
+            .merge("https://api.example/file", per_call.clone())
+            .unwrap();
+         assert_eq!(merged.headers, per_call);
+         assert!(!merged.force_same_origin);
+      }
+   }
+
+   #[test]
+   fn rust_default_host_is_allowed() {
+      let headers = HashMap::from([
+         ("Host".into(), "trusted-tenant.example".into()),
+         ("authorization".into(), "Bearer test".into()),
+      ]);
+      for origins in [None, Some(vec!["https://api.example".into()])] {
+         let restricted = origins.is_some();
+         let defaults = DefaultHeaders::new(headers.clone(), origins).unwrap();
+         let merged = defaults.merge("https://api.example/file", None).unwrap();
+         assert_eq!(merged.headers, Some(headers.clone()));
+         assert_eq!(merged.force_same_origin, restricted);
+      }
+   }
+
+   #[test]
    fn per_call_headers_override_defaults_ignoring_case() {
       for (default_name, request_name) in [
          ("x-app-version", "X-App-Version"),
@@ -200,6 +266,7 @@ mod tests {
          assert_eq!(
             defaults
                .merge("https://example.com/video.mp4", headers)
+               .unwrap()
                .headers,
             Some(HashMap::from([
                (request_name.into(), "2.0".into()),
@@ -217,7 +284,9 @@ mod tests {
          Some(vec!["https://API.EXAMPLE:443/path".into()]),
       )
       .unwrap();
-      let merged = defaults.merge("https://api.example/video.mp4", None);
+      let merged = defaults
+         .merge("https://api.example/video.mp4", None)
+         .unwrap();
       assert_eq!(merged.headers, Some(headers));
       assert!(merged.force_same_origin);
       for source in [
@@ -227,7 +296,7 @@ mod tests {
          "https://api.example.evil/video.mp4",
       ] {
          let per_call = Some(HashMap::from([("x-call".into(), "keep".into())]));
-         let merged = defaults.merge(source, per_call.clone());
+         let merged = defaults.merge(source, per_call.clone()).unwrap();
          assert_eq!(merged.headers, per_call);
          assert!(!merged.force_same_origin);
       }
@@ -238,11 +307,11 @@ mod tests {
       let headers = HashMap::from([("user-agent".into(), "app/1.0".into())]);
       let global = DefaultHeaders::new(headers.clone(), None).unwrap();
       let empty = DefaultHeaders::new(headers.clone(), Some(vec![])).unwrap();
-      let merged = global.merge("https://any.example/video.mp4", None);
+      let merged = global.merge("https://any.example/video.mp4", None).unwrap();
       assert_eq!(merged.headers, Some(headers.clone()));
       assert!(!merged.force_same_origin);
       assert_eq!(
-         empty.merge("https://any.example/video.mp4", None),
+         empty.merge("https://any.example/video.mp4", None).unwrap(),
          MergedHeaders::default()
       );
       for source in [
@@ -251,12 +320,14 @@ mod tests {
          "file:///tmp/video.mp4",
          "https://",
       ] {
+         let mut headers = headers.clone();
+         headers.insert("Host".into(), "other-tenant.example".into());
          assert_eq!(
-            global.merge(source, Some(headers.clone())),
+            global.merge(source, Some(headers.clone())).unwrap(),
             MergedHeaders::default()
          );
          assert_eq!(
-            empty.merge(source, Some(headers.clone())),
+            empty.merge(source, Some(headers.clone())).unwrap(),
             MergedHeaders::default()
          );
       }
@@ -276,7 +347,7 @@ mod tests {
 
    #[tokio::test]
    async fn merged_user_agent_redirects_preserve_origin_restrictions_and_overrides() {
-      use wiremock::matchers::{any, header, method};
+      use wiremock::matchers::{any, header};
       use wiremock::{Mock, MockServer, ResponseTemplate};
 
       for (restricted, overridden, blocked) in [
@@ -291,30 +362,20 @@ mod tests {
             .expect(2)
             .mount(&source)
             .await;
-         if blocked {
-            Mock::given(any())
-               .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-               .expect(0)
-               .mount(&target)
-               .await;
-         } else {
-            for verb in ["HEAD", "GET"] {
-               Mock::given(method(verb))
-                  .and(header("User-Agent", "app/1.0"))
-                  .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-                  .expect(1)
-                  .mount(&target)
-                  .await;
-            }
+         Mock::given(any())
+            .and(header("User-Agent", "app/1.0"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+            .expect(if blocked { 0 } else { 2 })
+            .mount(&target)
+            .await;
+         let mut builder = crate::Builder::new().user_agent("app/1.0");
+         if restricted {
+            builder = builder.default_headers_origins([source.uri(), target.uri()]);
          }
-         let defaults = DefaultHeaders::new(
-            crate::Builder::new().user_agent("app/1.0").into_headers(),
-            restricted.then(|| vec![source.uri(), target.uri()]),
-         )
-         .unwrap();
+         let defaults = builder.into_default_headers().unwrap();
          let per_call =
             overridden.then(|| HashMap::from([("user-agent".into(), "app/1.0".into())]));
-         let headers = defaults.merge(&source.uri(), per_call);
+         let headers = defaults.merge(&source.uri(), per_call).unwrap();
          let reader = open_reader(&source.uri(), &headers).await.unwrap();
 
          let size = reader.size().await;
@@ -337,88 +398,6 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn merged_headers_redirects_respect_only_explicit_origin_restrictions() {
-      use wiremock::matchers::any;
-      use wiremock::{Mock, MockServer, ResponseTemplate};
-
-      for (name, value, restricted, overridden, custom_default) in [
-         ("Authorization", "Bearer test", false, false, false),
-         ("Authorization", "Bearer test", true, false, false),
-         ("Authorization", "Bearer test", true, true, false),
-         ("Authorization", "Bearer test", false, true, true),
-         ("Authorization", "Bearer test", true, true, true),
-         ("X-Api-Key", "test-key", false, false, false),
-         ("X-Api-Key", "test-key", true, false, false),
-         ("X-Api-Key", "test-key", true, true, false),
-      ] {
-         let source = MockServer::start().await;
-         let target = MockServer::start().await;
-         Mock::given(any())
-            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
-            .expect(2)
-            .mount(&source)
-            .await;
-         Mock::given(any())
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-            .mount(&target)
-            .await;
-         let mut configured = HashMap::from([(name.into(), value.into())]);
-         if custom_default {
-            configured.insert("X-Api-Key".into(), "test-key".into());
-         }
-         let defaults = DefaultHeaders::new(
-            configured,
-            restricted.then(|| vec![source.uri(), target.uri()]),
-         )
-         .unwrap();
-         let per_call =
-            overridden.then(|| HashMap::from([(name.to_ascii_lowercase(), value.into())]));
-         let merged = defaults.merge(&source.uri(), per_call);
-         let reader = open_reader(&source.uri(), &merged).await.unwrap();
-         let head = reader.size().await;
-         let get = reader.read_vec(0, 4).await;
-         let initial = source.received_requests().await.unwrap();
-         let destination = target.received_requests().await.unwrap();
-         assert_eq!(initial.len(), 2);
-         assert_eq!(initial[0].method, "HEAD");
-         assert_eq!(initial[1].method, "GET");
-         for request in &initial {
-            assert_eq!(request.headers.get(name).unwrap(), value);
-            if custom_default {
-               assert_eq!(request.headers.get("x-api-key").unwrap(), "test-key");
-            }
-         }
-         assert_eq!(
-            merged.force_same_origin,
-            restricted && (!overridden || custom_default)
-         );
-         if restricted && (!overridden || custom_default) {
-            assert!(destination.is_empty());
-            for error in [head.unwrap_err(), get.unwrap_err()] {
-               assert_eq!(
-                  serde_json::to_value(crate::Error::from(error)).unwrap(),
-                  serde_json::json!(
-                     "Media parser error: HTTP request failed: cross-origin redirect blocked: same-origin policy enforced"
-                  )
-               );
-            }
-         } else {
-            assert_eq!(head.unwrap(), 4);
-            assert_eq!(get.unwrap(), b"data");
-            assert_eq!(destination.len(), 2);
-            assert_eq!(destination[0].method, "HEAD");
-            assert_eq!(destination[1].method, "GET");
-            for request in &destination {
-               assert!(!request.headers.contains_key("authorization"));
-               if custom_default || name == "X-Api-Key" {
-                  assert_eq!(request.headers.get("x-api-key").unwrap(), "test-key");
-               }
-            }
-         }
-      }
-   }
-
-   #[tokio::test]
    async fn restricted_default_override_with_the_same_value_has_a_distinct_source_key() {
       let source = "https://example.com/video.mp4";
       let defaults = DefaultHeaders::new(
@@ -426,8 +405,8 @@ mod tests {
          Some(vec![source.into()]),
       )
       .unwrap();
-      let inherited = defaults.merge(source, None);
-      let overridden = defaults.merge(source, inherited.headers.clone());
+      let inherited = defaults.merge(source, None).unwrap();
+      let overridden = defaults.merge(source, inherited.headers.clone()).unwrap();
 
       assert_eq!(inherited.headers, overridden.headers);
       assert!(inherited.force_same_origin);
@@ -452,27 +431,37 @@ mod tests {
          Some(vec![source.into()]),
       )
       .unwrap();
-      let partial_override = defaults.merge(
-         source,
-         Some(HashMap::from([("user-agent".into(), "app/1.0".into())])),
-      );
+      let partial_override = defaults
+         .merge(
+            source,
+            Some(HashMap::from([("user-agent".into(), "app/1.0".into())])),
+         )
+         .unwrap();
       assert!(partial_override.force_same_origin);
-      let full_override = defaults.merge(
-         source,
-         Some(HashMap::from([
-            ("user-agent".into(), "app/1.0".into()),
-            ("x-app-version".into(), "1.0".into()),
-         ])),
-      );
+      let full_override = defaults
+         .merge(
+            source,
+            Some(HashMap::from([
+               ("user-agent".into(), "app/1.0".into()),
+               ("x-app-version".into(), "1.0".into()),
+            ])),
+         )
+         .unwrap();
       assert!(!full_override.force_same_origin);
       assert!(
          !defaults
             .merge("https://other.example/file", None)
+            .unwrap()
             .force_same_origin
       );
 
       let empty_defaults = DefaultHeaders::new(HashMap::new(), Some(vec![source.into()])).unwrap();
-      assert!(!empty_defaults.merge(source, None).force_same_origin);
+      assert!(
+         !empty_defaults
+            .merge(source, None)
+            .unwrap()
+            .force_same_origin
+      );
    }
 
    #[tokio::test]

@@ -91,6 +91,11 @@ Run Rust tests:
 cargo test
 ```
 
+The HTTP default helper tests cover composition and validation, including accumulated
+and empty origins and invalid headers. They do not execute `Builder::build()` or
+Tauri's setup hook. A separate setup integration test using `tauri::test::mock_builder`
+(with Tauri's `test` feature in dev-dependencies) remains recommended.
+
 ### Linting and standards checks
 
 ```bash
@@ -146,6 +151,12 @@ tauri::Builder::default().plugin(
 Per-call headers override these defaults regardless of header name casing.
 `user_agent` overrides `User-Agent` in `default_headers`. Invalid HTTP header
 names or values fail plugin initialization. Local files ignore headers.
+
+When configured defaults apply to the requested URL, a per-call `Host` header in any
+casing causes an error, even if per-call headers override all defaults. This prevents
+the frontend from substituting the HTTP authority alongside Rust-configured defaults.
+`Host` configured in Rust defaults remains allowed. For HTTP(S) requests where no
+defaults apply, per-call `Host` is preserved.
 
 `default_headers_origins` restricts all defaults, including the user agent, by
 scheme, host and port. Paths are ignored and default ports are normalized. Calls

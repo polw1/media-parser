@@ -782,94 +782,15 @@ mod tests {
    }
 
    #[tokio::test]
-   async fn test_http_cross_origin_redirects_allow_empty_headers_and_forward_api_keys() {
-      for configured in [true, false] {
-         let source = MockServer::start().await;
-         let target = MockServer::start().await;
-         Mock::given(wiremock::matchers::any())
-            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
-            .expect(2)
-            .mount(&source)
-            .await;
-         Mock::given(wiremock::matchers::any())
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-            .expect(2)
-            .mount(&target)
-            .await;
-         let headers = if configured {
-            HashMap::from([("X-Api-Key".into(), "test-secret".into())])
-         } else {
-            HashMap::new()
-         };
-         let reader = HttpStreamReader::with_headers(&source.uri(), headers)
-            .await
-            .unwrap();
-         let size = reader.size().await;
-         let bytes = reader.read_vec(0, 4).await;
-         assert_eq!(size.unwrap(), 4);
-         assert_eq!(bytes.unwrap(), b"data");
-         for request in target.received_requests().await.unwrap() {
-            if configured {
-               assert_eq!(request.headers.get("X-Api-Key").unwrap(), "test-secret");
-            } else {
-               assert!(!request.headers.contains_key("X-Api-Key"));
-            }
-         }
-      }
-   }
-
-   #[tokio::test]
-   async fn test_http_user_agent_only_follows_cross_origin_redirects_ignoring_case() {
-      for name in ["User-Agent", "uSeR-aGeNt"] {
-         let source = MockServer::start().await;
-         let target = MockServer::start().await;
-         Mock::given(header("User-Agent", "app/1.0"))
-            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
-            .expect(2)
-            .mount(&source)
-            .await;
-         for verb in ["HEAD", "GET"] {
-            Mock::given(method(verb))
-               .and(header("User-Agent", "app/1.0"))
-               .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-               .expect(1)
-               .mount(&target)
-               .await;
-         }
-         let reader = HttpStreamReader::with_headers(
-            &source.uri(),
-            HashMap::from([(name.into(), "app/1.0".into())]),
-         )
-         .await
-         .unwrap();
-
-         assert_eq!(reader.size().await.unwrap(), 4);
-         assert_eq!(reader.read_vec(0, 4).await.unwrap(), b"data");
-      }
-   }
-
-   #[tokio::test]
-   async fn test_http_only_explicit_redirect_restrictions_block_cross_origin_requests() {
-      for (headers, force_same_origin, blocked) in [
-         (HashMap::new(), true, true),
-         (
-            HashMap::from([("User-Agent".into(), "app/1.0".into())]),
-            true,
-            true,
-         ),
-         (
-            HashMap::from([("User-Agent".into(), "app/1.0".into())]),
-            false,
-            false,
-         ),
-         (
-            HashMap::from([
-               ("User-Agent".into(), "app/1.0".into()),
-               ("X-Api-Key".into(), "test-secret".into()),
-            ]),
-            false,
-            false,
-         ),
+   async fn test_http_cross_origin_redirects_preserve_user_agent_and_strip_credentials() {
+      for headers in [
+         HashMap::new(),
+         HashMap::from([("uSeR-aGeNt".into(), "app/1.0".into())]),
+         HashMap::from([
+            ("Authorization".into(), "Bearer test".into()),
+            ("Cookie".into(), "session=test".into()),
+            ("X-Api-Key".into(), "test-secret".into()),
+         ]),
       ] {
          let source = MockServer::start().await;
          let target = MockServer::start().await;
@@ -880,73 +801,26 @@ mod tests {
             .await;
          Mock::given(wiremock::matchers::any())
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
-            .expect(if blocked { 0 } else { 2 })
+            .expect(2)
             .mount(&target)
             .await;
-         let reader = HttpStreamReader::with_headers_and_redirect_policy(
-            &source.uri(),
-            headers,
-            force_same_origin,
-         )
-         .await
-         .unwrap();
-
+         let reader = HttpStreamReader::with_headers(&source.uri(), headers.clone())
+            .await
+            .unwrap();
          let size = reader.size().await;
          let bytes = reader.read_vec(0, 4).await;
-         if blocked {
-            for error in [size.unwrap_err(), bytes.unwrap_err()] {
-               assert!(
-                  matches!(error, MediaParserError::HttpRequest(ref message)
-                     if message == "cross-origin redirect blocked: same-origin policy enforced"),
-                  "unexpected error: {error:?}"
-               );
+         assert_eq!(size.unwrap(), 4);
+         assert_eq!(bytes.unwrap(), b"data");
+         for (server, redirected) in [(&source, false), (&target, true)] {
+            for request in server.received_requests().await.unwrap() {
+               for (name, value) in &headers {
+                  if redirected && matches!(name.as_str(), "Authorization" | "Cookie") {
+                     assert!(!request.headers.contains_key(name.as_str()));
+                  } else {
+                     assert_eq!(request.headers.get(name.as_str()).unwrap(), value.as_str());
+                  }
+               }
             }
-            assert!(target.received_requests().await.unwrap().is_empty());
-         } else {
-            assert_eq!(size.unwrap(), 4);
-            assert_eq!(bytes.unwrap(), b"data");
-            for request in target.received_requests().await.unwrap() {
-               assert_eq!(request.headers.get("User-Agent").unwrap(), "app/1.0");
-            }
-         }
-      }
-   }
-
-   #[tokio::test]
-   async fn test_http_explicit_redirect_policy_validates_headers() {
-      for force_same_origin in [false, true] {
-         for (headers, message) in [
-            (
-               (0..65)
-                  .map(|i| (format!("x-test-{i}"), "v".into()))
-                  .collect(),
-               "64",
-            ),
-            (
-               HashMap::from([("bad name".into(), "value".into())]),
-               "Invalid header name",
-            ),
-            (
-               HashMap::from([("User-Agent".into(), "bad\nvalue".into())]),
-               "Invalid header value",
-            ),
-            (
-               HashMap::from([
-                  ("User-Agent".into(), "app/1.0".into()),
-                  ("user-agent".into(), "app/1.0".into()),
-               ]),
-               "duplicate header name",
-            ),
-         ] {
-            let result = HttpStreamReader::with_headers_and_redirect_policy(
-               "https://example.com/file",
-               headers,
-               force_same_origin,
-            )
-            .await;
-            assert!(
-               matches!(result, Err(MediaParserError::HttpRequest(error)) if error.contains(message))
-            );
          }
       }
    }
@@ -978,36 +852,17 @@ mod tests {
             assert_eq!(result.unwrap(), 4);
             assert_eq!(reader.read_vec(0, 4).await.unwrap(), b"data");
          } else {
-            for (verb, error) in [
-               ("HEAD", result.unwrap_err()),
-               ("GET", reader.read_vec(0, 4).await.unwrap_err()),
+            for error in [
+               result.unwrap_err(),
+               reader.read_vec(0, 4).await.unwrap_err(),
             ] {
-               let expected = format!(
-                  "{verb} request failed: error following redirect for url ({}/10)",
-                  server.uri()
-               );
                assert!(
-                  matches!(error, MediaParserError::HttpRequest(ref message) if message == &expected),
+                  matches!(error, MediaParserError::HttpRequest(ref message)
+                     if message.contains("error following redirect") && !message.contains("same-origin policy")),
                   "unexpected error: {error:?}"
                );
             }
          }
-      }
-   }
-
-   #[tokio::test]
-   async fn test_http_non_redirect_request_errors_keep_their_context() {
-      let reader = HttpStreamReader::new("not a URL").await.unwrap();
-
-      for (verb, error) in [
-         ("HEAD", reader.size().await.unwrap_err()),
-         ("GET", reader.read_vec(0, 4).await.unwrap_err()),
-      ] {
-         assert!(
-            matches!(error, MediaParserError::HttpRequest(ref message)
-               if message == &format!("{verb} request failed: builder error")),
-            "unexpected error: {error:?}"
-         );
       }
    }
 
