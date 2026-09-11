@@ -320,18 +320,100 @@ mod tests {
          let size = reader.size().await;
          let bytes = reader.read_vec(0, 4).await;
          if blocked {
-            assert!(matches!(
-               size,
-               Err(media_parser::MediaParserError::HttpStatus(302))
-            ));
-            assert!(matches!(
-               bytes,
-               Err(media_parser::MediaParserError::HttpStatus(302))
-            ));
+            for error in [size.unwrap_err(), bytes.unwrap_err()] {
+               assert_eq!(
+                  serde_json::to_value(crate::Error::from(error)).unwrap(),
+                  serde_json::json!(
+                     "Media parser error: HTTP request failed: cross-origin redirect blocked: same-origin policy enforced"
+                  )
+               );
+            }
             assert!(target.received_requests().await.unwrap().is_empty());
          } else {
             assert_eq!(size.unwrap(), 4);
             assert_eq!(bytes.unwrap(), b"data");
+         }
+      }
+   }
+
+   #[tokio::test]
+   async fn merged_headers_redirects_respect_only_explicit_origin_restrictions() {
+      use wiremock::matchers::any;
+      use wiremock::{Mock, MockServer, ResponseTemplate};
+
+      for (name, value, restricted, overridden, custom_default) in [
+         ("Authorization", "Bearer test", false, false, false),
+         ("Authorization", "Bearer test", true, false, false),
+         ("Authorization", "Bearer test", true, true, false),
+         ("Authorization", "Bearer test", false, true, true),
+         ("Authorization", "Bearer test", true, true, true),
+         ("X-Api-Key", "test-key", false, false, false),
+         ("X-Api-Key", "test-key", true, false, false),
+         ("X-Api-Key", "test-key", true, true, false),
+      ] {
+         let source = MockServer::start().await;
+         let target = MockServer::start().await;
+         Mock::given(any())
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", target.uri()))
+            .expect(2)
+            .mount(&source)
+            .await;
+         Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"data"))
+            .mount(&target)
+            .await;
+         let mut configured = HashMap::from([(name.into(), value.into())]);
+         if custom_default {
+            configured.insert("X-Api-Key".into(), "test-key".into());
+         }
+         let defaults = DefaultHeaders::new(
+            configured,
+            restricted.then(|| vec![source.uri(), target.uri()]),
+         )
+         .unwrap();
+         let per_call =
+            overridden.then(|| HashMap::from([(name.to_ascii_lowercase(), value.into())]));
+         let merged = defaults.merge(&source.uri(), per_call);
+         let reader = open_reader(&source.uri(), &merged).await.unwrap();
+         let head = reader.size().await;
+         let get = reader.read_vec(0, 4).await;
+         let initial = source.received_requests().await.unwrap();
+         let destination = target.received_requests().await.unwrap();
+         assert_eq!(initial.len(), 2);
+         assert_eq!(initial[0].method, "HEAD");
+         assert_eq!(initial[1].method, "GET");
+         for request in &initial {
+            assert_eq!(request.headers.get(name).unwrap(), value);
+            if custom_default {
+               assert_eq!(request.headers.get("x-api-key").unwrap(), "test-key");
+            }
+         }
+         assert_eq!(
+            merged.force_same_origin,
+            restricted && (!overridden || custom_default)
+         );
+         if restricted && (!overridden || custom_default) {
+            assert!(destination.is_empty());
+            for error in [head.unwrap_err(), get.unwrap_err()] {
+               assert_eq!(
+                  serde_json::to_value(crate::Error::from(error)).unwrap(),
+                  serde_json::json!(
+                     "Media parser error: HTTP request failed: cross-origin redirect blocked: same-origin policy enforced"
+                  )
+               );
+            }
+         } else {
+            assert_eq!(head.unwrap(), 4);
+            assert_eq!(get.unwrap(), b"data");
+            assert_eq!(destination.len(), 2);
+            assert_eq!(destination[0].method, "HEAD");
+            assert_eq!(destination[1].method, "GET");
+            for request in &destination {
+               assert!(!request.headers.contains_key("authorization"));
+               if custom_default || name == "X-Api-Key" {
+                  assert_eq!(request.headers.get("x-api-key").unwrap(), "test-key");
+               }
+            }
          }
       }
    }

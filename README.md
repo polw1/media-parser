@@ -158,12 +158,21 @@ frontend. Configure trusted HTTPS origins when defaults include credentials such
 `Authorization` or `X-Api-Key`; the credential can stay in Rust.
 
 HTTP requests accept at most 64 headers after merging defaults and per-call headers.
-With no headers or only `User-Agent`, redirects follow the default policy across
-origins, unless a default subject to `default_headers_origins` was actually inserted
-during the merge. A per-call override does not count as inserting that default,
-even when its value is identical. Any other header, or an inserted restricted
-default, stops redirects to another origin, including another allowed origin or a
-CDN. Same-origin redirects keep the headers. Both policies allow up to ten hops.
+Unless a restricted default was inserted, redirects follow reqwest's default
+policy across origins, regardless of the configured header names or combinations.
+Reqwest removes `Authorization`, `Cookie`, `cookie2`, `Proxy-Authorization` and
+`WWW-Authenticate` when the origin changes. Other headers, including `User-Agent`
+and `X-Api-Key`, can be forwarded to the new origin. Configure
+`default_headers_origins` to restrict defaults containing credentials.
+
+If a default subject to `default_headers_origins` was actually inserted during the
+merge, redirects stay within the same origin regardless of the final header names,
+including when the destination is another allowed origin or a CDN. A per-call
+override does not count as inserting that default, even when its value is identical.
+
+Same-origin redirects keep the headers. Both policies allow up to ten hops.
+Blocked redirects return `cross-origin redirect blocked: same-origin policy
+enforced` for both HEAD and GET requests.
 
 ### JavaScript/TypeScript API
 
