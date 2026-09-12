@@ -32,7 +32,12 @@ export interface Metadata {
  * Options for metadata extraction.
  */
 export interface MetadataOptions {
-   /** Custom HTTP headers to send with the request (only used for URLs). */
+   /**
+    * Custom HTTP headers to send with the request (only used for URLs).
+    * These headers override applicable Rust-configured defaults regardless of name casing.
+    * When those defaults apply to the URL, a per-call Host header in any casing is rejected,
+    * even if all defaults are overridden.
+    */
    headers?: Record<string, string>;
 }
 

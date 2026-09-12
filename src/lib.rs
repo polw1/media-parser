@@ -271,6 +271,16 @@ mod tests {
    }
 
    #[test]
+   fn later_default_headers_replace_earlier_values_ignoring_name_casing() {
+      let headers = Builder::new()
+         .default_headers([("X-Test", "first")])
+         .default_headers([("x-test", "second")])
+         .into_headers();
+
+      assert_eq!(headers, HashMap::from([("x-test".into(), "second".into())]));
+   }
+
+   #[test]
    fn user_agent_overrides_default_header_in_either_setter_order() {
       for builder in [
          Builder::new()
